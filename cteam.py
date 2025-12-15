@@ -62,7 +62,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-import threading
 
 
 # -----------------------------
@@ -1620,20 +1619,12 @@ def is_codex_running(state: Dict[str, Any], window: str) -> bool:
     return "codex" in cmd.lower()
 
 
-def _send_prompt_when_ready(session: str, window: str, prompt: str) -> None:
-    wait_for_pane_command(session, window, "codex", timeout=4.0)
-    wait_for_pane_quiet(session, window, quiet_for=0.8, timeout=10.0)
-    tmux_send_keys(session, window, ["C-u"])
-    tmux_send_line_when_quiet(session, window, prompt)
-
-
 def start_codex_in_window(
     root: Path,
     state: Dict[str, Any],
     agent: Dict[str, Any],
     *,
     boot: bool,
-    async_prompt: bool = False,
 ) -> None:
     session = state["tmux"]["session"]
     w = agent["name"]
@@ -1661,12 +1652,6 @@ def start_codex_in_window(
             )
     else:
         first_prompt = prompt_on_mail(agent["name"])
-
-    if async_prompt:
-        threading.Thread(
-            target=_send_prompt_when_ready, args=(session, w, first_prompt), daemon=True
-        ).start()
-        return
 
     wait_for_pane_command(session, w, "codex", timeout=4.0)
     wait_for_pane_quiet(session, w, quiet_for=0.8, timeout=6.0)
@@ -1833,17 +1818,17 @@ def create_root_structure(root: Path, state: Dict[str, Any]) -> None:
     save_state(root, state)
 
 
-def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool, async_prompts: bool) -> None:
+def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
     ensure_tmux_session(root, state)
     ensure_router_window(root, state)
-    ensure_agent_windows(root, state, launch_codex=launch_codex, async_prompts=async_prompts)
+    ensure_agent_windows(root, state, launch_codex=launch_codex)
 
     pm_agent = next((a for a in state["agents"] if a["name"] == "pm"), None)
     if pm_agent and launch_codex and not is_codex_running(state, "pm"):
-        start_codex_in_window(root, state, pm_agent, boot=True, async_prompt=async_prompts)
+        start_codex_in_window(root, state, pm_agent, boot=True)
 
 
-def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: bool, async_prompts: bool) -> None:
+def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
     session = state["tmux"]["session"]
     auto = set(autostart_agent_names(state))
 
@@ -1851,7 +1836,7 @@ def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: boo
         w = agent["name"]
         agent_dir = Path(agent["dir_abs"])
         if launch_codex and w in auto:
-            start_codex_in_window(root, state, agent, boot=True, async_prompt=async_prompts)
+            start_codex_in_window(root, state, agent, boot=True)
             continue
 
         windows = set(tmux_list_windows(session))
@@ -1921,7 +1906,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
+    ensure_tmux(root, state, launch_codex=not args.no_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2011,7 +1996,7 @@ def cmd_import(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
+    ensure_tmux(root, state, launch_codex=not args.no_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2045,7 +2030,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print(f"Workspace ready at {root} (tmux disabled)")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
+    ensure_tmux(root, state, launch_codex=not args.no_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2067,11 +2052,10 @@ def cmd_open(args: argparse.Namespace) -> None:
     update_roster(root, state)
     save_state(root, state)
     if not args.no_tmux:
-        ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
+        ensure_tmux(root, state, launch_codex=not args.no_codex)
+        print(f"tmux session: {state['tmux']['session']}")
         if not args.no_attach:
             tmux_attach(state["tmux"]["session"], window=args.window)
-        else:
-            print(f"tmux session: {state['tmux']['session']}")
     else:
         print(f"tmux disabled. Workspace at {root}")
 
@@ -2489,6 +2473,7 @@ def build_parser() -> argparse.ArgumentParser:
         pp.add_argument("--no-tmux", action="store_true", help="Do not start/manage tmux.")
         pp.add_argument("--no-codex", action="store_true", help="Do not launch Codex in windows.")
         pp.add_argument("--no-attach", action="store_true", help="Do not attach to tmux after starting.")
+        pp.add_argument("--attach-late", action="store_true", help="Attach after tmux/windows/Codex are ready.")
         pp.add_argument("--window", help="Window name to attach/select (e.g., pm).")
 
     def add_codex_flags(pp: argparse.ArgumentParser) -> None:
