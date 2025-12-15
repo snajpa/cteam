@@ -58,6 +58,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import readline
 import textwrap
 import time
 from dataclasses import dataclass
@@ -1135,6 +1136,8 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
 
         - Send message:
           - `python3 cteam.py msg $CTEAM_ROOT --to pm --subject "..." "text..."`
+        - Interactive chat:
+          - `python3 cteam.py chat $CTEAM_ROOT --to pm`
         - Assignments (PM/human):
           - `python3 cteam.py assign $CTEAM_ROOT --to dev1 --task T001 --subject "..." "instructions"`
 
@@ -1146,6 +1149,10 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         - Push early, push often; pull/rebase frequently to avoid conflicts.
         - Avoid rewriting shared history.
         - Keep large binaries out of git; put them in `shared/drive/` and reference them in notes/PRs.
+
+        ## Role clarity
+        - The customer never performs engineering tasks; they provide inputs, feedback, and clarifications.
+        - Respect your lane: do your role’s work well; do not offload your duties to the customer.
         """
     )
 
@@ -1178,6 +1185,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Produce/maintain architecture docs.
             - Record major decisions in shared/DECISIONS.md.
             - Coordinate with PM before making broad changes.
+            - Keep the customer out of engineering tasks; they provide context/feedback only via PM.
 
             Default behavior if unassigned:
             - create a short "architecture map" note for PM
@@ -1192,6 +1200,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Implement assigned tasks.
             - Keep changes small and mergeable.
             - Write tests when feasible.
+            - Do not ask the customer to do engineering work; request clarifications via PM.
 
             Default behavior if unassigned:
             - scan repo quickly, propose a task to PM
@@ -1205,6 +1214,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Establish how to run tests.
             - Add smoke tests and regression tests.
             - Verify fixes.
+            - You own quality; never push testing effort onto the customer.
 
             Default behavior if unassigned:
             - find how to run the project/tests, write a short note to PM
@@ -1218,6 +1228,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Inventory dependencies and risks.
             - Provide actionable notes to PM/Architect.
             - Use seed-extras and (optional) web search.
+            - Do not ask the customer to do research; route questions through PM.
 
             Default behavior if unassigned:
             - write a dependency inventory note and send it to PM
@@ -1941,6 +1952,69 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                         print(new_txt, end="")
     except KeyboardInterrupt:
         print("\nExiting customer chat.")
+
+
+def cmd_chat(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("chat: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    agent_names = {a["name"] for a in state["agents"]}
+    allowed = set(agent_names) | {"customer"}
+    recipient = args.to
+    if recipient not in allowed:
+        raise CTeamError(f"unknown recipient: {recipient}")
+
+    msg_path, inbox_dir, _ = mailbox_paths(root, recipient)
+    mkdirp(inbox_dir)
+    if not msg_path.exists():
+        atomic_write_text(msg_path, f"# Inbox — {recipient}\n\n(append-only)\n\n")
+
+    print(f"=== Chat with {recipient} ===")
+    print("Type a message and press Enter to send. Ctrl+C to exit.\n")
+
+    try:
+        existing = msg_path.read_text(encoding="utf-8", errors="replace")
+        if existing.strip():
+            print(existing.rstrip())
+    except Exception:
+        pass
+
+    last_pos = msg_path.stat().st_size if msg_path.exists() else 0
+    try:
+        with msg_path.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(last_pos)
+            while True:
+                r, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if r:
+                    line = sys.stdin.readline()
+                    if line == "":
+                        break
+                    text = line.rstrip("\n")
+                    if text.strip():
+                        write_message(
+                            root,
+                            state,
+                            sender=args.sender or "human",
+                            recipient=recipient,
+                            subject=args.subject or "chat",
+                            body=text,
+                            msg_type="MESSAGE",
+                            task=None,
+                            nudge=not args.no_nudge,
+                            start_if_needed=args.start_if_needed,
+                        )
+                        focus_recipient_window(state, recipient)
+                        print(f"[you → {recipient}] {text}")
+
+                cur_size = msg_path.stat().st_size
+                if cur_size > f.tell():
+                    new_txt = f.read()
+                    if new_txt:
+                        print(new_txt, end="")
+    except KeyboardInterrupt:
+        print("\nExiting chat.")
 
 
 # -----------------------------
@@ -2667,6 +2741,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("workdir")
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
+
+    p_chat = sub.add_parser("chat", help="Interactive chat with an agent or customer.")
+    p_chat.add_argument("workdir")
+    p_chat.add_argument("--to", required=True, help="Recipient agent name or 'customer'.")
+    p_chat.add_argument("--sender", help="Override sender name (default: human).")
+    p_chat.add_argument("--subject", help="Optional subject.")
+    p_chat.add_argument("--no-nudge", action="store_true")
+    p_chat.add_argument("--start-if-needed", action="store_true")
+    p_chat.set_defaults(func=cmd_chat)
 
     p_cust = sub.add_parser("customer-chat", help="Run an interactive customer chat window (tmux-friendly).")
     p_cust.add_argument("workdir")
