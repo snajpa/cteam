@@ -53,6 +53,7 @@ import datetime as _dt
 import json
 import os
 import re
+import select
 import shlex
 import shutil
 import subprocess
@@ -80,6 +81,7 @@ DIR_AGENTS = "agents"
 DIR_LOGS = "logs"
 DIR_MAIL = f"{DIR_SHARED}/mail"
 DIR_RUNTIME = f"{DIR_SHARED}/runtime"
+CUSTOMER_WINDOW = "customer"
 
 ROUTER_WINDOW = "router"
 
@@ -1301,6 +1303,16 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
         msg = base / "message.md"
         if not msg.exists():
             atomic_write_text(msg, f"# Inbox — {agent['name']}\n\n(append-only)\n\n")
+    # Customer channel (for PM <-> customer updates)
+    customer_dir = mail_root / "customer"
+    mkdirp(customer_dir / "inbox")
+    mkdirp(customer_dir / "outbox")
+    mkdirp(customer_dir / "sent")
+    if not (customer_dir / "message.md").exists():
+        atomic_write_text(
+            customer_dir / "message.md",
+            "# Customer channel\n\nUse this file to record customer updates, questions, and answers.\n\n",
+        )
 
 
 def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
@@ -1517,8 +1529,9 @@ def write_message(
         entry += "\n"
 
     agent_names = {a["name"] for a in state["agents"]}
-    if recipient not in agent_names:
-        raise CTeamError(f"unknown recipient agent: {recipient}")
+    allowed = set(agent_names) | {"customer"}
+    if recipient not in allowed:
+        raise CTeamError(f"unknown recipient: {recipient}")
 
     msg_path, inbox_dir, _ = mailbox_paths(root, recipient)
     mkdirp(inbox_dir)
@@ -1532,27 +1545,37 @@ def write_message(
     if msg_type == ASSIGNMENT_TYPE:
         append_text(root / DIR_SHARED / "ASSIGNMENTS.log.md", entry)
 
-    # Save a copy in sender outbox (if sender is a known agent) for local context.
-    if sender in agent_names:
+    # Save a copy in sender outbox (if sender is known) for local context.
+    if sender in (allowed):
         _, _, outbox_dir = mailbox_paths(root, sender)
         mkdirp(outbox_dir)
         atomic_write_text(outbox_dir / f"{ts_for_filename(ts)}_{recipient}.md", entry)
 
-    rec = next(a for a in state["agents"] if a["name"] == recipient)
-    agent_dir_msg = root / rec["dir_rel"] / "message.md"
-    repo_msg = root / rec["repo_dir_rel"] / "message.md"
-    if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
-        append_text(agent_dir_msg, entry)
-    if repo_msg.exists() and not samefile(repo_msg, msg_path):
-        append_text(repo_msg, entry)
+    if recipient != "customer":
+        rec = next(a for a in state["agents"] if a["name"] == recipient)
+        agent_dir_msg = root / rec["dir_rel"] / "message.md"
+        repo_msg = root / rec["repo_dir_rel"] / "message.md"
+        if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
+            append_text(agent_dir_msg, entry)
+        if repo_msg.exists() and not samefile(repo_msg, msg_path):
+            append_text(repo_msg, entry)
+
+    # Mirror to sender inbox for conversational context (if it exists and is distinct).
+    if sender and sender != recipient:
+        try:
+            sender_msg_path, _, _ = mailbox_paths(root, sender)
+            if sender_msg_path.exists() and not samefile(sender_msg_path, msg_path):
+                append_text(sender_msg_path, entry)
+        except Exception:
+            pass
 
     if not nudge:
         return
 
-    if start_if_needed:
-        maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
-
-    nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
+    if recipient != "customer":
+        if start_if_needed:
+            maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
+        nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
 
 
 # -----------------------------
@@ -1573,6 +1596,11 @@ def router_window_command(root: Path) -> List[str]:
     cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py watch ."
     return shell + [cmd]
 
+def customer_window_command(root: Path) -> List[str]:
+    shell = pick_shell()
+    cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py customer-chat ."
+    return shell + [cmd]
+
 
 def ensure_router_window(root: Path, state: Dict[str, Any]) -> None:
     session = state["tmux"]["session"]
@@ -1589,6 +1617,16 @@ def ensure_router_window(root: Path, state: Dict[str, Any]) -> None:
     if cmd not in ("python", "python3"):
         cmd_args = router_window_command(root)
         tmux_respawn_window(session, ROUTER_WINDOW, root, command_args=cmd_args)
+
+
+def ensure_customer_window(root: Path, state: Dict[str, Any]) -> None:
+    session = state["tmux"]["session"]
+    windows = set(tmux_list_windows(session))
+    if CUSTOMER_WINDOW in windows:
+        return
+    install_self_into_root(root)
+    cmd_args = customer_window_command(root)
+    tmux_new_window(session, CUSTOMER_WINDOW, root, command_args=cmd_args)
 
 
 def standby_window_command(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> List[str]:
@@ -1806,6 +1844,66 @@ def cmd_watch(args: argparse.Namespace) -> None:
         time.sleep(interval)
 
 
+def cmd_customer_chat(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("customer-chat: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    chat_dir = root / DIR_MAIL / "customer"
+    mkdirp(chat_dir / "inbox")
+    mkdirp(chat_dir / "outbox")
+    mkdirp(chat_dir / "sent")
+    chat_file = chat_dir / "message.md"
+    if not chat_file.exists():
+        atomic_write_text(chat_file, "# Customer channel\n\nUse this window to chat with the PM/team.\n\n")
+
+    print("=== Customer chat ===")
+    print("Type a message and press Enter to send to PM. Ctrl+C to exit.\n")
+
+    try:
+        existing = chat_file.read_text(encoding="utf-8", errors="replace")
+        if existing.strip():
+            print(existing.rstrip())
+    except Exception:
+        pass
+
+    last_pos = chat_file.stat().st_size if chat_file.exists() else 0
+    try:
+        with chat_file.open("r", encoding="utf-8", errors="replace") as f:
+            f.seek(last_pos)
+            while True:
+                # Check for stdin input (non-blocking).
+                r, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if r:
+                    line = sys.stdin.readline()
+                    if line == "":
+                        break
+                    text = line.rstrip("\n")
+                    if text.strip():
+                        write_message(
+                            root,
+                            state,
+                            sender="customer",
+                            recipient="pm",
+                            subject="Customer chat",
+                            body=text,
+                            msg_type="MESSAGE",
+                            task=None,
+                            nudge=True,
+                            start_if_needed=True,
+                        )
+                        print(f"[you → pm] {text}")
+                # Display any new content appended to customer log (e.g., from PM).
+                cur_size = chat_file.stat().st_size
+                if cur_size > f.tell():
+                    new_txt = f.read()
+                    if new_txt:
+                        print(new_txt, end="")
+    except KeyboardInterrupt:
+        print("\nExiting customer chat.")
+
+
 # -----------------------------
 # High-level operations: init/import/resume/open
 # -----------------------------
@@ -1821,6 +1919,7 @@ def create_root_structure(root: Path, state: Dict[str, Any]) -> None:
 def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
     ensure_tmux_session(root, state)
     ensure_router_window(root, state)
+    ensure_customer_window(root, state)
     ensure_agent_windows(root, state, launch_codex=launch_codex)
 
     pm_agent = next((a for a in state["agents"] if a["name"] == "pm"), None)
@@ -2535,6 +2634,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("workdir")
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
+
+    p_cust = sub.add_parser("customer-chat", help="Run an interactive customer chat window (tmux-friendly).")
+    p_cust.add_argument("workdir")
+    p_cust.set_defaults(func=cmd_customer_chat)
 
     p_status = sub.add_parser("status", help="Show workspace + agent status.")
     p_status.add_argument("workdir")
