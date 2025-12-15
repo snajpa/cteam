@@ -1750,17 +1750,21 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
         return False
-    windows = set(tmux_list_windows(session))
-    if agent_name not in windows:
-        return False
+    try:
+        if agent_name not in set(tmux_list_windows(session)):
+            ensure_agent_windows(root, state, launch_codex=True)
+    except Exception:
+        pass
 
     msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md."
-    tmux_send_keys(session, agent_name, ["C-u"])
-    if is_codex_running(state, agent_name):
-        wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
-        return tmux_send_line_when_quiet(session, agent_name, msg)
-    else:
+    try:
+        tmux_send_keys(session, agent_name, ["C-u"])
+        if is_codex_running(state, agent_name):
+            wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
+            return tmux_send_line_when_quiet(session, agent_name, msg)
         return tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
+    except Exception:
+        return False
 
 
 def maybe_start_agent_on_message(
