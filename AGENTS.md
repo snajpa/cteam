@@ -4,6 +4,7 @@
 - `cteam.py` is a single-file orchestration tool that spins up a tmux-based team of Codex agents working against a shared git repo.
 - It bootstraps a bare repo (`project.git`), an integration checkout (`project/`), per-agent clones (`agents/<name>/proj/`), and out-of-repo coordination assets under `shared/`.
 - Messaging is file-based (`shared/mail/<agent>/message.md` + inbox/outbox copies); a router loop (`cteam watch`) nudges agents and can auto-start Codex when assignments arrive. A dedicated `customer` window runs `cteam customer-chat` for PM/customer conversations. When sending messages via cteam CLI, tmux focus jumps to the recipient window by default (use `--no-follow` to stay put); customer chat also focuses PM when the customer sends.
+- Shared drive: `shared/drive/` (linked into each agent as `shared-drive/`) for large/non-repo artifacts; **all code/config stays in git**. Keep branches tidy (`agent/<name>/<topic>`), push/pull frequently, avoid history rewrites, and reference shared-drive artifacts in notes/PRs instead of committing them.
 
 ## Workspace model
 - State lives in `cteam.json` (versioned; upgraded in `upgrade_state_if_needed`). Paths are stored absolute + relative; keep compatibility when editing.

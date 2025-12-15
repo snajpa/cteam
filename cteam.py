@@ -77,6 +77,7 @@ DIR_PROJECT_CHECKOUT = "project"
 DIR_SEED = "seed"
 DIR_SEED_EXTRAS = "seed-extras"
 DIR_SHARED = "shared"
+DIR_SHARED_DRIVE = f"{DIR_SHARED}/drive"
 DIR_AGENTS = "agents"
 DIR_LOGS = "logs"
 DIR_MAIL = f"{DIR_SHARED}/mail"
@@ -1036,6 +1037,9 @@ def render_shared_readme(state: Dict[str, Any]) -> str:
         Mail:
         - shared/mail/<agent>/message.md (append-only mailbox)
 
+        Shared drive:
+        - shared/drive/ for non-repo artifacts (design exports, videos, binaries). Do NOT park code here.
+
         Router:
         - tmux window `{ROUTER_WINDOW}` runs `python3 cteam.py watch .`
         """
@@ -1119,10 +1123,12 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         - Your repo clone: `proj/` (work here)
         - Your inbox: `message.md` (check frequently)
         - Update: `STATUS.md`
+        - Shared drive (non-repo artifacts): `shared-drive/` (links to shared/drive)
 
         Shared coordination:
         - `shared/GOALS.md`, `shared/PLAN.md`, `shared/TASKS.md`, `shared/DECISIONS.md`
         - `shared/TEAM_ROSTER.md` (who is on the team)
+        - `shared/drive/` for large/binary assets; keep code/config in git.
 
         ## Messaging
         Preferred: use cteam CLI so delivery+nudge is reliable:
@@ -1137,8 +1143,9 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
 
         ## Git rules
         - Branch naming: `agent/{agent['name']}/<topic>`
-        - Push early, push often.
+        - Push early, push often; pull/rebase frequently to avoid conflicts.
         - Avoid rewriting shared history.
+        - Keep large binaries out of git; put them in `shared/drive/` and reference them in notes/PRs.
         """
     )
 
@@ -1276,6 +1283,7 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
     mkdirp(root / DIR_SEED)
     mkdirp(root / DIR_SEED_EXTRAS)
     mkdirp(root / DIR_SHARED)
+    mkdirp(root / DIR_SHARED_DRIVE)
     mkdirp(root / DIR_AGENTS)
     mkdirp(root / DIR_RUNTIME)
 
@@ -1300,6 +1308,20 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
         p = root / DIR_SHARED / name
         if not p.exists():
             atomic_write_text(p, content)
+
+    drive_readme = root / DIR_SHARED_DRIVE / "README.md"
+    if not drive_readme.exists():
+        atomic_write_text(
+            drive_readme,
+            textwrap.dedent(
+                """\
+                # Shared drive (cteam)
+
+                Use this for large or non-repo artifacts (design exports, videos, binaries).
+                Code/config still belongs in git (agents/*/proj and project/).
+                """
+            ),
+        )
 
     mail_root = root / DIR_MAIL
     mkdirp(mail_root)
@@ -1452,6 +1474,8 @@ def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) 
     safe_link_file(Path("..") / "STATUS.md", repo_dir / "STATUS.md")
     safe_link_file(Path("..") / "message.md", repo_dir / "message.md")
     safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED, repo_dir / "shared")
+    safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive")
+    safe_link_dir(Path("..") / ".." / DIR_SHARED_DRIVE, agent_dir / "shared-drive")
     if (agent_dir / "seed").exists():
         safe_link_dir(Path("..") / "seed", repo_dir / "seed")
     if (agent_dir / "seed-extras").exists():
@@ -1563,10 +1587,10 @@ def write_message(
         rec = next(a for a in state["agents"] if a["name"] == recipient)
         agent_dir_msg = root / rec["dir_rel"] / "message.md"
         repo_msg = root / rec["repo_dir_rel"] / "message.md"
-        if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
-            append_text(agent_dir_msg, entry)
-        if repo_msg.exists() and not samefile(repo_msg, msg_path):
-            append_text(repo_msg, entry)
+    if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
+        append_text(agent_dir_msg, entry)
+    if repo_msg.exists() and not samefile(repo_msg, msg_path):
+        append_text(repo_msg, entry)
 
     # Mirror to sender inbox for conversational context (if it exists and is distinct).
     if sender and sender != recipient:
