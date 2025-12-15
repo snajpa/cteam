@@ -53,11 +53,11 @@ import datetime as _dt
 import json
 import os
 import re
-import select
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import readline
 import textwrap
 import time
@@ -780,6 +780,7 @@ def build_state(
         "tmux": {
             "session": session,
             "router": bool(router),
+            "paused": False,
         },
         "agents": agents_list,
     }
@@ -831,6 +832,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         tm = state.get("tmux", {})
         tm.setdefault("session", f"cteam_{slugify(state.get('project_name', root.name))}")
         tm.setdefault("router", True)
+        tm.setdefault("paused", False)
         state["tmux"] = tm
 
         agents: List[Dict[str, Any]] = state.get("agents") or []
@@ -1903,6 +1905,13 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
         raise CTeamError("customer-chat: could not find cteam.json in this directory or its parents")
     state = load_state(root)
 
+    history_path = root / DIR_RUNTIME / "customer_chat.history"
+    mkdirp(history_path.parent)
+    try:
+        readline.read_history_file(history_path)
+    except FileNotFoundError:
+        pass
+
     chat_dir = root / DIR_MAIL / "customer"
     mkdirp(chat_dir / "inbox")
     mkdirp(chat_dir / "outbox")
@@ -1921,41 +1930,67 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    last_pos = chat_file.stat().st_size if chat_file.exists() else 0
     try:
-        with chat_file.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(last_pos)
-            while True:
-                # Check for stdin input (non-blocking).
-                r, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if r:
-                    line = sys.stdin.readline()
-                    if line == "":
-                        break
-                    text = line.rstrip("\n")
-                    if text.strip():
-                        write_message(
-                            root,
-                            state,
-                            sender="customer",
-                            recipient="pm",
-                            subject="Customer chat",
-                            body=text,
-                            msg_type="MESSAGE",
-                            task=None,
-                            nudge=True,
-                            start_if_needed=True,
-                        )
-                        focus_recipient_window(state, "pm")
-                        print(f"[you → pm] {text}")
-                # Display any new content appended to customer log (e.g., from PM).
-                cur_size = chat_file.stat().st_size
-                if cur_size > f.tell():
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind('"\\e[1;5D": backward-word')
+        readline.parse_and_bind('"\\e[1;5C": forward-word')
+    except Exception:
+        pass
+
+    stop = threading.Event()
+
+    def tail_chat() -> None:
+        pos = chat_file.stat().st_size if chat_file.exists() else 0
+        while not stop.is_set():
+            try:
+                with chat_file.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
                     new_txt = f.read()
+                    pos = f.tell()
                     if new_txt:
-                        print(new_txt, end="")
-    except KeyboardInterrupt:
-        print("\nExiting customer chat.")
+                        print("\n" + new_txt, end="", flush=True)
+            except Exception:
+                pass
+            stop.wait(0.5)
+
+    t = threading.Thread(target=tail_chat, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            try:
+                text = input("you> ")
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("")
+                break
+            text = text.rstrip("\n")
+            if not text.strip():
+                continue
+            write_message(
+                root,
+                state,
+                sender="customer",
+                recipient="pm",
+                subject="Customer chat",
+                body=text,
+                msg_type="MESSAGE",
+                task=None,
+                nudge=True,
+                start_if_needed=True,
+            )
+            try:
+                readline.add_history(text)
+                readline.write_history_file(history_path)
+            except Exception:
+                pass
+            focus_recipient_window(state, "pm")
+            print(f"[you → pm] {text}")
+    finally:
+        stop.set()
+        t.join(timeout=1.0)
+        print("Exiting customer chat.")
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
@@ -1985,40 +2020,146 @@ def cmd_chat(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    last_pos = msg_path.stat().st_size if msg_path.exists() else 0
     try:
-        with msg_path.open("r", encoding="utf-8", errors="replace") as f:
-            f.seek(last_pos)
-            while True:
-                r, _, _ = select.select([sys.stdin], [], [], 0.5)
-                if r:
-                    line = sys.stdin.readline()
-                    if line == "":
-                        break
-                    text = line.rstrip("\n")
-                    if text.strip():
-                        write_message(
-                            root,
-                            state,
-                            sender=args.sender or "human",
-                            recipient=recipient,
-                            subject=args.subject or "chat",
-                            body=text,
-                            msg_type="MESSAGE",
-                            task=None,
-                            nudge=not args.no_nudge,
-                            start_if_needed=args.start_if_needed,
-                        )
-                        focus_recipient_window(state, recipient)
-                        print(f"[you → {recipient}] {text}")
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind('"\\e[1;5D": backward-word')
+        readline.parse_and_bind('"\\e[1;5C": forward-word')
+    except Exception:
+        pass
 
-                cur_size = msg_path.stat().st_size
-                if cur_size > f.tell():
+    stop = threading.Event()
+
+    def tail_chat() -> None:
+        pos = msg_path.stat().st_size if msg_path.exists() else 0
+        while not stop.is_set():
+            try:
+                with msg_path.open("r", encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
                     new_txt = f.read()
+                    pos = f.tell()
                     if new_txt:
-                        print(new_txt, end="")
-    except KeyboardInterrupt:
-        print("\nExiting chat.")
+                        print("\n" + new_txt, end="", flush=True)
+            except Exception:
+                pass
+            stop.wait(0.5)
+
+    t = threading.Thread(target=tail_chat, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            try:
+                text = input("you> ")
+            except EOFError:
+                break
+            except KeyboardInterrupt:
+                print("")
+                break
+            text = text.rstrip("\n")
+            if not text.strip():
+                continue
+            write_message(
+                root,
+                state,
+                sender=args.sender or "human",
+                recipient=recipient,
+                subject=args.subject or "chat",
+                body=text,
+                msg_type="MESSAGE",
+                task=None,
+                nudge=not args.no_nudge,
+                start_if_needed=args.start_if_needed,
+            )
+            focus_recipient_window(state, recipient)
+            print(f"[you → {recipient}] {text}")
+    finally:
+        stop.set()
+        t.join(timeout=1.0)
+        print("Exiting chat.")
+
+
+def cmd_upload(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("upload: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    dest_root = root / DIR_SHARED_DRIVE
+    mkdirp(dest_root)
+
+    uploaded: List[Tuple[Path, Path]] = []
+    for src_str in args.paths:
+        src = Path(src_str).expanduser()
+        if not src.exists():
+            print(f"skip: source does not exist: {src}", file=sys.stderr)
+            continue
+        dest = dest_root / (args.dest or src.name)
+        if src.is_dir():
+            shutil.copytree(src, dest, dirs_exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+        uploaded.append((src, dest))
+        print(f"Uploaded {src} -> {dest}")
+
+    if uploaded:
+        lines = ["Files uploaded to shared drive:", ""]
+        for s, d in uploaded:
+            lines.append(f"- {s} → {d}")
+        lines.append("")
+        lines.append("Check `shared/drive/` for the uploaded artifacts.")
+        body = "\n".join(lines)
+        write_message(
+            root,
+            state,
+            sender=args.sender or "human",
+            recipient="pm",
+            subject="Upload to shared drive",
+            body=body,
+            msg_type="MESSAGE",
+            task=None,
+            nudge=True,
+            start_if_needed=True,
+        )
+
+
+def cmd_pause(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir))
+    if not root:
+        raise CTeamError("could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    state["tmux"]["paused"] = True
+    save_state(root, state)
+
+    session = state["tmux"]["session"]
+    if tmux_has_session(session):
+        # Move agent windows to standby shells.
+        for agent in state["agents"]:
+            try:
+                try:
+                    tmux_send_keys(session, agent["name"], ["Escape", "Escape", "Escape", "C-c"])
+                except Exception:
+                    pass
+                cmd_args = standby_window_command(root, state, agent)
+                tmux_respawn_window(session, agent["name"], Path(agent["dir_abs"]), command_args=cmd_args)
+            except Exception:
+                pass
+        # Quiet router window.
+        try:
+            try:
+                tmux_send_keys(session, ROUTER_WINDOW, ["Escape", "Escape", "Escape", "C-c"])
+            except Exception:
+                pass
+            tmux_respawn_window(
+                session,
+                ROUTER_WINDOW,
+                root,
+                command_args=pick_shell() + ["printf 'cteam paused; router idle\\n'; exec $SHELL"],
+            )
+        except Exception:
+            pass
+    print(f"paused tmux session: {state['tmux']['session']}")
 
 
 # -----------------------------
@@ -2122,7 +2263,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
+    ensure_tmux(root, state, launch_codex=launch_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2212,7 +2354,8 @@ def cmd_import(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
+    ensure_tmux(root, state, launch_codex=launch_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2240,13 +2383,15 @@ def cmd_resume(args: argparse.Namespace) -> None:
 
     ensure_agents_created(root, state)
     update_roster(root, state)
+    state["tmux"]["paused"] = False
     save_state(root, state)
 
     if args.no_tmux:
         print(f"Workspace ready at {root} (tmux disabled)")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
+    ensure_tmux(root, state, launch_codex=launch_codex)
     print(f"tmux session: {state['tmux']['session']}")
     if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2268,7 +2413,8 @@ def cmd_open(args: argparse.Namespace) -> None:
     update_roster(root, state)
     save_state(root, state)
     if not args.no_tmux:
-        ensure_tmux(root, state, launch_codex=not args.no_codex)
+        launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
+        ensure_tmux(root, state, launch_codex=launch_codex)
         print(f"tmux session: {state['tmux']['session']}")
         if not args.no_attach:
             tmux_attach(state["tmux"]["session"], window=args.window)
@@ -2746,6 +2892,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
 
+    p_pause = sub.add_parser("pause", help="Pause tmux: park agent windows and mark workspace paused.")
+    p_pause.add_argument("workdir")
+    p_pause.set_defaults(func=cmd_pause)
+
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent or customer.")
     p_chat.add_argument("workdir")
     p_chat.add_argument("--to", required=True, help="Recipient agent name or 'customer'.")
@@ -2754,6 +2904,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--no-nudge", action="store_true")
     p_chat.add_argument("--start-if-needed", action="store_true")
     p_chat.set_defaults(func=cmd_chat)
+
+    p_upload = sub.add_parser("upload", help="Copy files/dirs into shared/drive for sharing with the team.")
+    p_upload.add_argument("workdir")
+    p_upload.add_argument("paths", nargs="+", help="Files or directories to copy into shared/drive.")
+    p_upload.add_argument("--dest", help="Optional destination name/path under shared/drive (default: use source name).")
+    p_upload.add_argument("--from", dest="sender", help="Sender name for PM notification (default: human).")
+    p_upload.set_defaults(func=cmd_upload)
 
     p_cust = sub.add_parser("customer-chat", help="Run an interactive customer chat window (tmux-friendly).")
     p_cust.add_argument("workdir")
