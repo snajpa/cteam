@@ -1642,6 +1642,13 @@ def ensure_tmux_session(root: Path, state: Dict[str, Any]) -> None:
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
         tmux_new_session(session, root)
+        # Spawn router immediately as first window for visibility
+        try:
+            install_self_into_root(root)
+            cmd_args = router_window_command(root)
+            tmux_new_window(session, ROUTER_WINDOW, root, command_args=cmd_args)
+        except Exception:
+            pass
     tmux(["set-option", "-t", session, "remain-on-exit", "on"], capture=True, check=False)
     tmux(["set-option", "-t", session, "allow-rename", "off"], capture=True, check=False)
 
