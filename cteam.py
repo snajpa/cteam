@@ -1245,6 +1245,8 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
 
 def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
     mode = state.get("mode", "new")
+    root_abs = state.get("root_abs", "")
+    path_hint = f"cteam.py location: {root_abs}/cteam.py. "
     if mode == "import":
         return (
             "You are the Project Manager. First open message.md for any kickoff notes. "
@@ -1252,12 +1254,14 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
             "Open shared/GOALS.md and fill it with inferred goals, non-goals, and questions. "
             "Then write shared/PLAN.md + shared/TASKS.md, and assign first tasks using `cteam assign`. "
             "Keep everyone coordinated; do not let others work unassigned. "
-            "Start now."
+            "Start now. "
+            f"{path_hint}"
         )
     return (
         "You are the Project Manager. First open message.md for any kickoff notes. "
         "Then read seed/ and write shared/GOALS.md + shared/PLAN.md + shared/TASKS.md. "
-        "Then assign tasks to the team using `cteam assign`. Keep everyone coordinated. Start now."
+        "Then assign tasks to the team using `cteam assign`. Keep everyone coordinated. Start now. "
+        f"{path_hint}"
     )
 
 
@@ -1737,7 +1741,8 @@ def start_codex_in_window(
                 f"You are {agent['title']} ({agent['name']}). "
                 f"Open AGENTS.md and message.md. "
                 f"If you do not have an assignment (Type: {ASSIGNMENT_TYPE}), do NOT start coding; "
-                f"send a short recon note to PM, then wait."
+                f"send a short recon note to PM, then wait. "
+                f"cteam.py location: {state.get('root_abs','')}/cteam.py"
             )
     else:
         first_prompt = prompt_on_mail(agent["name"])
@@ -1835,9 +1840,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         except FileNotFoundError:
             last_mail_sig[a["name"]] = (0, 0)
 
-    print(f"[router] watching mailboxes under {root} (interval={interval}s)")
-    sys.stdout.flush()
+    log_line(root, f"[router] watching mailboxes under {root} (interval={interval}s)")
 
+    last_nudge: Dict[str, float] = {a["name"]: time.time() for a in state["agents"]}
     while True:
         try:
             state = load_state(root)
@@ -1891,10 +1896,19 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
             ok = nudge_agent(root, state, name, reason="MAILBOX UPDATED")
             if ok:
-                print(f"[router] nudged {name}")
+                log_line(root, f"[router] nudged {name}")
             else:
-                print(f"[router] mailbox updated for {name}, but could not nudge (window missing?)")
-            sys.stdout.flush()
+                log_line(root, f"[router] mailbox updated for {name}, but could not nudge (window missing?)")
+
+        # Idle nudges
+        now = time.time()
+        for a in state["agents"]:
+            name = a["name"]
+            last = last_nudge.get(name, 0)
+            if now - last >= 30:
+                if nudge_agent(root, state, name, reason="IDLE CHECK"):
+                    last_nudge[name] = now
+                    log_line(root, f"[router] idle nudge sent to {name}")
 
         time.sleep(interval)
 
@@ -3022,3 +3036,14 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+def log_line(root: Path, message: str) -> None:
+    ts = now_iso()
+    line = f"[{ts}] {message}"
+    print(line)
+    try:
+        log_dir = root / DIR_LOGS
+        mkdirp(log_dir)
+        with (log_dir / "router.log").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
