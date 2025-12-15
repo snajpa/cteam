@@ -10,12 +10,12 @@ Goal
 
 Key design choices (PM-led coordination)
 - Default mode is **PM-led**:
-  - Only the PM agent starts Codex immediately.
-  - Other agent tmux windows start in "standby".
+  - All agent tmux windows start Codex immediately so they are ready to act.
+  - Agents still wait for an **ASSIGNMENT** before implementing work.
   - When the PM (or a human) sends an **ASSIGNMENT** message to an agent, cteam:
-      1) starts Codex in that agent's tmux window (if not already running)
+      1) ensures Codex is running in that agent's tmux window
       2) nudges them to read `message.md` and execute the task
-- This avoids the "everyone does random stuff immediately" failure mode.
+- This avoids the "everyone does random work without coordination" failure mode while keeping agents live.
 
 Communication
 - Canonical mailbox per agent: shared/mail/<agent>/message.md
@@ -62,6 +62,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+import threading
 
 
 # -----------------------------
@@ -90,7 +91,7 @@ DEFAULT_CODEX_SANDBOX = "danger-full-access"   # read-only | workspace-write | d
 DEFAULT_CODEX_APPROVAL = "never"               # untrusted | on-failure | on-request | never
 DEFAULT_CODEX_SEARCH = True
 
-DEFAULT_AUTOSTART = "pm"  # pm | pm+architect | all
+DEFAULT_AUTOSTART = "all"  # pm | pm+architect | all
 
 # For robust "assignment" detection
 ASSIGNMENT_TYPE = "ASSIGNMENT"
@@ -459,6 +460,47 @@ def tmux_send_keys(session: str, window: str, keys: List[str]) -> None:
     tmux(["send-keys", "-t", f"{session}:{window}", *keys], capture=True)
 
 
+def tmux_select_window(session: str, window: str) -> None:
+    tmux(["select-window", "-t", f"{session}:{window}"], capture=True, check=False)
+
+
+def tmux_send_line(session: str, window: str, text: str) -> None:
+    """
+    Paste text (with trailing newline) into a tmux pane in one shot to avoid
+    key parsing issues.
+    """
+    target = f"{session}:{window}"
+    payload = text if text.endswith("\n") else text + "\n"
+    tmux(["set-buffer", "--", payload], capture=True)
+    tmux(["paste-buffer", "-d", "-t", target], capture=True)
+
+
+def tmux_send_line_when_quiet(
+    session: str,
+    window: str,
+    text: str,
+    *,
+    quiet_for: float = 2.0,
+    block_timeout: float = 30.0,
+) -> bool:
+    """
+    Block until the pane is quiet, then send text+Enter once.
+    If the pane never goes quiet before block_timeout, do nothing.
+    """
+    payload = text if text.endswith("\n") else text + "\n"
+    target = f"{session}:{window}"
+    deadline = time.time() + max(block_timeout, 0.5)
+    while time.time() < deadline:
+        remaining = max(0.5, deadline - time.time())
+        if wait_for_pane_quiet(session, window, quiet_for=quiet_for, timeout=min(quiet_for + 1.0, remaining)):
+            tmux(["set-buffer", "--", payload], capture=True)
+            tmux_send_keys(session, window, ["C-u"])
+            tmux(["paste-buffer", "-d", "-t", target], capture=True)
+            tmux_send_keys(session, window, ["Enter"])
+            return True
+    return False
+
+
 def tmux_pane_current_command(session: str, window: str) -> str:
     """
     Best-effort detection of what's running in the active pane of a window.
@@ -469,6 +511,51 @@ def tmux_pane_current_command(session: str, window: str) -> str:
         return out[0].strip() if out else ""
     except Exception:
         return ""
+
+
+def wait_for_pane_command(session: str, window: str, target_substring: str, timeout: float = 4.0) -> bool:
+    """
+    Wait until the active pane command contains target_substring (case-insensitive) or timeout.
+    """
+    deadline = time.time() + max(timeout, 0.1)
+    target = target_substring.lower()
+    while time.time() < deadline:
+        cmd = tmux_pane_current_command(session, window).lower()
+        if target in cmd:
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _pane_sig(session: str, window: str) -> Tuple[int, str]:
+    """
+    Lightweight signature of the pane contents: length + tail slice.
+    """
+    try:
+        cp = tmux(["capture-pane", "-p", "-t", f"{session}:{window}", "-J"], capture=True)
+        txt = (cp.stdout or "")
+        return (len(txt), txt[-400:])
+    except Exception:
+        return (0, "")
+
+
+def wait_for_pane_quiet(session: str, window: str, *, quiet_for: float = 1.0, timeout: float = 6.0) -> bool:
+    """
+    Wait until the pane output is stable (no changes) for quiet_for seconds, or timeout.
+    """
+    deadline = time.time() + max(timeout, 0.1)
+    quiet_start = time.time()
+    last_sig = _pane_sig(session, window)
+    while time.time() < deadline:
+        time.sleep(0.2)
+        sig = _pane_sig(session, window)
+        if sig == last_sig:
+            if time.time() - quiet_start >= quiet_for:
+                return True
+        else:
+            quiet_start = time.time()
+            last_sig = sig
+    return False
 
 
 def tmux_attach(session: str, window: Optional[str] = None) -> None:
@@ -1427,6 +1514,8 @@ def write_message(
 ) -> None:
     ts = now_iso()
     entry = format_message(ts, sender, recipient, subject, body, msg_type=msg_type, task=task)
+    if not entry.endswith("\n"):
+        entry += "\n"
 
     agent_names = {a["name"] for a in state["agents"]}
     if recipient not in agent_names:
@@ -1443,6 +1532,12 @@ def write_message(
 
     if msg_type == ASSIGNMENT_TYPE:
         append_text(root / DIR_SHARED / "ASSIGNMENTS.log.md", entry)
+
+    # Save a copy in sender outbox (if sender is a known agent) for local context.
+    if sender in agent_names:
+        _, _, outbox_dir = mailbox_paths(root, sender)
+        mkdirp(outbox_dir)
+        atomic_write_text(outbox_dir / f"{ts_for_filename(ts)}_{recipient}.md", entry)
 
     rec = next(a for a in state["agents"] if a["name"] == recipient)
     agent_dir_msg = root / rec["dir_rel"] / "message.md"
@@ -1525,7 +1620,21 @@ def is_codex_running(state: Dict[str, Any], window: str) -> bool:
     return "codex" in cmd.lower()
 
 
-def start_codex_in_window(root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, boot: bool) -> None:
+def _send_prompt_when_ready(session: str, window: str, prompt: str) -> None:
+    wait_for_pane_command(session, window, "codex", timeout=4.0)
+    wait_for_pane_quiet(session, window, quiet_for=0.8, timeout=10.0)
+    tmux_send_keys(session, window, ["C-u"])
+    tmux_send_line_when_quiet(session, window, prompt)
+
+
+def start_codex_in_window(
+    root: Path,
+    state: Dict[str, Any],
+    agent: Dict[str, Any],
+    *,
+    boot: bool,
+    async_prompt: bool = False,
+) -> None:
     session = state["tmux"]["session"]
     w = agent["name"]
     repo_dir = Path(agent["repo_dir_abs"])
@@ -1540,8 +1649,6 @@ def start_codex_in_window(root: Path, state: Dict[str, Any], agent: Dict[str, An
     else:
         tmux_respawn_window(session, w, repo_dir, command_args=cmd_args)
 
-    time.sleep(0.1)
-
     if boot:
         if agent["name"] == "pm":
             first_prompt = initial_prompt_for_pm(state)
@@ -1555,8 +1662,16 @@ def start_codex_in_window(root: Path, state: Dict[str, Any], agent: Dict[str, An
     else:
         first_prompt = prompt_on_mail(agent["name"])
 
+    if async_prompt:
+        threading.Thread(
+            target=_send_prompt_when_ready, args=(session, w, first_prompt), daemon=True
+        ).start()
+        return
+
+    wait_for_pane_command(session, w, "codex", timeout=4.0)
+    wait_for_pane_quiet(session, w, quiet_for=0.8, timeout=6.0)
     tmux_send_keys(session, w, ["C-u"])
-    tmux_send_keys(session, w, [first_prompt, "Enter"])
+    tmux_send_line_when_quiet(session, w, first_prompt)
 
 
 def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED") -> bool:
@@ -1570,10 +1685,10 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
     msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md."
     tmux_send_keys(session, agent_name, ["C-u"])
     if is_codex_running(state, agent_name):
-        tmux_send_keys(session, agent_name, [msg, "Enter"])
+        wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
+        return tmux_send_line_when_quiet(session, agent_name, msg)
     else:
-        tmux_send_keys(session, agent_name, [f"echo {shlex.quote(msg)}", "Enter"])
-    return True
+        return tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
 
 
 def maybe_start_agent_on_message(
@@ -1718,38 +1833,31 @@ def create_root_structure(root: Path, state: Dict[str, Any]) -> None:
     save_state(root, state)
 
 
-def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
+def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool, async_prompts: bool) -> None:
     ensure_tmux_session(root, state)
     ensure_router_window(root, state)
-    ensure_agent_windows(root, state, launch_codex=launch_codex)
+    ensure_agent_windows(root, state, launch_codex=launch_codex, async_prompts=async_prompts)
 
     pm_agent = next((a for a in state["agents"] if a["name"] == "pm"), None)
     if pm_agent and launch_codex and not is_codex_running(state, "pm"):
-        start_codex_in_window(root, state, pm_agent, boot=True)
+        start_codex_in_window(root, state, pm_agent, boot=True, async_prompt=async_prompts)
 
 
-def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
+def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: bool, async_prompts: bool) -> None:
     session = state["tmux"]["session"]
-    windows = set(tmux_list_windows(session))
-
     auto = set(autostart_agent_names(state))
 
     for agent in state["agents"]:
         w = agent["name"]
-        agent_repo = Path(agent["repo_dir_abs"])
         agent_dir = Path(agent["dir_abs"])
+        if launch_codex and w in auto:
+            start_codex_in_window(root, state, agent, boot=True, async_prompt=async_prompts)
+            continue
+
+        windows = set(tmux_list_windows(session))
         if w not in windows:
-            if launch_codex and w in auto:
-                cmd_args = codex_window_command(root, state, agent, boot=True)
-                tmux_new_window(session, w, agent_repo, command_args=cmd_args)
-            else:
-                cmd_args = standby_window_command(root, state, agent)
-                tmux_new_window(session, w, agent_dir, command_args=cmd_args)
-            windows.add(w)
-        else:
-            if launch_codex and w in auto:
-                if not is_codex_running(state, w):
-                    start_codex_in_window(root, state, agent, boot=True)
+            cmd_args = standby_window_command(root, state, agent)
+            tmux_new_window(session, w, agent_dir, command_args=cmd_args)
 
 
 # -----------------------------
@@ -1813,9 +1921,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
     print(f"tmux session: {state['tmux']['session']}")
-    if args.attach:
+    if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
 
 
@@ -1903,9 +2011,9 @@ def cmd_import(args: argparse.Namespace) -> None:
         print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
     print(f"tmux session: {state['tmux']['session']}")
-    if args.attach:
+    if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
 
 
@@ -1937,9 +2045,9 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print(f"Workspace ready at {root} (tmux disabled)")
         return
 
-    ensure_tmux(root, state, launch_codex=not args.no_codex)
+    ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
     print(f"tmux session: {state['tmux']['session']}")
-    if args.attach:
+    if not args.no_attach:
         tmux_attach(state["tmux"]["session"], window=args.window)
 
 
@@ -1959,8 +2067,11 @@ def cmd_open(args: argparse.Namespace) -> None:
     update_roster(root, state)
     save_state(root, state)
     if not args.no_tmux:
-        ensure_tmux(root, state, launch_codex=not args.no_codex)
-        tmux_attach(state["tmux"]["session"], window=args.window)
+        ensure_tmux(root, state, launch_codex=not args.no_codex, async_prompts=not args.no_attach)
+        if not args.no_attach:
+            tmux_attach(state["tmux"]["session"], window=args.window)
+        else:
+            print(f"tmux session: {state['tmux']['session']}")
     else:
         print(f"tmux disabled. Workspace at {root}")
 
@@ -2134,6 +2245,11 @@ def cmd_msg(args: argparse.Namespace) -> None:
         if agent and not is_codex_running(state, args.to):
             start_codex_in_window(root, state, agent, boot=False)
 
+    if not args.no_follow:
+        session = state["tmux"]["session"]
+        if tmux_has_session(session):
+            tmux_select_window(session, args.to)
+
     print(f"sent to {args.to}")
 
 
@@ -2198,6 +2314,10 @@ def cmd_assign(args: argparse.Namespace) -> None:
         nudge=not args.no_nudge,
         start_if_needed=True,
     )
+    if not args.no_follow:
+        session = state["tmux"]["session"]
+        if tmux_has_session(session):
+            tmux_select_window(session, args.to)
     print(f"assigned to {args.to}")
 
 
@@ -2215,6 +2335,10 @@ def cmd_nudge(args: argparse.Namespace) -> None:
     for t in targets:
         ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE")
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
+    if not args.no_follow and len(targets) == 1:
+        session = state["tmux"]["session"]
+        if tmux_has_session(session):
+            tmux_select_window(session, targets[0])
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -2364,7 +2488,7 @@ def build_parser() -> argparse.ArgumentParser:
         pp.add_argument("workdir", help="Workspace directory or any path inside it.")
         pp.add_argument("--no-tmux", action="store_true", help="Do not start/manage tmux.")
         pp.add_argument("--no-codex", action="store_true", help="Do not launch Codex in windows.")
-        pp.add_argument("--attach", action="store_true", help="Attach to tmux after starting.")
+        pp.add_argument("--no-attach", action="store_true", help="Do not attach to tmux after starting.")
         pp.add_argument("--window", help="Window name to attach/select (e.g., pm).")
 
     def add_codex_flags(pp: argparse.ArgumentParser) -> None:
@@ -2455,6 +2579,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.add_argument("--no-nudge", action="store_true")
     p_msg.add_argument("--start-if-needed", action="store_true",
                        help="If recipient is not running Codex, start it in their tmux window.")
+    p_msg.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
     p_msg.add_argument("text", nargs="?", default="")
     p_msg.set_defaults(func=cmd_msg)
 
@@ -2477,12 +2602,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_assign.add_argument("--file")
     p_assign.add_argument("--no-nudge", action="store_true")
     p_assign.add_argument("text", nargs="?", default="")
+    p_assign.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
     p_assign.set_defaults(func=cmd_assign)
 
     p_nudge = sub.add_parser("nudge", help="Send a manual nudge to an agent window.")
     p_nudge.add_argument("workdir")
     p_nudge.add_argument("--to", default="pm", help="agent(s) comma-separated or 'all'")
     p_nudge.add_argument("--reason", default="NUDGE")
+    p_nudge.add_argument("--no-follow", action="store_true", help="Do not select the target window.")
     p_nudge.set_defaults(func=cmd_nudge)
 
     p_restart = sub.add_parser("restart", help="Restart Codex in agent tmux windows (respawn).")
