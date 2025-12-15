@@ -465,6 +465,14 @@ def tmux_select_window(session: str, window: str) -> None:
     tmux(["select-window", "-t", f"{session}:{window}"], capture=True, check=False)
 
 
+def focus_recipient_window(state: Dict[str, Any], recipient: str) -> None:
+    session = state["tmux"]["session"]
+    if not tmux_has_session(session):
+        return
+    target = recipient if recipient != "customer" else CUSTOMER_WINDOW
+    tmux_select_window(session, target)
+
+
 def tmux_send_line(session: str, window: str, text: str) -> None:
     """
     Paste text (with trailing newline) into a tmux pane in one shot to avoid
@@ -1577,6 +1585,12 @@ def write_message(
             maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
         nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
 
+    # Focus the recipient window if tmux is active (helps humans follow the conversation).
+    try:
+        focus_recipient_window(state, recipient)
+    except Exception:
+        pass
+
 
 # -----------------------------
 # Starting / nudging agents in tmux
@@ -1893,6 +1907,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                             nudge=True,
                             start_if_needed=True,
                         )
+                        focus_recipient_window(state, "pm")
                         print(f"[you → pm] {text}")
                 # Display any new content appended to customer log (e.g., from PM).
                 cur_size = chat_file.stat().st_size
@@ -2329,9 +2344,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
             start_codex_in_window(root, state, agent, boot=False)
 
     if not args.no_follow:
-        session = state["tmux"]["session"]
-        if tmux_has_session(session):
-            tmux_select_window(session, args.to)
+        focus_recipient_window(state, args.to)
 
     print(f"sent to {args.to}")
 
@@ -2398,9 +2411,7 @@ def cmd_assign(args: argparse.Namespace) -> None:
         start_if_needed=True,
     )
     if not args.no_follow:
-        session = state["tmux"]["session"]
-        if tmux_has_session(session):
-            tmux_select_window(session, args.to)
+        focus_recipient_window(state, args.to)
     print(f"assigned to {args.to}")
 
 
@@ -2419,9 +2430,7 @@ def cmd_nudge(args: argparse.Namespace) -> None:
         ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE")
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
     if not args.no_follow and len(targets) == 1:
-        session = state["tmux"]["session"]
-        if tmux_has_session(session):
-            tmux_select_window(session, targets[0])
+        focus_recipient_window(state, targets[0])
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
