@@ -73,7 +73,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 
 STATE_FILENAME = "cteam.json"
-STATE_VERSION = 5
+STATE_VERSION = 6
 
 DIR_PROJECT_BARE = "project.git"
 DIR_PROJECT_CHECKOUT = "project"
@@ -914,7 +914,7 @@ def build_state(
             "pm_is_boss": True,
             "start_agents_on_assignment": True,
             "assignment_type": ASSIGNMENT_TYPE,
-            "assignment_from": ["pm", "customer", "cteam"],   # who can "start" an agent by messaging them
+            "assignment_from": ["pm", "cteam"],   # who can "start" an agent by messaging them
         },
         "tmux": {
             "session": session,
@@ -970,7 +970,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         coord.setdefault("pm_is_boss", True)
         coord.setdefault("start_agents_on_assignment", True)
         coord.setdefault("assignment_type", ASSIGNMENT_TYPE)
-        coord.setdefault("assignment_from", ["pm", "customer", "cteam"])
+        coord.setdefault("assignment_from", ["pm", "cteam"])
         state["coordination"] = coord
 
         tm = state.get("tmux", {})
@@ -997,6 +997,19 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         tg.setdefault("enabled", False)
         tg.setdefault("config_rel", TELEGRAM_CONFIG_REL)
         state["telegram"] = tg
+
+    # --- v < 6 upgrades (tighten assignment_from defaults) ---
+    if v < 6:
+        coord = state.get("coordination", {})
+        if not isinstance(coord, dict):
+            coord = {}
+        current = coord.get("assignment_from", ["pm", "cteam"])
+        if "customer" in current:
+            coord["assignment_from"] = [x for x in current if x != "customer"]
+        coord.setdefault("assignment_type", ASSIGNMENT_TYPE)
+        coord.setdefault("start_agents_on_assignment", True)
+        coord.setdefault("pm_is_boss", True)
+        state["coordination"] = coord
 
     state["version"] = STATE_VERSION
     compute_agent_abspaths(state)
@@ -1732,8 +1745,17 @@ def write_message(
 
     agent_names = {a["name"] for a in state["agents"]}
     allowed = set(agent_names) | {"customer"}
+    allowed_senders = allowed | {"cteam"}
     if recipient not in allowed:
         raise CTeamError(f"unknown recipient: {recipient}")
+    if sender not in allowed_senders:
+        raise CTeamError(f"unknown sender: {sender}")
+    if sender == "customer" and recipient != "pm":
+        raise CTeamError("customer can only message pm")
+    if recipient == "customer" and sender not in {"pm", "cteam"}:
+        raise CTeamError("only pm can message customer")
+    if msg_type == ASSIGNMENT_TYPE and sender not in {"pm", "cteam"}:
+        raise CTeamError("assignments must come from pm")
 
     msg_path, inbox_dir, _ = mailbox_paths(root, recipient)
     mkdirp(inbox_dir)
@@ -1763,7 +1785,7 @@ def write_message(
             append_text(repo_msg, entry)
 
     # Mirror to sender inbox for conversational context (if it exists and is distinct).
-    if sender and sender != recipient:
+    if sender and sender != recipient and sender not in {"customer", "cteam"}:
         try:
             sender_msg_path, _, _ = mailbox_paths(root, sender)
             if sender_msg_path.exists() and not samefile(sender_msg_path, msg_path):
@@ -1948,7 +1970,7 @@ def maybe_start_agent_on_message(
     if recipient == "pm":
         return
 
-    allowed_from = set(coord.get("assignment_from", ["pm", "customer", "cteam"]))
+    allowed_from = set(coord.get("assignment_from", ["pm", "cteam"]))
     if sender not in allowed_from:
         return
 
@@ -2285,6 +2307,10 @@ class TelegramBridge:
             ts, sender, recipient, subject, body = _parse_entry(entry)
             if recipient != "customer":
                 continue
+            if body and "\\n" in body:
+                body = body.replace("\\n", "\n")
+            if subject and "\\n" in subject:
+                subject = subject.replace("\\n", "\n")
             out = f"[{ts or now_iso()}] {sender or 'cteam'}\n"
             if subject:
                 out += f"Subject: {subject}\n"
@@ -2460,16 +2486,32 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
 
     def tail_chat() -> None:
         pos = chat_file.stat().st_size if chat_file.exists() else 0
+        buf = ""
         while not stop.is_set():
             try:
                 with chat_file.open("r", encoding="utf-8", errors="replace") as f:
                     f.seek(pos)
                     new_txt = f.read()
                     pos = f.tell()
-                    if new_txt:
-                        print("\n" + new_txt, end="", flush=True)
+                if not new_txt:
+                    stop.wait(0.5)
+                    continue
+                buf += new_txt
+                parts = buf.split("\n---\n")
+                complete = parts[:-1]
+                buf = parts[-1]
+                for entry in complete:
+                    entry = entry.strip("\n")
+                    if not entry:
+                        continue
+                    entry = entry + "\n---\n"
+                    _, sender, recipient, _, _ = _parse_entry(entry)
+                    if recipient and recipient != "customer":
+                        continue
+                    print("\n" + entry, end="", flush=True)
             except Exception:
-                pass
+                stop.wait(0.5)
+                continue
             stop.wait(0.5)
 
     t = threading.Thread(target=tail_chat, daemon=True)
@@ -2577,7 +2619,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
             write_message(
                 root,
                 state,
-                sender=args.sender or "customer",
+                sender=args.sender or "pm",
                 recipient=recipient,
                 subject=args.subject or "chat",
                 body=text,
@@ -2586,7 +2628,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
                 nudge=not args.no_nudge,
                 start_if_needed=args.start_if_needed,
             )
-            focus_if_sender_active(state, args.sender or "customer", recipient)
+            focus_if_sender_active(state, args.sender or "pm", recipient)
             print(f"[you → {recipient}] {text}")
     finally:
         stop.set()
@@ -2628,7 +2670,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
         write_message(
             root,
             state,
-            sender=args.sender or "customer",
+            sender=args.sender or "pm",
             recipient="pm",
             subject="Upload to shared drive",
             body=body,
@@ -3137,7 +3179,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
     write_message(
         root,
         state,
-        sender=args.sender or "customer",
+        sender=args.sender or "pm",
         recipient=args.to,
         subject=args.subject or "",
         body=body,
@@ -3154,7 +3196,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
             start_codex_in_window(root, state, agent, boot=False)
 
     if not args.no_follow:
-        focus_if_sender_active(state, args.sender or "customer", args.to)
+        focus_if_sender_active(state, args.sender or "pm", args.to)
 
     print(f"sent to {args.to}")
 
@@ -3339,7 +3381,7 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
     write_message(
         root,
         state,
-        sender=args.sender or "customer",
+        sender=args.sender or "pm",
         recipient="pm",
         subject=args.subject or "Doc-walk kickoff",
         body=(
@@ -3365,7 +3407,7 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
                 write_message(
                     root,
                     state,
-                    sender=args.sender or "customer",
+                    sender=args.sender or "pm",
                     recipient=who,
                     subject=subj,
                     body=body,
