@@ -2267,6 +2267,7 @@ class TelegramBridge:
         except Exception:
             state = self.state
 
+        # Record for PM mailbox
         write_message(
             self.root,
             state,
@@ -2279,6 +2280,17 @@ class TelegramBridge:
             nudge=True,
             start_if_needed=True,
         )
+
+        # Mirror into customer channel for visibility/logging (customer chat tails this file).
+        try:
+            ts = now_iso()
+            entry = format_message(ts, "customer", "customer", "Telegram", text, msg_type="MESSAGE")
+            cust_msg, cust_inbox, _ = mailbox_paths(self.root, "customer")
+            mkdirp(cust_inbox)
+            append_text(cust_msg, entry)
+            atomic_write_text(cust_inbox / f"{ts_for_filename(ts)}_customer.md", entry)
+        except Exception as e:
+            log_line(self.root, f"[telegram] failed to mirror inbound to customer mailbox: {e}")
 
     def _maybe_forward_outbound(self, cfg: Dict[str, Any], customer_file: Path) -> None:
         if not cfg.get("chat_id"):
@@ -2307,6 +2319,8 @@ class TelegramBridge:
             ts, sender, recipient, subject, body = _parse_entry(entry)
             if recipient != "customer":
                 continue
+            if sender == "customer":
+                continue  # avoid echoing inbound Telegram messages back to Telegram
             if body and "\\n" in body:
                 body = body.replace("\\n", "\n")
             if subject and "\\n" in subject:
@@ -2444,7 +2458,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         now = time.time()
         non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
         if non_pm:
-            if all(now - last_activity.get(n, 0) >= 30 for n in non_pm):
+            pm_idle = now - last_activity.get("pm", 0) >= 30
+            team_idle = all(now - last_activity.get(n, 0) >= 30 for n in non_pm)
+            if pm_idle and team_idle:
                 if not state["tmux"].get("paused", False):
                     if nudge_agent(root, state, "pm", reason="TEAM IDLE — CHECK IN"):
                         last_activity["pm"] = now
