@@ -152,6 +152,19 @@ def append_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def log_line(root: Path, message: str) -> None:
+    ts = now_iso()
+    line = f"[{ts}] {message}"
+    print(line)
+    try:
+        log_dir = root / DIR_LOGS
+        mkdirp(log_dir)
+        with (log_dir / "router.log").open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
 def ensure_executable(name: str, hint: str = "") -> None:
     if shutil.which(name) is None:
         msg = f"required executable not found in PATH: {name}"
@@ -475,6 +488,32 @@ def focus_recipient_window(state: Dict[str, Any], recipient: str) -> None:
     tmux_select_window(session, target)
 
 
+def tmux_active_window(session: str) -> str:
+    try:
+        cp = tmux(["display-message", "-p", "#W"], capture=True)
+        return (cp.stdout or "").strip().splitlines()[0]
+    except Exception:
+        return ""
+
+
+def focus_if_sender_active(state: Dict[str, Any], sender: str, recipient: str) -> None:
+    session = state["tmux"]["session"]
+    if not tmux_has_session(session):
+        return
+    agent_names = {a["name"] for a in state["agents"]}
+    sender_window = None
+    if sender == "customer":
+        sender_window = CUSTOMER_WINDOW
+    elif sender in agent_names or sender == "pm":
+        sender_window = sender
+    if not sender_window:
+        return
+    active = tmux_active_window(session)
+    if not active or active != sender_window:
+        return
+    focus_recipient_window(state, recipient)
+
+
 def tmux_send_line(session: str, window: str, text: str) -> None:
     """
     Paste text (with trailing newline) into a tmux pane in one shot to avoid
@@ -775,7 +814,7 @@ def build_state(
             "pm_is_boss": True,
             "start_agents_on_assignment": True,
             "assignment_type": ASSIGNMENT_TYPE,
-            "assignment_from": ["pm", "human", "cteam"],   # who can "start" an agent by messaging them
+            "assignment_from": ["pm", "customer", "cteam"],   # who can "start" an agent by messaging them
         },
         "tmux": {
             "session": session,
@@ -826,7 +865,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         coord.setdefault("pm_is_boss", True)
         coord.setdefault("start_agents_on_assignment", True)
         coord.setdefault("assignment_type", ASSIGNMENT_TYPE)
-        coord.setdefault("assignment_from", ["pm", "human", "cteam"])
+        coord.setdefault("assignment_from", ["pm", "customer", "cteam"])
         state["coordination"] = coord
 
         tm = state.get("tmux", {})
@@ -1604,10 +1643,10 @@ def write_message(
         rec = next(a for a in state["agents"] if a["name"] == recipient)
         agent_dir_msg = root / rec["dir_rel"] / "message.md"
         repo_msg = root / rec["repo_dir_rel"] / "message.md"
-    if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
-        append_text(agent_dir_msg, entry)
-    if repo_msg.exists() and not samefile(repo_msg, msg_path):
-        append_text(repo_msg, entry)
+        if agent_dir_msg.exists() and not samefile(agent_dir_msg, msg_path):
+            append_text(agent_dir_msg, entry)
+        if repo_msg.exists() and not samefile(repo_msg, msg_path):
+            append_text(repo_msg, entry)
 
     # Mirror to sender inbox for conversational context (if it exists and is distinct).
     if sender and sender != recipient:
@@ -1626,9 +1665,9 @@ def write_message(
             maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
         nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
 
-    # Focus the recipient window if tmux is active (helps humans follow the conversation).
+    # Focus recipient only if the sender's window is currently active.
     try:
-        focus_recipient_window(state, recipient)
+        focus_if_sender_active(state, sender, recipient)
     except Exception:
         pass
 
@@ -1795,7 +1834,7 @@ def maybe_start_agent_on_message(
     if recipient == "pm":
         return
 
-    allowed_from = set(coord.get("assignment_from", ["pm", "human", "cteam"]))
+    allowed_from = set(coord.get("assignment_from", ["pm", "customer", "cteam"]))
     if sender not in allowed_from:
         return
 
@@ -1849,7 +1888,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     log_line(root, f"[router] watching mailboxes under {root} (interval={interval}s)")
 
-    last_nudge: Dict[str, float] = {a["name"]: time.time() for a in state["agents"]}
+    now_ts = time.time()
+    last_activity: Dict[str, float] = {a["name"]: now_ts for a in state["agents"]}
     while True:
         try:
             state = load_state(root)
@@ -1884,6 +1924,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if last_mail_sig.get(name) != sig:
                 last_mail_sig[name] = sig
                 new_files.append(msg_path)
+                last_activity[name] = time.time()
 
             if not new_files:
                 continue
@@ -1907,15 +1948,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
             else:
                 log_line(root, f"[router] mailbox updated for {name}, but could not nudge (window missing?)")
 
-        # Idle nudges
+        # PM-level idle nudging: if all non-PM agents are idle >30s, ping PM.
         now = time.time()
-        for a in state["agents"]:
-            name = a["name"]
-            last = last_nudge.get(name, 0)
-            if now - last >= 30:
-                if nudge_agent(root, state, name, reason="IDLE CHECK"):
-                    last_nudge[name] = now
-                    log_line(root, f"[router] idle nudge sent to {name}")
+        non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
+        if non_pm:
+            if all(now - last_activity.get(n, 0) >= 30 for n in non_pm):
+                if not state["tmux"].get("paused", False):
+                    if nudge_agent(root, state, "pm", reason="TEAM IDLE — CHECK IN"):
+                        last_activity["pm"] = now
+                        log_line(root, "[router] team idle; nudged pm to check in")
 
         time.sleep(interval)
 
@@ -2006,7 +2047,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                 readline.write_history_file(history_path)
             except Exception:
                 pass
-            focus_recipient_window(state, "pm")
+            focus_if_sender_active(state, "customer", "pm")
             print(f"[you → pm] {text}")
     finally:
         stop.set()
@@ -2082,7 +2123,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
             write_message(
                 root,
                 state,
-                sender=args.sender or "human",
+                sender=args.sender or "customer",
                 recipient=recipient,
                 subject=args.subject or "chat",
                 body=text,
@@ -2091,7 +2132,7 @@ def cmd_chat(args: argparse.Namespace) -> None:
                 nudge=not args.no_nudge,
                 start_if_needed=args.start_if_needed,
             )
-            focus_recipient_window(state, recipient)
+            focus_if_sender_active(state, args.sender or "customer", recipient)
             print(f"[you → {recipient}] {text}")
     finally:
         stop.set()
@@ -2133,7 +2174,7 @@ def cmd_upload(args: argparse.Namespace) -> None:
         write_message(
             root,
             state,
-            sender=args.sender or "human",
+            sender=args.sender or "customer",
             recipient="pm",
             subject="Upload to shared drive",
             body=body,
@@ -2596,7 +2637,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
     write_message(
         root,
         state,
-        sender=args.sender or "human",
+        sender=args.sender or "customer",
         recipient=args.to,
         subject=args.subject or "",
         body=body,
@@ -2613,7 +2654,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
             start_codex_in_window(root, state, agent, boot=False)
 
     if not args.no_follow:
-        focus_recipient_window(state, args.to)
+        focus_if_sender_active(state, args.sender or "customer", args.to)
 
     print(f"sent to {args.to}")
 
@@ -2630,7 +2671,7 @@ def cmd_broadcast(args: argparse.Namespace) -> None:
     if not body.strip():
         raise CTeamError("message body is empty (provide TEXT or --file)")
 
-    sender = args.sender or "human"
+    sender = args.sender or "pm"
     subject = args.subject or "broadcast"
     for a in state["agents"]:
         write_message(
@@ -2680,7 +2721,7 @@ def cmd_assign(args: argparse.Namespace) -> None:
         start_if_needed=True,
     )
     if not args.no_follow:
-        focus_recipient_window(state, args.to)
+        focus_if_sender_active(state, args.sender or "pm", args.to)
     print(f"assigned to {args.to}")
 
 
@@ -2699,7 +2740,7 @@ def cmd_nudge(args: argparse.Namespace) -> None:
         ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE")
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
     if not args.no_follow and len(targets) == 1:
-        focus_recipient_window(state, targets[0])
+        focus_if_sender_active(state, "pm", targets[0])
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
@@ -2798,7 +2839,7 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
     write_message(
         root,
         state,
-        sender=args.sender or "human",
+        sender=args.sender or "customer",
         recipient="pm",
         subject=args.subject or "Doc-walk kickoff",
         body=(
@@ -2824,7 +2865,7 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
                 write_message(
                     root,
                     state,
-                    sender=args.sender or "human",
+                    sender=args.sender or "customer",
                     recipient=who,
                     subject=subj,
                     body=body,
@@ -3043,14 +3084,3 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-def log_line(root: Path, message: str) -> None:
-    ts = now_iso()
-    line = f"[{ts}] {message}"
-    print(line)
-    try:
-        log_dir = root / DIR_LOGS
-        mkdirp(log_dir)
-        with (log_dir / "router.log").open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
