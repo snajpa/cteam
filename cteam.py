@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-cteam — single-file multi-agent manager for tmux + OpenAI Codex CLI + git repos.
+Clanker Team (cteam) — single-file multi-agent manager for tmux + OpenAI Codex CLI + git repos.
 
 Goal
 - Run multiple Codex "agents" in a tmux session to collaboratively develop a project.
@@ -42,7 +42,9 @@ Security note
     --ask-for-approval never
   and a permissive sandbox default:
     --sandbox danger-full-access
-  Adjust via CLI flags if you want more safety.
+  Adjust via CLI flags if you want more safety. When running Codex directly, set
+  `approval_policy=never` (or `--ask-for-approval never`) for the expected
+  Clanker Team experience.
 
 """
 
@@ -455,6 +457,27 @@ def find_project_root(start: Path) -> Optional[Path]:
         if (p / STATE_FILENAME).exists():
             return p
     return None
+
+
+def sync_cteam_into_agents(root: Path, state: Dict[str, Any]) -> None:
+    """
+    Ensure the current cteam.py is present in every agent workspace and repo clone.
+    Uses safe_link_file to allow symlink/hardlink/copy based on FS support.
+    """
+    cteam_path = root / "cteam.py"
+    if not cteam_path.exists():
+        return
+    for agent in state.get("agents", []):
+        a_dir = root / agent["dir_rel"]
+        repo_dir = root / agent["repo_dir_rel"]
+        try:
+            mkdirp(a_dir)
+            mkdirp(repo_dir)
+            safe_link_file(cteam_path, a_dir / "cteam.py")
+            safe_link_file(cteam_path, repo_dir / "cteam.py")
+        except Exception:
+            # Best-effort; skip failures to avoid breaking the rest of update-workdir.
+            pass
 
 
 # -----------------------------
@@ -1213,7 +1236,7 @@ def render_timeline_template() -> str:
 def render_shared_readme(state: Dict[str, Any]) -> str:
     return textwrap.dedent(
         f"""\
-        # Shared workspace (cteam)
+        # Shared workspace — Clanker Team (cteam)
 
         Project: **{state['project_name']}**
         Root: `{state['root_abs']}`
@@ -1293,7 +1316,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         f"""\
         # AGENTS.md — {agent['name']} ({agent['title']})
 
-        You are a Codex agent in a multi-agent team managed by **cteam**.
+        You are a Codex agent in a multi-agent team managed by **Clanker Team (cteam)**.
 
         Project: **{state['project_name']}**
         Mode: `{mode}`
@@ -1374,6 +1397,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - assigning work to other agents
             - keeping everyone in sync
             - ensuring the project is completed
+            - rebalancing assignments when new agents join or capacity changes
 
             On startup:
             1) Read seed/ (if any) and repo README/docs.
@@ -1383,6 +1407,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
 
             Important:
             - Keep non-PM agents focused on one assignment at a time.
+            - When a new agent is added, onboard them quickly and redistribute work to keep the load balanced.
             - Ask for short status updates; require each agent to keep `STATUS.md` updated.
             - Track long-running/background work; nudge the owner until it completes or is fixed.
             - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
@@ -1485,7 +1510,7 @@ def prompt_on_mail(agent_name: str) -> str:
 def standby_banner(agent: Dict[str, Any], state: Dict[str, Any]) -> str:
     return textwrap.dedent(
         f"""\
-        cteam — {state['project_name']}
+        Clanker Team (cteam) — {state['project_name']}
         Agent window: {agent['name']} ({agent['title']})
         Mode: {state.get('mode','new')}
 
@@ -2027,7 +2052,7 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
     extra = ""
     if agent_name == "pm" and "IDLE" in reason.upper():
         extra = " Check who should be working, unblock them, and assign next steps. Confirm any background tasks are still running."
-    msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md.{extra}"
+    msg = f"{reason}: open message.md and act. Read and update STATUS.md. Make sure progress is being made. {extra}"
     try:
         tmux_send_keys(session, agent_name, ["C-u"])
         if is_codex_running(state, agent_name):
@@ -3287,6 +3312,7 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
 
     install_self_into_root(root)
     ensure_agents_created(root, state)
+    sync_cteam_into_agents(root, state)
 
     updated: List[str] = []
     for a in state["agents"]:
@@ -3295,12 +3321,6 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
         repo_dir = root / a["repo_dir_rel"]
         try:
             safe_link_file(Path("..") / "AGENTS.md", repo_dir / "AGENTS.md")
-        except Exception:
-            pass
-        try:
-            if (root / "cteam.py").exists():
-                safe_link_file(Path("..") / ".." / "cteam.py", a_dir / "cteam.py")
-                safe_link_file(Path("..") / ".." / ".." / "cteam.py", repo_dir / "cteam.py")
         except Exception:
             pass
         updated.append(a["name"])
@@ -3460,6 +3480,37 @@ def cmd_restart(args: argparse.Namespace) -> None:
         print(f"restarted codex in window: {name}")
 
 
+def notify_pm_new_agent(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> None:
+    """
+    Inform the PM that a new agent was added and remind them to balance workloads.
+    """
+    if not any(a["name"] == "pm" for a in state["agents"]):
+        return
+    role = agent.get("role", "agent").replace("_", " ")
+    subject = f"New agent added: {agent.get('name','(unknown)')} ({agent.get('title','')})"
+    lines = [
+        f"A new {role} joined: **{agent.get('name','')}** — {agent.get('title','')}.",
+        "Please balance work across the team: onboard them, delegate tasks, and adjust the plan if needed.",
+        "Keep assignments explicit (`Type: ASSIGNMENT`) and update PLAN/TASKS to reflect the new capacity.",
+    ]
+    body = "\n".join(lines)
+    try:
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient="pm",
+            subject=subject,
+            body=body,
+            msg_type="MESSAGE",
+            task=None,
+            nudge=True,
+            start_if_needed=True,
+        )
+    except Exception:
+        pass
+
+
 def cmd_add_agent(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
@@ -3467,6 +3518,8 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
     state = load_state(root)
 
     role = args.role
+    if role == "project_manager" or (args.name and args.name.strip().lower() == "pm"):
+        raise CTeamError("cannot add another project manager; workspace already has a PM")
     name = args.name
     if not name:
         existing = {a["name"] for a in state["agents"]}
@@ -3476,7 +3529,7 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
                 i += 1
             name = f"dev{i}"
         else:
-            base = {"project_manager": "pm"}.get(role, role)
+            base = role
             if base not in existing:
                 name = base
             else:
@@ -3513,6 +3566,7 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
         if args.start_codex:
             start_codex_in_window(root, state, agent, boot=False)
 
+    notify_pm_new_agent(root, state, agent)
     print(f"added agent: {name} ({title}) role={role}")
 
 
@@ -3818,9 +3872,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_restart.add_argument("--hard", action="store_true", help="send Ctrl-C before respawn (best-effort)")
     p_restart.set_defaults(func=cmd_restart)
 
-    p_add = sub.add_parser("add-agent", help="Add a new agent to an existing workspace.")
+    p_add = sub.add_parser("add-agent", help="Add a new agent to an existing workspace (one PM only).")
     p_add.add_argument("workdir")
-    p_add.add_argument("--role", default="developer", choices=["developer","tester","researcher","architect","project_manager"])
+    p_add.add_argument(
+        "--role",
+        default="developer",
+        choices=["developer","tester","researcher","architect"],
+    )
     p_add.add_argument("--name")
     p_add.add_argument("--title")
     p_add.add_argument("--persona")
