@@ -23,14 +23,17 @@
 - Each agent dir links to the canonical mailbox and shared docs; AGENTS/STATUS templates are generated per role.
 - Shared drive: `shared/drive/` (linked into each agent as `shared-drive/`) for large/non-repo artifacts; **all code/config stays in git**. Keep branches tidy (`agent/<name>/<topic>`), push/pull frequently, avoid history rewrites, and reference shared-drive artifacts in notes/PRs instead of committing them.
 - Upload helper: `cteam upload . path1 [path2 ...] [--dest subpath]` (notifies PM).
-- Roles clarity:
+- Roles clarity (for the cteam tool itself; agent-facing instructions are generated per workspace via `render_agent_agents_md` in cteam.py):
   - PM coordinates sequencing/merge decisions.
+  - PM is the planner/owner, not the implementer; delegate execution to architects/devs/testers/researchers and only code as a last resort.
   - Architect designs and records decisions.
   - Developers implement assigned tasks.
   - Tester/QA tests and verifies (customer should not be asked to test).
   - Researcher reduces uncertainty with actionable notes.
   - **Customer only provides inputs/feedback through PM**—never ask them to do engineering tasks.
   - PM must reply to every customer message promptly; do not leave customer messages unanswered.
+  - PM etiquette: when you read a customer message, reply in that same run with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”), and if you file a task, tell the customer what was filed and when to expect results. No silent reads.
+  - Background-task tracking belongs in agent-facing AGENTS.md (template in cteam.py); ensure agents log long-running work in STATUS and PM nudges owners until completion.
 
 ## Coordination defaults to preserve
 - PM is the coordinator; non-PM agents must wait for explicit `Type: ASSIGNMENT` before coding.

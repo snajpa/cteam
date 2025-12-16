@@ -127,6 +127,28 @@ def ts_for_filename(ts: str) -> str:
     safe = safe.replace("Z", "z").replace("T", "_")
     return safe
 
+def iso_to_unix(ts: str) -> float:
+    try:
+        return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0.0
+
+def customer_state_path(root: Path) -> Path:
+    return root / DIR_RUNTIME / "customer_state.json"
+
+def load_customer_state(root: Path) -> Dict[str, Any]:
+    p = customer_state_path(root)
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_customer_state(root: Path, state: Dict[str, Any]) -> None:
+    try:
+        atomic_write_text(customer_state_path(root), json.dumps(state, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
 
 def slugify(s: str) -> str:
     s = s.strip().lower()
@@ -1264,6 +1286,8 @@ def render_agent_status_template(agent: Dict[str, Any]) -> str:
 def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
     role = agent["role"]
     mode = state.get("mode", "new")
+    agent_cteam_rel = Path("..") / ".." / "cteam.py"
+    repo_cteam_rel = Path("cteam.py")
 
     common = textwrap.dedent(
         f"""\
@@ -1298,6 +1322,22 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         - `shared/GOALS.md`, `shared/PLAN.md`, `shared/TASKS.md`, `shared/DECISIONS.md`
         - `shared/TEAM_ROSTER.md` (who is on the team)
         - `shared/drive/` for large/binary assets; keep code/config in git.
+
+        ## Tooling
+        - cteam CLI from your agent dir: `python3 {agent_cteam_rel} ...`
+        - From your repo clone `proj/`: `python3 {repo_cteam_rel} ...`
+
+        ## Team roles (who does what)
+        - Project Manager (PM): owns scope/priorities and customer comms; plans work and delegates; avoids doing implementation unless absolutely necessary.
+        - Architect: owns technical direction/design; records decisions; partners with PM on scope/impact.
+        - Developers: implement assigned tasks; keep changes small/mergeable; do not self-assign from customer asks.
+        - Tester/QA: owns verification; adds/executes tests; never offload testing to the customer.
+        - Researcher: reduces uncertainty with actionable notes; no direct customer asks.
+        - Customer: provides inputs/feedback only through PM; never asked to do engineering.
+
+        ## Background runs / long tasks
+        - If you start a long-running or background command, record it in `STATUS.md` with owner, command, working dir, start time, expected finish, and purpose.
+        - Tell PM when it starts/finishes; if it stalls, update PM/STATUS.
 
         ## Messaging
         Preferred: use cteam CLI so delivery+nudge is reliable:
@@ -1344,6 +1384,9 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             Important:
             - Keep non-PM agents focused on one assignment at a time.
             - Ask for short status updates; require each agent to keep `STATUS.md` updated.
+            - Track long-running/background work; nudge the owner until it completes or is fixed.
+            - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
+            - Customer channel: when you read a customer message, reply immediately with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”). If you file work, tell the customer what you filed and when you’ll return with results.
             """
         )
     elif role == "architect":
@@ -1614,6 +1657,7 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
 
 
 def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> None:
+    install_self_into_root(root)
     agent_dir = root / agent["dir_rel"]
     mkdirp(agent_dir)
     mkdirp(agent_dir / "notes")
@@ -1665,6 +1709,7 @@ def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) 
         safe_link_dir(Path("..") / "seed-extras", repo_dir / "seed-extras")
 
     if (root / "cteam.py").exists():
+        safe_link_file(Path("..") / ".." / "cteam.py", agent_dir / "cteam.py")
         safe_link_file(Path("..") / ".." / ".." / "cteam.py", repo_dir / "cteam.py")
 
 
@@ -1711,18 +1756,22 @@ def format_message(
     task: Optional[str] = None,
 ) -> str:
     subject_line = subject.strip() if subject.strip() else "(no subject)"
-    task_line = f"**Task:** {task}\n" if task else ""
-    return textwrap.dedent(
-        f"""\
-        ## {ts} — From: {sender} → To: {recipient}
-        **Type:** {msg_type}
-        **Subject:** {subject_line}
-        {task_line}
-        {body.rstrip()}
+    lines = [
+        f"## {ts} — From: {sender} → To: {recipient}",
+        f"**Type:** {msg_type}",
+        f"**Subject:** {subject_line}",
+    ]
+    if task:
+        lines.append(f"**Task:** {task}")
+    lines.append("")  # blank line before body
+    lines.append(body.rstrip())
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    return "\n".join(lines)
 
-        ---
-        """
-    )
+
+MESSAGE_SEPARATOR_RE = re.compile(r"\n\s*---\s*\n")
 
 
 def write_message(
@@ -1768,6 +1817,36 @@ def write_message(
 
     if msg_type == ASSIGNMENT_TYPE:
         append_text(root / DIR_SHARED / "ASSIGNMENTS.log.md", entry)
+
+    if sender == "pm" and recipient == "customer":
+        cust_state = load_customer_state(root)
+        cust_state["last_pm_reply_ts"] = ts
+        save_customer_state(root, cust_state)
+
+    if sender == "customer" and recipient == "pm":
+        cust_state = load_customer_state(root)
+        cust_state["last_customer_msg_ts"] = ts
+        save_customer_state(root, cust_state)
+        ack_body = (
+            "Automated acknowledgement: we received your message and notified the PM. "
+            "They will reply in this chat promptly. If action is needed, the PM will file the task "
+            "and share status/results here."
+        )
+        try:
+            write_message(
+                root,
+                state,
+                sender="cteam",
+                recipient="customer",
+                subject="We received your message — PM notified",
+                body=ack_body,
+                msg_type="MESSAGE",
+                task=None,
+                nudge=False,
+                start_if_needed=False,
+            )
+        except Exception:
+            pass
 
     # Save a copy in sender outbox (if sender is known) for local context.
     if sender in (allowed):
@@ -1946,8 +2025,8 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
         pass
 
     extra = ""
-    if agent_name == "pm" and "TEAM IDLE" in reason.upper():
-        extra = " Check who should be working, unblock them, and assign next steps."
+    if agent_name == "pm" and "IDLE" in reason.upper():
+        extra = " Check who should be working, unblock them, and assign next steps. Confirm any background tasks are still running."
     msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md.{extra}"
     try:
         tmux_send_keys(session, agent_name, ["C-u"])
@@ -2311,7 +2390,7 @@ class TelegramBridge:
             return
 
         self._customer_buf += new_txt
-        parts = self._customer_buf.split("\n---\n")
+        parts = MESSAGE_SEPARATOR_RE.split(self._customer_buf)
         complete = parts[:-1]
         self._customer_buf = parts[-1]
         for entry in complete:
@@ -2457,6 +2536,23 @@ def cmd_watch(args: argparse.Namespace) -> None:
             else:
                 log_line(root, f"[router] mailbox updated for {name}, but could not nudge (window missing?)")
 
+        # Customer wait loop: if last inbound from customer lacks a PM reply, keep nudging PM.
+        try:
+            cust_state = load_customer_state(root)
+            last_in = iso_to_unix(str(cust_state.get("last_customer_msg_ts", "")))
+            last_out = iso_to_unix(str(cust_state.get("last_pm_reply_ts", "")))
+            last_nag = iso_to_unix(str(cust_state.get("last_pm_nag_ts", "")))
+            if last_in and (not last_out or last_out < last_in):
+                now_ts = time.time()
+                should_nag = not last_nag or last_nag < last_in or (now_ts - last_nag) >= 60
+                if should_nag:
+                    if nudge_agent(root, state, "pm", reason="CUSTOMER WAITING — REPLY NOW"):
+                        cust_state["last_pm_nag_ts"] = now_iso()
+                        save_customer_state(root, cust_state)
+                        log_line(root, "[router] nudged pm to reply to customer")
+        except Exception:
+            pass
+
         # PM-level idle nudging: if all non-PM agents are idle >30s, ping PM.
         now = time.time()
         non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
@@ -2516,7 +2612,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                     stop.wait(0.5)
                     continue
                 buf += new_txt
-                parts = buf.split("\n---\n")
+                parts = MESSAGE_SEPARATOR_RE.split(buf)
                 complete = parts[:-1]
                 buf = parts[-1]
                 for entry in complete:
@@ -3189,6 +3285,7 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
         raise CTeamError("could not find cteam.json in this directory or its parents")
     state = load_state(root)
 
+    install_self_into_root(root)
     ensure_agents_created(root, state)
 
     updated: List[str] = []
@@ -3198,6 +3295,12 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
         repo_dir = root / a["repo_dir_rel"]
         try:
             safe_link_file(Path("..") / "AGENTS.md", repo_dir / "AGENTS.md")
+        except Exception:
+            pass
+        try:
+            if (root / "cteam.py").exists():
+                safe_link_file(Path("..") / ".." / "cteam.py", a_dir / "cteam.py")
+                safe_link_file(Path("..") / ".." / ".." / "cteam.py", repo_dir / "cteam.py")
         except Exception:
             pass
         updated.append(a["name"])
