@@ -61,6 +61,8 @@ import threading
 import readline
 import textwrap
 import time
+import urllib.request
+import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -71,7 +73,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # -----------------------------
 
 STATE_FILENAME = "cteam.json"
-STATE_VERSION = 4
+STATE_VERSION = 5
 
 DIR_PROJECT_BARE = "project.git"
 DIR_PROJECT_CHECKOUT = "project"
@@ -95,6 +97,10 @@ DEFAULT_CODEX_APPROVAL = "never"               # untrusted | on-failure | on-req
 DEFAULT_CODEX_SEARCH = True
 
 DEFAULT_AUTOSTART = "all"  # pm | pm+architect | all
+
+
+TELEGRAM_CONFIG_REL = f"{DIR_RUNTIME}/telegram.json"
+TELEGRAM_MAX_MESSAGE = 3900  # Telegram hard limit is 4096; keep margin.
 
 # For robust "assignment" detection
 ASSIGNMENT_TYPE = "ASSIGNMENT"
@@ -163,6 +169,100 @@ def log_line(root: Path, message: str) -> None:
             f.write(line + "\n")
     except Exception:
         pass
+
+
+
+# -----------------------------
+# Readline helpers (interactive UX)
+# -----------------------------
+
+def configure_readline(history_path: Optional[Path] = None) -> None:
+    """Best-effort readline configuration + persistent history."""
+    try:
+        readline.parse_and_bind("set editing-mode emacs")
+        readline.parse_and_bind('"\\e[1;5D": backward-word')
+        readline.parse_and_bind('"\\e[1;5C": forward-word')
+        readline.parse_and_bind("set show-all-if-ambiguous on")
+        readline.parse_and_bind("TAB: complete")
+    except Exception:
+        pass
+
+    if not history_path:
+        return
+    try:
+        mkdirp(history_path.parent)
+        readline.read_history_file(history_path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _readline_save_history(history_path: Optional[Path]) -> None:
+    if not history_path:
+        return
+    try:
+        mkdirp(history_path.parent)
+        readline.write_history_file(history_path)
+    except Exception:
+        pass
+
+
+def prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
+    suffix = " [Y/n] " if default else " [y/N] "
+    while True:
+        try:
+            raw = input(prompt + suffix).strip().lower()
+        except EOFError:
+            return default
+        if not raw:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("Please type 'y' or 'n'.")
+
+
+def prompt_line(prompt: str, *, default: Optional[str] = None, secret: bool = False) -> str:
+    show = f" [{default}]" if default else ""
+    while True:
+        try:
+            if secret:
+                import getpass  # type: ignore
+                raw = getpass.getpass(prompt + show + ": ")
+            else:
+                raw = input(prompt + show + ": ")
+        except EOFError:
+            return default or ""
+        raw = raw.strip()
+        if raw:
+            return raw
+        if default is not None:
+            return default
+
+
+def prompt_multiline(
+    header: str,
+    *,
+    terminator: str = ".",
+    history_path: Optional[Path] = None,
+) -> str:
+    """Capture multiline input. Finish with a line containing only `terminator` or Ctrl-D."""
+    print(header.rstrip())
+    print(f"(paste multiple lines; finish with a line containing only '{terminator}', or press Ctrl-D)")
+    lines: List[str] = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            print("")  # newline after Ctrl-D
+            break
+        if line.strip() == terminator:
+            break
+        lines.append(line.rstrip("\n"))
+    _readline_save_history(history_path)
+    return "\n".join(lines).rstrip() + "\n" if lines else ""
 
 
 def ensure_executable(name: str, hint: str = "") -> None:
@@ -821,6 +921,10 @@ def build_state(
             "router": bool(router),
             "paused": False,
         },
+                "telegram": {
+            "enabled": False,
+            "config_rel": TELEGRAM_CONFIG_REL,
+        },
         "agents": agents_list,
     }
 
@@ -836,13 +940,14 @@ def compute_agent_abspaths(state: Dict[str, Any]) -> None:
         a["repo_dir_abs"] = str((root / a["repo_dir_rel"]).resolve())
 
 
+
 def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
     v = int(state.get("version") or 1)
     if v == STATE_VERSION:
         return state
 
+    # --- v < 4 upgrades (legacy) ---
     if v < 4:
-        state["version"] = STATE_VERSION
         state.setdefault("created_at", now_iso())
         state.setdefault("project_name", root.name)
         state.setdefault("mode", state.get("mode", "new"))
@@ -884,9 +989,18 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
                 a["repo_dir_rel"] = f"{a['dir_rel']}/proj"
         state["agents"] = agents
 
-        compute_agent_abspaths(state)
-        save_state(root, state)
+    # --- v < 5 upgrades (Telegram integration state) ---
+    if v < 5:
+        tg = state.get("telegram", {})
+        if not isinstance(tg, dict):
+            tg = {}
+        tg.setdefault("enabled", False)
+        tg.setdefault("config_rel", TELEGRAM_CONFIG_REL)
+        state["telegram"] = tg
 
+    state["version"] = STATE_VERSION
+    compute_agent_abspaths(state)
+    save_state(root, state)
     return state
 
 
@@ -1851,6 +1965,336 @@ def maybe_start_agent_on_message(
 
 
 # -----------------------------
+
+# -----------------------------
+# Telegram integration (customer channel bridge)
+# -----------------------------
+
+def telegram_config_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Path:
+    rel = None
+    if state:
+        rel = (state.get("telegram") or {}).get("config_rel")
+    rel = rel or TELEGRAM_CONFIG_REL
+    return (root / rel).resolve()
+
+
+def _chmod_private(path: Path) -> None:
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+
+
+def _normalize_phone(p: str) -> str:
+    return "".join(ch for ch in (p or "") if ch.isdigit())
+
+
+def telegram_load_config(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
+    cfg_path = telegram_config_path(root, state)
+    if not cfg_path.exists():
+        raise CTeamError(
+            f"telegram not configured: missing {cfg_path}. Run: python3 cteam.py telegram-configure {shlex.quote(str(root))}"
+        )
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise CTeamError(f"invalid telegram config JSON: {cfg_path} ({e})") from e
+
+    token = (cfg.get("bot_token") or "").strip()
+    phone = (cfg.get("authorized_phone") or "").strip()
+    if not token or not phone:
+        raise CTeamError(f"telegram config incomplete (need bot_token + authorized_phone): {cfg_path}")
+    cfg["authorized_phone_norm"] = _normalize_phone(phone)
+    return cfg
+
+
+def telegram_save_config(root: Path, state: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+    cfg_path = telegram_config_path(root, state)
+    cfg2 = dict(cfg)
+    cfg2.pop("authorized_phone_norm", None)
+    atomic_write_text(cfg_path, json.dumps(cfg2, indent=2, sort_keys=True) + "\n")
+    _chmod_private(cfg_path)
+
+
+def _telegram_api(token: str, method: str, payload: Dict[str, Any], *, timeout: float = 30.0) -> Any:
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise CTeamError(f"telegram HTTP error calling {method}: {e.code} {e.reason}\n{detail}".strip()) from e
+    except Exception as e:
+        raise CTeamError(f"telegram error calling {method}: {e}") from e
+
+    try:
+        obj = json.loads(raw)
+    except Exception as e:
+        raise CTeamError(f"telegram non-JSON response from {method}: {raw[:400]}") from e
+    if not obj.get("ok"):
+        raise CTeamError(f"telegram API returned ok=false for {method}: {raw[:600]}")
+    return obj.get("result")
+
+
+def _telegram_send_text(cfg: Dict[str, Any], text: str) -> None:
+    chat_id = cfg.get("chat_id")
+    token = cfg.get("bot_token")
+    if not chat_id or not token:
+        return
+    t = (text or "").rstrip()
+    if not t:
+        t = "(empty message)"
+    chunks: List[str] = []
+    while len(t) > TELEGRAM_MAX_MESSAGE:
+        chunks.append(t[:TELEGRAM_MAX_MESSAGE])
+        t = t[TELEGRAM_MAX_MESSAGE:]
+    if t:
+        chunks.append(t)
+    for c in chunks:
+        _telegram_api(token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=20.0)
+
+
+def _telegram_request_contact(cfg: Dict[str, Any], chat_id: int) -> None:
+    token = cfg.get("bot_token")
+    if not token:
+        return
+    markup = {
+        "keyboard": [[{"text": "Share phone number", "request_contact": True}]],
+        "resize_keyboard": True,
+        "one_time_keyboard": True,
+    }
+    _telegram_api(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": "To link this bot to your cteam customer channel, please share your phone number.",
+            "reply_markup": markup,
+        },
+        timeout=20.0,
+    )
+
+
+def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str], str, str]:
+    ts = None
+    sender = None
+    recipient = None
+    subject = ""
+    lines = entry.splitlines()
+    if lines:
+        m = re.match(r"^##\s+(.+?)\s+—\s+From:\s*([^\s→]+)\s+→\s+To:\s*([^\s]+)\s*$", lines[0].strip())
+        if m:
+            ts = m.group(1).strip()
+            sender = m.group(2).strip()
+            recipient = m.group(3).strip()
+
+    m2 = re.search(r"\*\*Subject:\*\*\s*(.+)", entry)
+    if m2:
+        subject = m2.group(1).strip()
+
+    body_start = 0
+    for i, line in enumerate(lines[:25]):
+        if line.strip().startswith("**Subject:**"):
+            body_start = i + 1
+            break
+    while body_start < len(lines) and lines[body_start].strip().startswith("**Task:**"):
+        body_start += 1
+    while body_start < len(lines) and not lines[body_start].strip():
+        body_start += 1
+
+    body_lines: List[str] = []
+    for line in lines[body_start:]:
+        if line.strip() == "---":
+            break
+        body_lines.append(line)
+    body = "\n".join(body_lines).rstrip()
+    return ts, sender, recipient, subject, body
+
+
+class TelegramBridge:
+    """Bridges Telegram <-> cteam customer channel."""
+
+    def __init__(self, root: Path, state: Dict[str, Any]) -> None:
+        self.root = root
+        self.state = state
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self._customer_pos: int = 0
+        self._customer_buf: str = ""
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.thread.join(timeout=2.0)
+
+    def run(self) -> None:
+        try:
+            cfg = telegram_load_config(self.root, self.state)
+        except Exception as e:
+            log_line(self.root, f"[telegram] disabled: {e}")
+            return
+
+        cfg_path = telegram_config_path(self.root, self.state)
+        customer_file = self.root / DIR_MAIL / "customer" / "message.md"
+        try:
+            self._customer_pos = customer_file.stat().st_size
+        except Exception:
+            self._customer_pos = 0
+
+        offset = int(cfg.get("update_offset") or 0)
+        last_saved = time.time()
+        log_line(self.root, f"[telegram] bridge started (config={cfg_path})")
+
+        while not self.stop_event.is_set():
+            self._maybe_forward_outbound(cfg, customer_file)
+
+            try:
+                updates = _telegram_api(
+                    cfg["bot_token"],
+                    "getUpdates",
+                    {"timeout": 6, "offset": offset, "allowed_updates": ["message"]},
+                    timeout=12.0,
+                )
+                if not isinstance(updates, list):
+                    updates = []
+            except Exception as e:
+                log_line(self.root, f"[telegram] getUpdates error: {e}")
+                time.sleep(1.5)
+                continue
+
+            for upd in updates:
+                try:
+                    offset = max(offset, int(upd.get("update_id", 0)) + 1)
+                    msg = upd.get("message") or {}
+                    if msg:
+                        self._handle_inbound(cfg, msg)
+                except Exception as e:
+                    log_line(self.root, f"[telegram] inbound handling error: {e}")
+
+            if time.time() - last_saved >= 3.0:
+                try:
+                    cfg["update_offset"] = offset
+                    telegram_save_config(self.root, self.state, cfg)
+                    last_saved = time.time()
+                except Exception:
+                    pass
+
+        try:
+            cfg["update_offset"] = offset
+            telegram_save_config(self.root, self.state, cfg)
+        except Exception:
+            pass
+        log_line(self.root, "[telegram] bridge stopped")
+
+    def _is_authorized_sender(self, cfg: Dict[str, Any], msg: Dict[str, Any]) -> bool:
+        chat = msg.get("chat") or {}
+        frm = msg.get("from") or {}
+        if cfg.get("chat_id") and cfg.get("user_id"):
+            return int(chat.get("id", 0)) == int(cfg["chat_id"]) and int(frm.get("id", 0)) == int(cfg["user_id"])
+        return False
+
+    def _handle_inbound(self, cfg: Dict[str, Any], msg: Dict[str, Any]) -> None:
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        text = (msg.get("text") or "").strip()
+        contact = msg.get("contact")
+
+        # First-time setup: require contact share that matches configured authorized phone number.
+        if contact and chat_id:
+            phone_norm = _normalize_phone(str(contact.get("phone_number") or ""))
+            if phone_norm and phone_norm == cfg.get("authorized_phone_norm"):
+                frm = msg.get("from") or {}
+                cfg["chat_id"] = int(chat_id)
+                cfg["user_id"] = int(frm.get("id", 0) or 0)
+                telegram_save_config(self.root, self.state, cfg)
+                _telegram_send_text(cfg, "✅ Linked! This chat is now authorized for the cteam customer channel.")
+                log_line(self.root, f"[telegram] authorized chat_id={cfg['chat_id']} user_id={cfg['user_id']}")
+            else:
+                tmp = dict(cfg)
+                tmp["chat_id"] = int(chat_id)
+                _telegram_send_text(tmp, "⛔ Not authorized (phone number did not match).")
+            return
+
+        if text == "/start" and chat_id:
+            _telegram_request_contact(cfg, int(chat_id))
+            return
+
+        if not self._is_authorized_sender(cfg, msg):
+            return
+
+        if not text:
+            if msg.get("photo"):
+                text = "[sent a photo]"
+            elif msg.get("document"):
+                text = "[sent a document]"
+            elif msg.get("sticker"):
+                text = "[sent a sticker]"
+            else:
+                text = "[sent a non-text message]"
+
+        try:
+            state = load_state(self.root)
+        except Exception:
+            state = self.state
+
+        write_message(
+            self.root,
+            state,
+            sender="customer",
+            recipient="pm",
+            subject="Telegram",
+            body=text,
+            msg_type="MESSAGE",
+            task=None,
+            nudge=True,
+            start_if_needed=True,
+        )
+
+    def _maybe_forward_outbound(self, cfg: Dict[str, Any], customer_file: Path) -> None:
+        if not cfg.get("chat_id"):
+            return
+        try:
+            if not customer_file.exists():
+                return
+            with customer_file.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(self._customer_pos)
+                new_txt = f.read()
+                self._customer_pos = f.tell()
+            if not new_txt:
+                return
+        except Exception:
+            return
+
+        self._customer_buf += new_txt
+        parts = self._customer_buf.split("\n---\n")
+        complete = parts[:-1]
+        self._customer_buf = parts[-1]
+        for entry in complete:
+            entry = entry.strip("\n")
+            if not entry:
+                continue
+            entry = entry + "\n---\n"
+            ts, sender, recipient, subject, body = _parse_entry(entry)
+            if recipient != "customer":
+                continue
+            out = f"[{ts or now_iso()}] {sender or 'cteam'}\n"
+            if subject:
+                out += f"Subject: {subject}\n"
+            out += (body or "(no body)")
+            try:
+                _telegram_send_text(cfg, out)
+            except Exception as e:
+                log_line(self.root, f"[telegram] send error: {e}")
+
+
 # Router / watch loop
 # -----------------------------
 
@@ -1872,6 +2316,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
     ensure_tmux_session(root, state)
 
     interval = max(0.5, float(args.interval))
+
+    telegram_bridge: Optional[TelegramBridge] = None
+    telegram_enabled = False
 
     seen_inbox: Dict[str, set[str]] = {}
     last_mail_sig: Dict[str, Tuple[int, int]] = {}
@@ -1895,6 +2342,25 @@ def cmd_watch(args: argparse.Namespace) -> None:
             state = load_state(root)
         except Exception:
             pass
+
+        # Start/stop Telegram bridge based on persisted state.
+        want_enabled = bool((state.get("telegram") or {}).get("enabled", False))
+        if want_enabled != telegram_enabled:
+            telegram_enabled = want_enabled
+            if telegram_bridge:
+                try:
+                    telegram_bridge.stop()
+                except Exception:
+                    pass
+                telegram_bridge = None
+            if telegram_enabled:
+                try:
+                    telegram_bridge = TelegramBridge(root, state)
+                    telegram_bridge.start()
+                    log_line(root, "[router] telegram bridge enabled")
+                except Exception as e:
+                    log_line(root, f"[router] telegram bridge failed to start: {e}")
+                    telegram_bridge = None
 
         session = state["tmux"]["session"]
         if not tmux_has_session(session):
@@ -1969,10 +2435,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
 
     history_path = root / DIR_RUNTIME / "customer_chat.history"
     mkdirp(history_path.parent)
-    try:
-        readline.read_history_file(history_path)
-    except FileNotFoundError:
-        pass
+    configure_readline(history_path)
 
     chat_dir = root / DIR_MAIL / "customer"
     mkdirp(chat_dir / "inbox")
@@ -1992,12 +2455,6 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    try:
-        readline.parse_and_bind("set editing-mode emacs")
-        readline.parse_and_bind('"\\e[1;5D": backward-word')
-        readline.parse_and_bind('"\\e[1;5C": forward-word')
-    except Exception:
-        pass
 
     stop = threading.Event()
 
@@ -2044,7 +2501,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
             )
             try:
                 readline.add_history(text)
-                readline.write_history_file(history_path)
+                _readline_save_history(history_path)
             except Exception:
                 pass
             focus_if_sender_active(state, "customer", "pm")
@@ -2060,6 +2517,9 @@ def cmd_chat(args: argparse.Namespace) -> None:
     if not (root / STATE_FILENAME).exists():
         raise CTeamError("chat: could not find cteam.json in this directory or its parents")
     state = load_state(root)
+
+    history_path = root / DIR_RUNTIME / f"chat_{slugify(args.to)}.history"
+    configure_readline(history_path)
 
     agent_names = {a["name"] for a in state["agents"]}
     allowed = set(agent_names) | {"customer"}
@@ -2082,12 +2542,6 @@ def cmd_chat(args: argparse.Namespace) -> None:
     except Exception:
         pass
 
-    try:
-        readline.parse_and_bind("set editing-mode emacs")
-        readline.parse_and_bind('"\\e[1;5D": backward-word')
-        readline.parse_and_bind('"\\e[1;5C": forward-word')
-    except Exception:
-        pass
 
     stop = threading.Event()
 
@@ -2268,6 +2722,47 @@ def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: boo
 # Commands
 # -----------------------------
 
+def _init_wizard(root: Path, state: Dict[str, Any], *, ask_telegram: bool = True) -> Dict[str, Any]:
+    """Interactive init wizard: capture seed text and optionally configure Telegram."""
+    history_path = root / DIR_RUNTIME / "init_wizard.history"
+    configure_readline(history_path)
+
+    seed_file = root / DIR_SEED / "SEED.md"
+    if not seed_file.exists() or not seed_file.read_text(encoding="utf-8", errors="replace").strip():
+        seed_txt = prompt_multiline("Paste customer/seed requirements (optional).", history_path=history_path)
+        if seed_txt.strip():
+            atomic_write_text(seed_file, "# Seed input\n\n" + seed_txt.strip() + "\n")
+
+    extras_file = root / DIR_SEED_EXTRAS / "EXTRAS.md"
+    if not extras_file.exists() or not extras_file.read_text(encoding="utf-8", errors="replace").strip():
+        extras_txt = prompt_multiline("Paste seed-extras (links, research notes) (optional).", history_path=history_path)
+        if extras_txt.strip():
+            atomic_write_text(extras_file, "# Seed extras\n\n" + extras_txt.strip() + "\n")
+
+    if ask_telegram and prompt_yes_no("Configure Telegram customer chat now?", default=False):
+        token = prompt_line("Telegram bot token (from @BotFather)", default="")
+        phone = prompt_line("Authorized phone number (digits; E.164 preferred, e.g. +15551234567)", default="")
+        cfg = {
+            "configured_at": now_iso(),
+            "bot_token": token.strip(),
+            "authorized_phone": phone.strip(),
+            "chat_id": None,
+            "user_id": None,
+            "update_offset": 0,
+        }
+        telegram_save_config(root, state, cfg)
+
+        if prompt_yes_no("Enable Telegram integration now?", default=True):
+            state.setdefault("telegram", {})
+            state["telegram"]["enabled"] = True
+            save_state(root, state)
+            print("Telegram enabled. After startup, open your bot in Telegram and send /start, then share contact.")
+
+    _readline_save_history(history_path)
+    return state
+
+
+
 def cmd_init(args: argparse.Namespace) -> None:
     root = Path(args.workdir).expanduser().resolve()
     if root.exists() and any(root.iterdir()) and not args.force:
@@ -2307,6 +2802,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     state = load_state(root)
+    if sys.stdin.isatty() and not args.no_interactive:
+        state = _init_wizard(root, state, ask_telegram=True)
+        state = load_state(root)
     write_message(
         root,
         state,
@@ -2518,6 +3016,8 @@ def cmd_status(args: argparse.Namespace) -> None:
     print(f"Mode: {state.get('mode','new')}")
     print(f"tmux session: {state['tmux']['session']}")
     print(f"autostart: {state.get('coordination',{}).get('autostart')}")
+    tg = state.get("telegram") or {}
+    print(f"telegram: enabled={bool(tg.get('enabled', False))} config={tg.get('config_rel', TELEGRAM_CONFIG_REL)}")
     print("")
 
     for a in state["agents"]:
@@ -2878,6 +3378,88 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
     print("doc-walk kickoff sent (PM-led)")
 
 
+
+# -----------------------------
+# Telegram commands
+# -----------------------------
+
+def cmd_telegram_configure(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("telegram-configure: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    history_path = root / DIR_RUNTIME / "telegram_configure.history"
+    if sys.stdin.isatty() and not args.no_interactive:
+        configure_readline(history_path)
+
+    token = (args.token or "").strip()
+    phone = (args.phone or "").strip()
+
+    if sys.stdin.isatty() and not args.no_interactive:
+        if not token:
+            token = prompt_line("Telegram bot token (from @BotFather)", default="")
+        if not phone:
+            phone = prompt_line("Authorized phone number (digits; E.164 preferred, e.g. +15551234567)", default="")
+
+    token = token.strip()
+    phone = phone.strip()
+    if not token or not phone:
+        raise CTeamError("telegram-configure: need --token and --phone (or run interactively)")
+
+    cfg = {
+        "configured_at": now_iso(),
+        "bot_token": token,
+        "authorized_phone": phone,
+        "chat_id": None,
+        "user_id": None,
+        "update_offset": 0,
+    }
+    telegram_save_config(root, state, cfg)
+
+    print(f"Wrote Telegram config: {telegram_config_path(root, state)}")
+    print("")
+    print("Next steps:")
+    print("1) In Telegram, open your bot chat and send /start.")
+    print("2) Tap 'Share phone number' to authorize (must match the configured phone).")
+    print("3) Enable integration:")
+    print(f"   python3 cteam.py telegram-enable {shlex.quote(str(root))}")
+
+
+def cmd_telegram_enable(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("telegram-enable: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    _ = telegram_load_config(root, state)  # validate
+
+    state.setdefault("telegram", {})
+    state["telegram"]["enabled"] = True
+
+    if not state.get("tmux", {}).get("router", True):
+        state["tmux"]["router"] = True
+
+    save_state(root, state)
+
+    print("Telegram integration enabled.")
+    print("If the router is running (`cteam watch`), it will start bridging immediately.")
+    print("If not, open/start the workspace (tmux router runs the watcher):")
+    print(f"  python3 cteam.py open {shlex.quote(str(root))}")
+
+
+def cmd_telegram_disable(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    if not (root / STATE_FILENAME).exists():
+        raise CTeamError("telegram-disable: could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    state.setdefault("telegram", {})
+    state["telegram"]["enabled"] = False
+    save_state(root, state)
+    print("Telegram integration disabled.")
+
+
 # -----------------------------
 # CLI
 # -----------------------------
@@ -2910,6 +3492,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_init = sub.add_parser("init", help="Initialize a new cteam workspace (empty repo).")
     add_common_workspace(p_init)
+    p_init.add_argument("--no-interactive", action="store_true", help="Disable interactive init wizard.")
     p_init.add_argument("--name", help="Project name (default: folder name).")
     p_init.add_argument("--devs", type=int, default=1, help="Number of developer agents.")
     p_init.add_argument("--force", action="store_true", help="Reuse non-empty directory.")
@@ -3062,6 +3645,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--task")
     p_doc.add_argument("--auto", action="store_true", help="Also assign initial doc tasks to architect/tester/researcher.")
     p_doc.set_defaults(func=cmd_doc_walk)
+
+
+    p_tg_cfg = sub.add_parser("telegram-configure", help="Configure Telegram bot credentials for customer chat.")
+    p_tg_cfg.add_argument("workdir")
+    p_tg_cfg.add_argument("--token", help="Bot token from @BotFather (stored locally).")
+    p_tg_cfg.add_argument("--phone", help="Authorized phone number (digits; E.164 preferred).")
+    p_tg_cfg.add_argument("--no-interactive", action="store_true", help="Do not prompt (require flags).")
+    p_tg_cfg.set_defaults(func=cmd_telegram_configure)
+
+    p_tg_en = sub.add_parser("telegram-enable", help="Enable Telegram customer chat bridge (requires prior configure).")
+    p_tg_en.add_argument("workdir")
+    p_tg_en.set_defaults(func=cmd_telegram_enable)
+
+    p_tg_dis = sub.add_parser("telegram-disable", help="Disable Telegram customer chat bridge.")
+    p_tg_dis.add_argument("workdir")
+    p_tg_dis.set_defaults(func=cmd_telegram_disable)
 
     return p
 
