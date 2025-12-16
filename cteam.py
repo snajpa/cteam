@@ -1945,7 +1945,10 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
     except Exception:
         pass
 
-    msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md."
+    extra = ""
+    if agent_name == "pm" and "TEAM IDLE" in reason.upper():
+        extra = " Check who should be working, unblock them, and assign next steps."
+    msg = f"{reason}: open message.md and act. If assigned, proceed; update STATUS.md.{extra}"
     try:
         tmux_send_keys(session, agent_name, ["C-u"])
         if is_codex_running(state, agent_name):
@@ -3180,6 +3183,28 @@ def cmd_seed_sync(args: argparse.Namespace) -> None:
     print("seed synced")
 
 
+def cmd_update_workdir(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir))
+    if not root:
+        raise CTeamError("could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    ensure_agents_created(root, state)
+
+    updated: List[str] = []
+    for a in state["agents"]:
+        a_dir = root / a["dir_rel"]
+        atomic_write_text(a_dir / "AGENTS.md", render_agent_agents_md(state, a))
+        repo_dir = root / a["repo_dir_rel"]
+        try:
+            safe_link_file(Path("..") / "AGENTS.md", repo_dir / "AGENTS.md")
+        except Exception:
+            pass
+        updated.append(a["name"])
+
+    print("updated AGENTS.md for agents: " + ", ".join(updated))
+
+
 def cmd_msg(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
@@ -3637,6 +3662,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_seed.add_argument("workdir")
     p_seed.add_argument("--clean", action="store_true")
     p_seed.set_defaults(func=cmd_seed_sync)
+
+    p_update = sub.add_parser("update-workdir", help="Refresh agent AGENTS.md files from current cteam templates.")
+    p_update.add_argument("workdir")
+    p_update.set_defaults(func=cmd_update_workdir)
 
     p_msg = sub.add_parser("msg", help="Send a message to one agent.")
     p_msg.add_argument("workdir")

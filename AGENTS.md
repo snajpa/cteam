@@ -30,6 +30,7 @@
   - Tester/QA tests and verifies (customer should not be asked to test).
   - Researcher reduces uncertainty with actionable notes.
   - **Customer only provides inputs/feedback through PM**—never ask them to do engineering tasks.
+  - PM must reply to every customer message promptly; do not leave customer messages unanswered.
 
 ## Coordination defaults to preserve
 - PM is the coordinator; non-PM agents must wait for explicit `Type: ASSIGNMENT` before coding.
