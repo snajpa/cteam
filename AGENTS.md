@@ -58,6 +58,7 @@ The Telegram integration exists to make the “customer chat” behave like toda
 
 - **Inbound (Telegram → cteam):**
   - Telegram messages from the authorized user are recorded as messages from `customer` to `pm` in the file mailbox system.
+  - Images sent from Telegram are downloaded to `shared/drive/telegram/` and referenced in the PM/customer mailboxes.
 - **Outbound (cteam → Telegram):**
   - Messages addressed to `customer` are forwarded to Telegram when Telegram is enabled.
 
@@ -120,6 +121,7 @@ Persistence model:
   - bot token + authorized phone are stored under `shared/runtime/` (runtime-only)
   - enable/disable state must persist in `cteam.json` and be honored on resume/open/watch
   - enforce single authorized customer identity (no “anyone who knows the bot”)
+  - inbound Telegram images are saved to `shared/drive/telegram/` (never committed to git)
 
 ## Manual test recipe (no automated tests yet)
 - Dry run help:

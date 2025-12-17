@@ -67,7 +67,7 @@ import urllib.request
 import urllib.error
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 # -----------------------------
@@ -107,6 +107,7 @@ TELEGRAM_MAX_MESSAGE = 3900  # Telegram hard limit is 4096; keep margin.
 # For robust "assignment" detection
 ASSIGNMENT_TYPE = "ASSIGNMENT"
 
+_nudge_history: Dict[str, Tuple[float, Set[str]]] = {}
 
 class CTeamError(RuntimeError):
     pass
@@ -1768,6 +1769,13 @@ def format_message(
 MESSAGE_SEPARATOR_RE = re.compile(r"\n\s*---\s*\n")
 
 
+def _split_reasons(reason_text: str) -> Set[str]:
+    parts = [p.strip() for p in (reason_text or "").split("/") if p.strip()]
+    if not parts:
+        parts = [reason_text or "NUDGE"]
+    return set(parts)
+
+
 def write_message(
     root: Path,
     state: Dict[str, Any],
@@ -2023,9 +2031,9 @@ def nudge_agent(
     if agent_name == "pm" and "IDLE" in reason.upper():
         extra = " Check who should be working, unblock them, and assign next steps. Confirm any background tasks are still running."
     if interrupt:
-        msg = f"INTERRUPT — {reason}: open message.md now. Update STATUS.md after acting. {extra}"
+        msg = f"INTERRUPT — {reason}: open message.md now and check if you replied to everything. Update STATUS.md after acting. {extra}"
     else:
-        msg = f"{reason}: open message.md and act. Read and update STATUS.md. Make sure progress is being made. {extra}"
+        msg = f"{reason}: open message.md and act. Also check if you replied to everything. Read and update STATUS.md. Make sure progress is being made. If you need anything from me, the customer, you can only reach me via the customer-pm chat, not here. {extra}"
     try:
         if interrupt:
             try:
@@ -2034,12 +2042,92 @@ def nudge_agent(
             except Exception:
                 pass
         tmux_send_keys(session, agent_name, ["C-u"])
+        ok = False
         if is_codex_running(state, agent_name):
             wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
-            return tmux_send_line_when_quiet(session, agent_name, msg)
-        return tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
+            ok = tmux_send_line_when_quiet(session, agent_name, msg)
+        else:
+            ok = tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
+        if ok:
+            _nudge_history[agent_name] = (time.time(), _split_reasons(reason))
+        return ok
     except Exception:
         return False
+
+
+class NudgeQueue:
+    """Batch and deduplicate nudges before sending to tmux windows; defers until pane idle."""
+
+    def __init__(self, root: Path, *, min_interval: float = 2.0, idle_for: float = 1.0) -> None:
+        self.root = root
+        self.min_interval = max(0.0, float(min_interval))
+        self.idle_for = max(0.0, float(idle_for))
+        self.pending: Dict[str, Dict[str, Any]] = {}
+        self.last_sent: Dict[str, Tuple[float, Set[str]]] = {}
+        self._pane_state: Dict[str, Tuple[Tuple[int, str], float]] = {}
+
+    def request(self, agent_name: str, reason: str, *, interrupt: bool = False) -> None:
+        entry = self.pending.setdefault(agent_name, {"reasons": [], "interrupt": False})
+        if reason not in entry["reasons"]:
+            entry["reasons"].append(reason)
+        if interrupt:
+            entry["interrupt"] = True
+
+    def _merge_back(self, agent_name: str, reasons: List[str], interrupt: bool) -> None:
+        entry = self.pending.setdefault(agent_name, {"reasons": [], "interrupt": False})
+        for r in reasons:
+            if r not in entry["reasons"]:
+                entry["reasons"].append(r)
+        entry["interrupt"] = entry["interrupt"] or interrupt
+
+    def _is_idle(self, state: Dict[str, Any], agent_name: str) -> bool:
+        session = (state.get("tmux") or {}).get("session")
+        if not session or not tmux_has_session(session):
+            return True
+        sig = _pane_sig(session, agent_name)
+        now = time.time()
+        prev_sig, prev_ts = self._pane_state.get(agent_name, (None, now))  # type: ignore
+        if sig == prev_sig and (now - prev_ts) >= self.idle_for:
+            return True
+        self._pane_state[agent_name] = (sig, now)
+        return False
+
+    def flush(self, state: Dict[str, Any]) -> List[Tuple[str, bool, str, str]]:
+        results: List[Tuple[str, bool, str, str]] = []
+        now = time.time()
+        for agent_name in list(self.pending.keys()):
+            entry = self.pending.pop(agent_name, {})
+            reasons = entry.get("reasons") or []
+            interrupt = bool(entry.get("interrupt", False))
+            reason_text = " / ".join(reasons) if reasons else "NUDGE"
+
+            if not self._is_idle(state, agent_name):
+                self._merge_back(agent_name, reasons, interrupt)
+                results.append((agent_name, False, reason_text, "busy"))
+                continue
+
+            last = self.last_sent.get(agent_name) or _nudge_history.get(agent_name)
+            last_ts = None
+            last_reasons: Set[str] = set()
+            if last:
+                try:
+                    last_ts, last_reasons = float(last[0]), set(last[1])
+                except Exception:
+                    last_ts, last_reasons = None, set()
+
+            current_reasons = set(reasons) if reasons else _split_reasons(reason_text)
+            if last_ts is not None and (now - last_ts) < self.min_interval:
+                if current_reasons.issubset(last_reasons):
+                    results.append((agent_name, False, reason_text, "duplicate"))
+                    continue
+
+            ok = nudge_agent(self.root, state, agent_name, reason=reason_text, interrupt=interrupt)
+            if ok:
+                reason_set = current_reasons or {reason_text}
+                self.last_sent[agent_name] = (now, reason_set)
+                _nudge_history[agent_name] = (now, reason_set)
+            results.append((agent_name, ok, reason_text, ""))
+        return results
 
 
 def maybe_start_agent_on_message(
@@ -2238,6 +2326,25 @@ def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str
     return ts, sender, recipient, subject, body
 
 
+def _sanitize_filename(name: str, fallback: str = "file") -> str:
+    base = Path(name or "").name
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    if not base or base in {".", ".."}:
+        base = fallback
+    if len(base) > 120:
+        stem, ext = os.path.splitext(base)
+        base = (stem[:100] or fallback) + ext[:15]
+    return base or fallback
+
+
+def _is_image_document(doc: Dict[str, Any]) -> bool:
+    mime = str(doc.get("mime_type") or "").lower()
+    if mime.startswith("image/"):
+        return True
+    name = str(doc.get("file_name") or "").lower()
+    return any(name.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"))
+
+
 class TelegramBridge:
     """Bridges Telegram <-> cteam customer channel."""
 
@@ -2249,6 +2356,7 @@ class TelegramBridge:
         self._customer_pos: int = 0
         self._customer_buf: str = ""
         self._logged_offset_reset = False
+        self._telegram_drive = self.root / DIR_SHARED_DRIVE / "telegram"
 
     def start(self) -> None:
         self.thread.start()
@@ -2327,11 +2435,47 @@ class TelegramBridge:
             return int(chat.get("id", 0)) == int(cfg["chat_id"]) and int(frm.get("id", 0)) == int(cfg["user_id"])
         return False
 
+    def _rel_path(self, p: Path) -> str:
+        try:
+            return str(p.relative_to(self.root))
+        except Exception:
+            return str(p)
+
+    def _save_telegram_file(self, cfg: Dict[str, Any], file_id: Optional[str], *, prefer_name: Optional[str] = None) -> Optional[Path]:
+        token = cfg.get("bot_token")
+        if not token or not file_id:
+            return None
+        try:
+            info = _telegram_api(token, "getFile", {"file_id": file_id}, timeout=20.0) or {}
+            file_path = info.get("file_path")
+            if not file_path:
+                raise CTeamError("missing file_path")
+            fname = _sanitize_filename(prefer_name or Path(file_path).name or "file")
+            mkdirp(self._telegram_drive)
+            ts_prefix = ts_for_filename(now_iso())
+            dest = self._telegram_drive / f"{ts_prefix}_{fname}"
+            counter = 1
+            while dest.exists():
+                dest = self._telegram_drive / f"{ts_prefix}_{counter}_{fname}"
+                counter += 1
+            url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+            with urllib.request.urlopen(url, timeout=60.0) as resp:
+                data = resp.read()
+            dest.write_bytes(data)
+            _chmod_private(dest)
+            return dest
+        except Exception as e:
+            log_line(self.root, f"[telegram] failed to save file {file_id}: {e}")
+            return None
+
     def _handle_inbound(self, cfg: Dict[str, Any], msg: Dict[str, Any]) -> None:
         chat = msg.get("chat") or {}
         chat_id = chat.get("id")
         text = (msg.get("text") or "").strip()
+        caption = (msg.get("caption") or "").strip()
         contact = msg.get("contact")
+        photos = msg.get("photo") or []
+        document = msg.get("document") or {}
 
         # First-time setup: require contact share that matches configured authorized phone number.
         if contact and chat_id:
@@ -2356,15 +2500,51 @@ class TelegramBridge:
         if not self._is_authorized_sender(cfg, msg):
             return
 
-        if not text:
-            if msg.get("photo"):
-                text = "[sent a photo]"
-            elif msg.get("document"):
-                text = "[sent a document]"
-            elif msg.get("sticker"):
-                text = "[sent a sticker]"
+        if caption and not text:
+            text = caption
+
+        attachments: List[str] = []
+        if photos:
+            best = max(photos, key=lambda p: p.get("file_size", 0))
+            saved = self._save_telegram_file(
+                cfg,
+                best.get("file_id"),
+                prefer_name=f"photo_{best.get('file_unique_id') or 'image'}.jpg",
+            )
+            if saved:
+                attachments.append(f"Image saved to {self._rel_path(saved)}")
             else:
-                text = "[sent a non-text message]"
+                attachments.append("Image received but failed to save.")
+
+        doc_is_image = False
+        if document:
+            doc_is_image = _is_image_document(document)
+            if doc_is_image:
+                saved = self._save_telegram_file(cfg, document.get("file_id"), prefer_name=document.get("file_name") or "image")
+                if saved:
+                    attachments.append(f"Image saved to {self._rel_path(saved)}")
+                else:
+                    name = document.get("file_name") or "image"
+                    attachments.append(f"Image {name} received but failed to save.")
+
+        body_lines: List[str] = []
+        if text:
+            body_lines.append(text)
+        else:
+            if photos or doc_is_image:
+                body_lines.append("[sent an image]")
+            elif msg.get("sticker"):
+                body_lines.append("[sent a sticker]")
+            elif document:
+                body_lines.append("[sent a document]")
+            else:
+                body_lines.append("[sent a non-text message]")
+
+        if attachments:
+            body_lines.append("")
+            body_lines.extend(attachments)
+
+        body = "\n".join(body_lines).strip()
 
         try:
             state = load_state(self.root)
@@ -2378,7 +2558,7 @@ class TelegramBridge:
             sender="customer",
             recipient="pm",
             subject="Telegram",
-            body=text,
+            body=body,
             msg_type="MESSAGE",
             task=None,
             nudge=True,
@@ -2388,7 +2568,7 @@ class TelegramBridge:
         # Mirror into customer channel for visibility/logging (customer chat tails this file).
         try:
             ts = now_iso()
-            entry = format_message(ts, "customer", "customer", "Telegram", text, msg_type="MESSAGE")
+            entry = format_message(ts, "customer", "customer", "Telegram", body, msg_type="MESSAGE")
             cust_msg, cust_inbox, _ = mailbox_paths(self.root, "customer")
             mkdirp(cust_inbox)
             append_text(cust_msg, entry)
@@ -2466,6 +2646,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
     seen_inbox: Dict[str, set[str]] = {}
     last_mail_sig: Dict[str, Tuple[int, int]] = {}
+    nudge_queue = NudgeQueue(root)
 
     for a in state["agents"]:
         msg_path, inbox_dir, _ = mailbox_paths(root, a["name"])
@@ -2482,6 +2663,10 @@ def cmd_watch(args: argparse.Namespace) -> None:
     now_ts = time.time()
     last_activity: Dict[str, float] = {a["name"]: now_ts for a in state["agents"]}
     while True:
+        customer_nag_pending = False
+        customer_state_for_nag: Optional[Dict[str, Any]] = None
+        pm_idle_pending = False
+
         try:
             state = load_state(root)
         except Exception:
@@ -2552,11 +2737,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if last_sender and last_type:
                 maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
 
-            ok = nudge_agent(root, state, name, reason="MAILBOX UPDATED")
-            if ok:
-                log_line(root, f"[router] nudged {name}")
-            else:
-                log_line(root, f"[router] mailbox updated for {name}, but could not nudge (window missing?)")
+            nudge_queue.request(name, "MAILBOX UPDATED")
 
         # Customer wait loop: if last inbound from customer lacks a PM reply, keep nudging PM.
         try:
@@ -2568,10 +2749,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 now_ts = time.time()
                 should_nag = not last_nag or last_nag < last_in or (now_ts - last_nag) >= 60
                 if should_nag:
-                    if nudge_agent(root, state, "pm", reason="CUSTOMER WAITING — REPLY NOW"):
-                        cust_state["last_pm_nag_ts"] = now_iso()
-                        save_customer_state(root, cust_state)
-                        log_line(root, "[router] nudged pm to reply to customer")
+                    nudge_queue.request("pm", reason="CUSTOMER WAITING — REPLY NOW")
+                    customer_nag_pending = True
+                    customer_state_for_nag = cust_state
         except Exception:
             pass
 
@@ -2583,9 +2763,32 @@ def cmd_watch(args: argparse.Namespace) -> None:
             team_idle = all(now - last_activity.get(n, 0) >= 30 for n in non_pm)
             if pm_idle and team_idle:
                 if not state["tmux"].get("paused", False):
-                    if nudge_agent(root, state, "pm", reason="TEAM IDLE — CHECK IN"):
-                        last_activity["pm"] = now
-                        log_line(root, "[router] team idle; nudged pm to check in")
+                    nudge_queue.request("pm", reason="TEAM IDLE — CHECK IN")
+                    pm_idle_pending = True
+
+        results = nudge_queue.flush(state)
+        if results:
+            for agent_name, ok, reason_text, skip_reason in results:
+                if skip_reason == "duplicate":
+                    log_line(root, f"[router] nudge skipped for {agent_name} (recent duplicate: {reason_text})")
+                    continue
+                if skip_reason == "busy":
+                    log_line(root, f"[router] nudge deferred for {agent_name} (pane active)")
+                    continue
+                if ok:
+                    log_line(root, f"[router] nudged {agent_name} ({reason_text})")
+                else:
+                    log_line(root, f"[router] could not nudge {agent_name} ({reason_text})")
+
+                if ok and customer_nag_pending and agent_name == "pm" and "CUSTOMER WAITING" in reason_text:
+                    try:
+                        cust_state = customer_state_for_nag or load_customer_state(root)
+                        cust_state["last_pm_nag_ts"] = now_iso()
+                        save_customer_state(root, cust_state)
+                    except Exception:
+                        pass
+                if ok and pm_idle_pending and agent_name == "pm" and "TEAM IDLE" in reason_text:
+                    last_activity["pm"] = time.time()
 
         time.sleep(interval)
 

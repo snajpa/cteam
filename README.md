@@ -160,3 +160,5 @@ Customer & Telegram
   contact to re-authorize).
 - `telegram-enable WORKDIR` / `telegram-disable WORKDIR`  
   Enable/disable Telegram bridge (honored by the router).
+- Telegram images from the authorized customer are saved to `shared/drive/telegram/`
+  and referenced in the PM/customer mailboxes.

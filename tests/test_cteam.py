@@ -3,7 +3,9 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 from pathlib import Path
+from typing import Any, Dict
 import unittest
 
 import cteam
@@ -236,6 +238,72 @@ class AddAgentTests(unittest.TestCase):
             )
             with self.assertRaises(cteam.CTeamError):
                 cteam.cmd_add_agent(args)
+
+
+class NudgeQueueTests(unittest.TestCase):
+    def test_queue_deduplicates_recent_nudges(self) -> None:
+        calls = []
+
+        def fake_nudge(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED", interrupt: bool = False) -> bool:  # type: ignore
+            calls.append((agent_name, reason, interrupt))
+            cteam._nudge_history[agent_name] = (time.time(), cteam._split_reasons(reason))
+            return True
+
+        orig_nudge = cteam.nudge_agent
+        try:
+            cteam.nudge_agent = fake_nudge  # type: ignore
+            queue = cteam.NudgeQueue(Path("/tmp"), min_interval=30.0, idle_for=0.0)
+            queue._is_idle = lambda state, agent: True  # type: ignore
+            dummy_state = {"tmux": {"session": "s"}}
+
+            queue.request("dev1", "MAILBOX UPDATED")
+            queue.flush(dummy_state)
+            self.assertEqual(len(calls), 1)
+
+            queue.request("dev1", "MAILBOX UPDATED")
+            queue.flush(dummy_state)
+            self.assertEqual(len(calls), 1)  # throttled duplicate
+
+            queue.request("dev1", "NEW REASON")
+            queue.flush(dummy_state)
+            self.assertEqual(len(calls), 2)
+            self.assertIn("NEW REASON", calls[-1][1])
+        finally:
+            cteam.nudge_agent = orig_nudge  # type: ignore
+            cteam._nudge_history.clear()
+
+    def test_queue_defers_until_idle(self) -> None:
+        calls = []
+
+        def fake_nudge(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED", interrupt: bool = False) -> bool:  # type: ignore
+            calls.append((agent_name, reason, interrupt))
+            return True
+
+        orig_nudge = cteam.nudge_agent
+        try:
+            cteam.nudge_agent = fake_nudge  # type: ignore
+            queue = cteam.NudgeQueue(Path("/tmp"), min_interval=0.0, idle_for=0.5)
+            dummy_state = {"tmux": {"session": "s"}}
+
+            busy_flag = {"idle": False}
+
+            def mock_idle(state: Dict[str, Any], agent: str) -> bool:
+                return busy_flag["idle"]
+
+            queue._is_idle = mock_idle  # type: ignore
+
+            queue.request("dev1", "MAILBOX UPDATED")
+            results = queue.flush(dummy_state)
+            self.assertTrue(any(r[3] == "busy" for r in results))
+            self.assertEqual(len(calls), 0)
+
+            busy_flag["idle"] = True
+            queue.request("dev1", "MAILBOX UPDATED")
+            results = queue.flush(dummy_state)
+            self.assertTrue(any(r[1] for r in results))
+            self.assertEqual(len(calls), 1)
+        finally:
+            cteam.nudge_agent = orig_nudge  # type: ignore
 
 
 class UpdateWorkdirTests(unittest.TestCase):
