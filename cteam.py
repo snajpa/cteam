@@ -625,40 +625,6 @@ def tmux_select_window(session: str, window: str) -> None:
     tmux(["select-window", "-t", f"{session}:{window}"], capture=True, check=False)
 
 
-def focus_recipient_window(state: Dict[str, Any], recipient: str) -> None:
-    session = state["tmux"]["session"]
-    if not tmux_has_session(session):
-        return
-    target = recipient if recipient != "customer" else CUSTOMER_WINDOW
-    tmux_select_window(session, target)
-
-
-def tmux_active_window(session: str) -> str:
-    try:
-        cp = tmux(["display-message", "-p", "#W"], capture=True)
-        return (cp.stdout or "").strip().splitlines()[0]
-    except Exception:
-        return ""
-
-
-def focus_if_sender_active(state: Dict[str, Any], sender: str, recipient: str) -> None:
-    session = state["tmux"]["session"]
-    if not tmux_has_session(session):
-        return
-    agent_names = {a["name"] for a in state["agents"]}
-    sender_window = None
-    if sender == "customer":
-        sender_window = CUSTOMER_WINDOW
-    elif sender in agent_names or sender == "pm":
-        sender_window = sender
-    if not sender_window:
-        return
-    active = tmux_active_window(session)
-    if not active or active != sender_window:
-        return
-    focus_recipient_window(state, recipient)
-
-
 def tmux_send_line(session: str, window: str, text: str) -> None:
     """
     Paste text (with trailing newline) into a tmux pane in one shot to avoid
@@ -1907,12 +1873,6 @@ def write_message(
             maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
         nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
 
-    # Focus recipient only if the sender's window is currently active.
-    try:
-        focus_if_sender_active(state, sender, recipient)
-    except Exception:
-        pass
-
 
 # -----------------------------
 # Starting / nudging agents in tmux
@@ -2704,7 +2664,6 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                 _readline_save_history(history_path)
             except Exception:
                 pass
-            focus_if_sender_active(state, "customer", "pm")
             print(f"[you → pm] {text}")
     finally:
         stop.set()
@@ -2786,7 +2745,6 @@ def cmd_chat(args: argparse.Namespace) -> None:
                 nudge=not args.no_nudge,
                 start_if_needed=args.start_if_needed,
             )
-            focus_if_sender_active(state, args.sender or "pm", recipient)
             print(f"[you → {recipient}] {text}")
     finally:
         stop.set()
@@ -3377,9 +3335,6 @@ def cmd_msg(args: argparse.Namespace) -> None:
         if agent and not is_codex_running(state, args.to):
             start_codex_in_window(root, state, agent, boot=False)
 
-    if not args.no_follow:
-        focus_if_sender_active(state, args.sender or "pm", args.to)
-
     print(f"sent to {args.to}")
 
 
@@ -3444,8 +3399,6 @@ def cmd_assign(args: argparse.Namespace) -> None:
         nudge=not args.no_nudge,
         start_if_needed=True,
     )
-    if not args.no_follow:
-        focus_if_sender_active(state, args.sender or "pm", args.to)
     print(f"assigned to {args.to}")
 
 
@@ -3463,8 +3416,6 @@ def cmd_nudge(args: argparse.Namespace) -> None:
     for t in targets:
         ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE", interrupt=args.interrupt)
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
-    if not args.no_follow and len(targets) == 1:
-        focus_if_sender_active(state, "pm", targets[0])
 
 
 def cmd_restart(args: argparse.Namespace) -> None:
