@@ -1410,6 +1410,8 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - When a new agent is added, onboard them quickly and redistribute work to keep the load balanced.
             - Ask for short status updates; require each agent to keep `STATUS.md` updated.
             - Track long-running/background work; nudge the owner until it completes or is fixed.
+            - If you must urgently stop an agent's current input, use `cteam nudge . --to <agent> --reason "..." --interrupt`
+              (sends Escape before the message); use sparingly and follow up with clear instructions.
             - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
             - Customer channel: when you read a customer message, reply immediately with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”). If you file work, tell the customer what you filed and when you’ll return with results.
             """
@@ -2039,7 +2041,14 @@ def start_codex_in_window(
     tmux_send_line_when_quiet(session, w, first_prompt)
 
 
-def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED") -> bool:
+def nudge_agent(
+    root: Path,
+    state: Dict[str, Any],
+    agent_name: str,
+    *,
+    reason: str = "MAILBOX UPDATED",
+    interrupt: bool = False,
+) -> bool:
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
         return False
@@ -2052,8 +2061,17 @@ def nudge_agent(root: Path, state: Dict[str, Any], agent_name: str, *, reason: s
     extra = ""
     if agent_name == "pm" and "IDLE" in reason.upper():
         extra = " Check who should be working, unblock them, and assign next steps. Confirm any background tasks are still running."
-    msg = f"{reason}: open message.md and act. Read and update STATUS.md. Make sure progress is being made. {extra}"
+    if interrupt:
+        msg = f"INTERRUPT — {reason}: open message.md now. Update STATUS.md after acting. {extra}"
+    else:
+        msg = f"{reason}: open message.md and act. Read and update STATUS.md. Make sure progress is being made. {extra}"
     try:
+        if interrupt:
+            try:
+                tmux_send_keys(session, agent_name, ["Escape"])
+                time.sleep(0.1)
+            except Exception:
+                pass
         tmux_send_keys(session, agent_name, ["C-u"])
         if is_codex_running(state, agent_name):
             wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
@@ -3443,7 +3461,7 @@ def cmd_nudge(args: argparse.Namespace) -> None:
     else:
         targets = [p.strip() for p in args.to.split(",") if p.strip()]
     for t in targets:
-        ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE")
+        ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE", interrupt=args.interrupt)
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
     if not args.no_follow and len(targets) == 1:
         focus_if_sender_active(state, "pm", targets[0])
@@ -3704,8 +3722,35 @@ def cmd_telegram_disable(args: argparse.Namespace) -> None:
 # CLI
 # -----------------------------
 
+class CTeamHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    """Readable help with defaults and preserved newlines."""
+
+
+class CTeamArgumentParser(argparse.ArgumentParser):
+    """
+    Custom parser that prints full help on usage errors for a friendlier UX.
+    """
+
+    def error(self, message: str) -> None:
+        self.print_help(sys.stderr)
+        self.exit(2, f"\ncteam error: {message}\n")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="cteam", add_help=True)
+    p = CTeamArgumentParser(
+        prog="cteam",
+        add_help=True,
+        description=(
+            "Clanker Team (cteam) orchestrates tmux + Codex agents around a shared git repo.\n"
+            "Common flow: init/import a workspace, open tmux, assign work, chat with agents, and keep the customer updated."
+        ),
+        epilog=(
+            "Popular: init/import/open/resume, msg/assign/broadcast/nudge, watch, add-agent, customer-chat.\n"
+            "Git/ops: sync, status, seed-sync, update-workdir, restart, doc-walk, telegram-*. "
+            "Run `cteam <command> --help` for details. Full guide: README.md."
+        ),
+        formatter_class=CTeamHelpFormatter,
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common_workspace(pp: argparse.ArgumentParser) -> None:
@@ -3864,6 +3909,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_nudge.add_argument("--to", default="pm", help="agent(s) comma-separated or 'all'")
     p_nudge.add_argument("--reason", default="NUDGE")
     p_nudge.add_argument("--no-follow", action="store_true", help="Do not select the target window.")
+    p_nudge.add_argument("--interrupt", action="store_true", help="Send an interrupting nudge (sends Escape before the message).")
     p_nudge.set_defaults(func=cmd_nudge)
 
     p_restart = sub.add_parser("restart", help="Restart Codex in agent tmux windows (respawn).")

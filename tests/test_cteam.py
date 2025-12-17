@@ -1,4 +1,6 @@
 import argparse
+import contextlib
+import io
 import json
 import tempfile
 from pathlib import Path
@@ -270,6 +272,24 @@ class UpdateWorkdirTests(unittest.TestCase):
             root_cteam = (root / "cteam.py").read_bytes()
             self.assertEqual((a_dir / "cteam.py").read_bytes(), root_cteam)
             self.assertEqual((repo_dir / "cteam.py").read_bytes(), root_cteam)
+
+
+class ParserHelpTests(unittest.TestCase):
+    def test_usage_error_prints_help(self) -> None:
+        parser = cteam.build_parser()
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(buf):
+            parser.parse_args([])
+        self.assertEqual(ctx.exception.code, 2)
+        out = buf.getvalue()
+        self.assertIn("usage:", out.lower())
+        self.assertIn("cteam error:", out.lower())
+
+    def test_nudge_interrupt_flag_parses(self) -> None:
+        parser = cteam.build_parser()
+        args = parser.parse_args(["nudge", "/tmp/workspace", "--to", "dev1", "--interrupt"])
+        self.assertTrue(hasattr(args, "interrupt"))
+        self.assertTrue(args.interrupt)
 
 
 if __name__ == "__main__":
