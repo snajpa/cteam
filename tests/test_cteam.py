@@ -291,6 +291,12 @@ class ParserHelpTests(unittest.TestCase):
         self.assertTrue(hasattr(args, "interrupt"))
         self.assertTrue(args.interrupt)
 
+    def test_telegram_initial_offset_resets_when_unauthorized(self) -> None:
+        cfg = {"update_offset": 999999, "chat_id": None, "user_id": None}
+        self.assertEqual(cteam._telegram_initial_offset(cfg), 0)
+        cfg2 = {"update_offset": 5, "chat_id": 123, "user_id": 456}
+        self.assertEqual(cteam._telegram_initial_offset(cfg2), 5)
+
 
 if __name__ == "__main__":
     unittest.main()

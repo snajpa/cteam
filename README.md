@@ -155,6 +155,8 @@ Customer & Telegram
 - `customer-chat WORKDIR`  
   Local PM/customer chat window (tails `shared/mail/customer/message.md`).
 - `telegram-configure WORKDIR [--token TOKEN] [--phone PHONE] [--no-interactive]`  
-  Store bot credentials for the authorized customer.
+  Store bot credentials for the authorized customer (send `/start` then share your
+  phone/contact from that number to link the chat; if it seems quiet, re-share
+  contact to re-authorize).
 - `telegram-enable WORKDIR` / `telegram-disable WORKDIR`  
   Enable/disable Telegram bridge (honored by the router).

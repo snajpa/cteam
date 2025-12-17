@@ -1378,6 +1378,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Track long-running/background work; nudge the owner until it completes or is fixed.
             - If you must urgently stop an agent's current input, use `cteam nudge . --to <agent> --reason "..." --interrupt`
               (sends Escape before the message); use sparingly and follow up with clear instructions.
+            - You own alignment with the customer and overall quality; ensure deliveries match customer intent and standards before they go out.
             - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
             - Customer channel: when you read a customer message, reply immediately with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”). If you file work, tell the customer what you filed and when you’ll return with results.
             """
@@ -2167,6 +2168,19 @@ def _telegram_send_text(cfg: Dict[str, Any], text: str) -> None:
         _telegram_api(token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=20.0)
 
 
+def _telegram_initial_offset(cfg: Dict[str, Any]) -> int:
+    try:
+        offset = int(cfg.get("update_offset") or 0)
+    except Exception:
+        offset = 0
+    if offset < 0:
+        offset = 0
+    # If chat is not yet authorized, start from 0 so the /start + contact flow works.
+    if not cfg.get("chat_id") or not cfg.get("user_id"):
+        return 0
+    return offset
+
+
 def _telegram_request_contact(cfg: Dict[str, Any], chat_id: int) -> None:
     token = cfg.get("bot_token")
     if not token:
@@ -2234,6 +2248,7 @@ class TelegramBridge:
         self.thread = threading.Thread(target=self.run, daemon=True)
         self._customer_pos: int = 0
         self._customer_buf: str = ""
+        self._logged_offset_reset = False
 
     def start(self) -> None:
         self.thread.start()
@@ -2256,7 +2271,11 @@ class TelegramBridge:
         except Exception:
             self._customer_pos = 0
 
-        offset = int(cfg.get("update_offset") or 0)
+        offset = _telegram_initial_offset(cfg)
+        if offset == 0 and (not cfg.get("chat_id") or not cfg.get("user_id")):
+            if not self._logged_offset_reset:
+                log_line(self.root, "[telegram] reset update_offset to 0 (chat not authorized yet; send /start and share contact)")
+                self._logged_offset_reset = True
         last_saved = time.time()
         log_line(self.root, f"[telegram] bridge started (config={cfg_path})")
 
