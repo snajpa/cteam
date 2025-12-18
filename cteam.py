@@ -21,7 +21,7 @@ Communication
 - Canonical mailbox per agent: shared/mail/<agent>/message.md
 - `cteam msg` and `cteam assign` append to that mailbox and also drop a copy in:
     shared/mail/<agent>/inbox/<timestamp>_<sender>.md
-- A router/watch loop (`cteam watch`) runs inside tmux in a `router` window:
+- A router/watch loop (`cteam <workdir> watch`) runs inside tmux in a `router` window:
   - watches inbox directories and mailbox changes
   - nudges recipients
   - can auto-start Codex for agents when assignments arrive
@@ -31,7 +31,7 @@ Major commands
 - msg, broadcast, assign, nudge
 - watch (router)
 - status, sync, seed-sync
-- add-agent, restart
+- add-agent, remove-agent, restart
 - doc-walk (kick off documentation sprint)
 
 External deps
@@ -86,7 +86,6 @@ DIR_SEED_EXTRAS = "seed-extras"
 DIR_SHARED = "shared"
 DIR_SHARED_DRIVE = f"{DIR_SHARED}/drive"
 TICKETS_JSON_REL = f"{DIR_SHARED}/TICKETS.json"
-TICKETS_MD_REL = f"{DIR_SHARED}/TICKETS.md"
 DIR_AGENTS = "agents"
 DIR_LOGS = "logs"
 DIR_MAIL = f"{DIR_SHARED}/mail"
@@ -225,14 +224,6 @@ def tickets_json_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Pat
     return (root / rel).resolve()
 
 
-def tickets_md_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Path:
-    rel = None
-    if state:
-        rel = (state.get("tickets") or {}).get("md_rel")
-    rel = rel or TICKETS_MD_REL
-    return (root / rel).resolve()
-
-
 @contextmanager
 def ticket_lock(root: Path, state: Dict[str, Any]):
     lock_path = tickets_json_path(root, state).with_suffix(".lock")
@@ -275,7 +266,6 @@ def load_tickets(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
 
 def save_tickets(root: Path, state: Dict[str, Any], store: Dict[str, Any]) -> None:
     atomic_write_text(tickets_json_path(root, state), json.dumps(store, indent=2, sort_keys=True) + "\n")
-    atomic_write_text(tickets_md_path(root, state), render_tickets_md(store))
 
 
 def _next_ticket_id(meta: Dict[str, Any]) -> str:
@@ -301,45 +291,22 @@ def _add_history(ticket: Dict[str, Any], event: Dict[str, Any]) -> None:
     hist.append(event)
 
 
-def render_tickets_md(store: Dict[str, Any]) -> str:
+def _format_ticket_summary(store: Dict[str, Any]) -> str:
     tickets = store.get("tickets") or []
-    lines = ["# Tickets", ""]
-
-    def fmt_ticket(t: Dict[str, Any]) -> str:
+    active = [t for t in tickets if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+    if not active:
+        return "No open or blocked tickets."
+    lines = []
+    for t in sorted(active, key=lambda x: x.get("id","")):
         tid = t.get("id", "")
         status = t.get("status", TICKET_STATUS_OPEN)
         assignee = t.get("assignee") or "unassigned"
         title = t.get("title") or ""
-        blocked_on = t.get("blocked_on") or ""
-        tag_str = ""
-        tags = t.get("tags") or []
-        if tags:
-            tag_str = f" [tags: {', '.join(tags)}]"
-        block_note = f" (blocked on {blocked_on})" if status == TICKET_STATUS_BLOCKED and blocked_on else ""
-        return f"- {tid} [{status}] @{assignee} — {title}{block_note}{tag_str}"
-
-    by_status: Dict[str, List[Dict[str, Any]]] = {s: [] for s in TICKET_STATUSES}
-    for t in tickets:
-        st = t.get("status", TICKET_STATUS_OPEN)
-        if st not in by_status:
-            st = TICKET_STATUS_OPEN
-        by_status[st].append(t)
-
-    stats = {k: len(v) for k, v in by_status.items()}
-    lines.append(f"Open: {stats.get(TICKET_STATUS_OPEN,0)} | Blocked: {stats.get(TICKET_STATUS_BLOCKED,0)} | Closed: {stats.get(TICKET_STATUS_CLOSED,0)}")
-    lines.append("")
-
-    for status_label in (TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED):
-        section = by_status.get(status_label, [])
-        if not section:
-            continue
-        lines.append(f"## {status_label.title()} ({len(section)})")
-        lines.append("")
-        for t in section:
-            lines.append(fmt_ticket(t))
-        lines.append("")
-
-    return "\n".join(lines).rstrip() + "\n"
+        block_note = ""
+        if status == TICKET_STATUS_BLOCKED and t.get("blocked_on"):
+            block_note = f" (blocked on {t.get('blocked_on')})"
+        lines.append(f"- {tid} [{status}] @{assignee} — {title}{block_note}")
+    return "\n".join(lines)
 
 
 def _ticket_required(store: Dict[str, Any], ticket_id: str) -> Dict[str, Any]:
@@ -1267,7 +1234,6 @@ def build_state(
         },
         "tickets": {
             "json_rel": TICKETS_JSON_REL,
-            "md_rel": TICKETS_MD_REL,
         },
                 "telegram": {
             "enabled": False,
@@ -1364,12 +1330,17 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         if not isinstance(tickets_cfg, dict):
             tickets_cfg = {}
         tickets_cfg.setdefault("json_rel", TICKETS_JSON_REL)
-        tickets_cfg.setdefault("md_rel", TICKETS_MD_REL)
         state["tickets"] = tickets_cfg
         try:
             _ = load_tickets(root, state)
         except Exception:
             save_tickets(root, state, _ticket_store_default())
+    else:
+        # Drop legacy md_rel if present.
+        tickets_cfg = state.get("tickets") or {}
+        if isinstance(tickets_cfg, dict) and "md_rel" in tickets_cfg:
+            tickets_cfg.pop("md_rel", None)
+            state["tickets"] = tickets_cfg
 
     state["version"] = STATE_VERSION
     compute_agent_abspaths(state)
@@ -1451,10 +1422,10 @@ def render_protocol_md() -> str:
 
         ## How to assign work
         - Human or PM should use:
-          - `python3 cteam.py assign . --to dev1 --task T001 --subject "..." "instructions..."`
+          - `python3 cteam.py <workdir> assign --to dev1 --task T001 --subject "..." "instructions..."`
 
         ## Router
-        - A tmux window named `{ROUTER_WINDOW}` runs `cteam watch`:
+        - A tmux window named `{ROUTER_WINDOW}` runs `cteam <workdir> watch`:
           - nudges agents when mail arrives
           - can auto-start Codex in an agent window when an assignment arrives
         """
@@ -1496,10 +1467,11 @@ def render_plan_template() -> str:
 
         Owned by: **PM**
 
+        Use this page for high-level goals/milestones only. All actionable work must live in tickets (`cteam tickets ...`).
+
         Suggested structure:
         - Goals (link to GOALS.md)
-        - Milestones
-        - Work breakdown (task IDs)
+        - Milestones (tie to ticket IDs)
         - Risks & mitigations
         - Definition of Done
         """
@@ -1513,11 +1485,11 @@ def render_tasks_template() -> str:
 
         Owned by: **PM**
 
-        Format suggestion:
-        - [ ] T001 — ...
-          - Owner: dev1
-          - Depends on: ...
-          - Acceptance criteria: ...
+        All tasks are tracked in tickets (`shared/TICKETS.json`). Do not list work here.
+
+        Useful commands:
+        - List tickets: `python3 cteam.py . tickets list`
+        - Show ticket:  `python3 cteam.py . tickets show --id T001`
         """
     )
 
@@ -1559,7 +1531,7 @@ def render_shared_readme(state: Dict[str, Any]) -> str:
         This directory is outside the git repo; it's for coordination artifacts.
 
         Key files:
-        - GOALS.md, PLAN.md, TASKS.md
+        - GOALS.md, PLAN.md (high-level milestones), TICKETS.json (ticket database)
         - DECISIONS.md, TIMELINE.md
         - PROTOCOL.md
 
@@ -1570,7 +1542,7 @@ def render_shared_readme(state: Dict[str, Any]) -> str:
         - shared/drive/ for non-repo artifacts (design exports, videos, binaries). Do NOT park code here.
 
         Router:
-        - tmux window `{ROUTER_WINDOW}` runs `python3 cteam.py watch .`
+        - tmux window `{ROUTER_WINDOW}` runs `python3 cteam.py . watch`
         """
     )
 
@@ -1658,7 +1630,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         - Shared drive (non-repo artifacts): `shared-drive/` (links to shared/drive)
 
         Shared coordination:
-        - `shared/GOALS.md`, `shared/PLAN.md`, `shared/TASKS.md`, `shared/DECISIONS.md`
+        - `shared/GOALS.md`, `shared/PLAN.md` (high-level), tickets via `cteam tickets ...`, `shared/DECISIONS.md`
         - `shared/TEAM_ROSTER.md` (who is on the team)
         - `shared/drive/` for large/binary assets; keep code/config in git.
 
@@ -1682,11 +1654,11 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         Preferred: use cteam CLI so delivery+nudge is reliable:
 
         - Send message:
-          - `python3 cteam.py msg $CTEAM_ROOT --to pm --subject "..." "text..."`
+          - `python3 cteam.py $CTEAM_ROOT msg --to pm --subject "..." "text..."`
         - Interactive chat:
-          - `python3 cteam.py chat $CTEAM_ROOT --to pm`
+          - `python3 cteam.py $CTEAM_ROOT chat --to pm`
         - Assignments (PM/human):
-          - `python3 cteam.py assign $CTEAM_ROOT --to dev1 --task T001 --subject "..." "instructions"`
+          - `python3 cteam.py $CTEAM_ROOT assign --to dev1 --task T001 --subject "..." "instructions"`
 
         If you must write manually, append to:
         - `shared/mail/<agent>/message.md`
@@ -1707,31 +1679,37 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
         block = textwrap.dedent(
             f"""\
             ## Role: Project Manager (the coordinator)
+            Customer expectation: operate autonomously. Exhaust team options before contacting the customer. Only reach out after several concrete attempts (reading docs/code, small spikes, reproductions) have failed, and bundle any outreach with a concise summary of what was tried and the proposed next move.
+
             You are responsible for:
-            - inferring/clarifying goals
-            - producing the plan and task breakdown
-            - assigning work to other agents
-            - keeping everyone in sync
-            - ensuring the project is completed
-            - rebalancing assignments when new agents join or capacity changes
+            - clarifying goals and constraints
+            - producing/maintaining the plan and task breakdown
+            - assigning work to other agents and rebalancing load
+            - keeping everyone in sync and unblocked
+            - ensuring the project completes with quality and customer intent intact
 
-            On startup:
+            Startup checklist:
             1) Read seed/ (if any) and repo README/docs.
-            2) Fill `shared/GOALS.md` with assumptions + questions.
-            3) Write `shared/PLAN.md` and `shared/TASKS.md`.
-            4) Start assigning work using tickets: create with `cteam tickets create ...` or `cteam assign --title/--desc` and assign with `cteam assign --ticket ...`.
+            2) Capture assumptions + open questions in `shared/GOALS.md`.
+            3) Draft `shared/PLAN.md` (goals/milestones only) and create tickets for all work.
+            4) Create tickets (`cteam tickets create ...` or `cteam assign --title/--desc`) and assign via `cteam assign --ticket ...`.
 
-            Important:
-            - Keep non-PM agents focused on one assignment at a time.
-            - When a new agent is added, onboard them quickly and redistribute work to keep the load balanced.
-            - Ask for short status updates; require each agent to keep `STATUS.md` updated.
-            - Track long-running/background work; nudge the owner until it completes or is fixed.
-            - If you must urgently stop an agent's current input, use `cteam nudge . --to <agent> --reason "..." --interrupt`
-              (sends Escape before the message); use sparingly and follow up with clear instructions.
-            - You own alignment with the customer and overall quality; ensure deliveries match customer intent and standards before they go out.
-            - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
-            - Keep tickets as the single source of truth. Migrate legacy TASKS/PLAN items into tickets and close out duplicates there.
-            - Customer channel: when you read a customer message, reply immediately with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”). If you file work, tell the customer what you filed and when you’ll return with results.
+            Execution cadence:
+            - Keep non-PM agents focused on one assignment at a time; rebalance when capacity or priorities change.
+            - Onboard new agents quickly and redistribute work to maintain momentum.
+            - Require agents to keep `STATUS.md` current; collect short status updates regularly.
+            - Track long-running/background work; note owner/command/timing in STATUS and nudge until complete or fixed.
+            - If you must stop an agent’s input urgently, use `cteam nudge . --to <agent> --reason "..." --interrupt` (sends Escape first); follow with clear instructions.
+
+            Customer channel policy:
+            - Reply promptly when reading a customer message with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”).
+            - Minimize new asks; only ask questions after multiple self-serve attempts fail. When you do ask, include what was attempted and the proposed path forward.
+            - Keep tickets as the single source of truth; migrate any stray PLAN/TASKS checklists into tickets and close duplicates there.
+
+            Delegation and quality:
+            - You are the planner/owner, not the implementer; only code as a last resort and keep changes minimal.
+            - Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty reduction.
+            - Ensure deliveries match customer intent and quality before sending anything out.
             """
         )
     elif role == "architect":
@@ -1809,7 +1787,7 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
             "You are the Project Manager. First open message.md for any kickoff notes. "
             "Then immediately infer what this codebase is for. "
             "Open shared/GOALS.md and fill it with inferred goals, non-goals, and questions. "
-            "Then write shared/PLAN.md + shared/TASKS.md. Track all work in tickets via `cteam tickets ...`. "
+            "Then write shared/PLAN.md (high-level only). Track all work in tickets via `cteam tickets ...`. "
             "Plan discovery work as tickets and assign them to the team to map the imported repo. "
             "Assign work with `cteam assign --ticket ...` (auto-create tickets with --title/--desc). "
             "Keep everyone coordinated; do not let others work unassigned. "
@@ -1818,7 +1796,7 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
         )
     return (
         "You are the Project Manager. First open message.md for any kickoff notes. "
-        "Then read seed/ and write shared/GOALS.md + shared/PLAN.md + shared/TASKS.md. "
+        "Then read seed/ and write shared/GOALS.md + shared/PLAN.md (high-level only). "
         "Track work via `cteam tickets ...`. Assign tasks with `cteam assign --ticket ...` "
         "or auto-create tickets using --title/--desc. Keep everyone coordinated. Start now. "
         f"{path_hint}"
@@ -2085,6 +2063,63 @@ def update_roster(root: Path, state: Dict[str, Any]) -> None:
     atomic_write_text(root / DIR_SHARED / "TEAM_ROSTER.md", render_team_roster(state))
 
 
+def _kill_agent_window_if_present(state: Dict[str, Any], agent_name: str) -> None:
+    session = (state.get("tmux") or {}).get("session")
+    if not session or not tmux_has_session(session):
+        return
+    try:
+        if agent_name in set(tmux_list_windows(session)):
+            tmux(["kill-window", "-t", f"{session}:{agent_name}"], capture=True)
+    except Exception:
+        pass
+
+
+def _archive_or_remove_agent_dirs(root: Path, agent: Dict[str, Any], *, purge: bool = False) -> None:
+    ts = ts_for_filename(now_iso())
+    agent_dir = root / agent["dir_rel"]
+    mail_dir = root / DIR_MAIL / agent["name"]
+
+    def _move_or_remove(src: Path, dest_root: Path) -> None:
+        if not src.exists():
+            return
+        if purge:
+            shutil.rmtree(src, ignore_errors=True)
+            return
+        dest_root.mkdir(parents=True, exist_ok=True)
+        dest = dest_root / f"{ts}_{src.name}"
+        try:
+            shutil.move(str(src), str(dest))
+        except Exception:
+            shutil.rmtree(src, ignore_errors=True)
+
+    _move_or_remove(agent_dir, root / DIR_AGENTS / "_removed")
+    _move_or_remove(mail_dir, root / DIR_MAIL / "_removed")
+
+
+def _unassign_tickets_for_agent(root: Path, state: Dict[str, Any], agent_name: str) -> None:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        changed = False
+        for t in store["tickets"]:
+            if t.get("assignee") == agent_name:
+                t["assignee"] = None
+                t["updated_at"] = now_iso()
+                _add_history(
+                    t,
+                    {
+                        "ts": t["updated_at"],
+                        "type": "unassigned",
+                        "user": "cteam",
+                        "from": agent_name,
+                        "to": None,
+                        "note": "agent removed",
+                    },
+                )
+                changed = True
+        if changed:
+            save_tickets(root, state, store)
+
+
 # -----------------------------
 # Coordination logic: autostart selection
 # -----------------------------
@@ -2145,6 +2180,35 @@ def _split_reasons(reason_text: str) -> Set[str]:
     if not parts:
         parts = [reason_text or "NUDGE"]
     return set(parts)
+
+
+def _normalize_reasons(reasons: Set[str]) -> Set[str]:
+    """
+    Normalize a set of reasons so variants of the same nudge (e.g., mailbox updates with/without metadata)
+    compare equal for deduplication.
+    """
+    if not reasons:
+        return {"NUDGE"}
+    normalized: Set[str] = set()
+    for r in reasons:
+        r_clean = (r or "").strip()
+        if not r_clean:
+            continue
+        upper_r = r_clean.upper()
+        if "MAILBOX UPDATED" in upper_r:
+            normalized.add("MAILBOX UPDATED")
+            continue
+        normalized.add(r_clean)
+    return normalized or {"NUDGE"}
+
+
+def _mailbox_nudge_reason(ticket_id: Optional[str], msg_type: Optional[str]) -> str:
+    reason = "MAILBOX UPDATED"
+    if ticket_id:
+        reason = f"{ticket_id} {reason}"
+    if msg_type:
+        reason = f"{reason} ({msg_type})"
+    return reason
 
 
 def write_message(
@@ -2273,7 +2337,8 @@ def write_message(
     if recipient != "customer":
         if start_if_needed:
             maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
-        nudge_agent(root, state, recipient, reason="MAILBOX UPDATED")
+        nudge_reason = _mailbox_nudge_reason(ticket_id, msg_type)
+        nudge_agent(root, state, recipient, reason=nudge_reason)
 
 
 # -----------------------------
@@ -2298,12 +2363,12 @@ def ensure_tmux_session(root: Path, state: Dict[str, Any]) -> None:
 
 def router_window_command(root: Path) -> List[str]:
     shell = pick_shell()
-    cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py watch ."
+    cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py . watch"
     return shell + [cmd]
 
 def customer_window_command(root: Path) -> List[str]:
     shell = pick_shell()
-    cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py customer-chat ."
+    cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py . customer-chat"
     return shell + [cmd]
 
 
@@ -2450,7 +2515,7 @@ def nudge_agent(
         else:
             ok = tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
         if ok:
-            _nudge_history[agent_name] = (time.time(), _split_reasons(reason))
+            _nudge_history[agent_name] = (time.time(), _normalize_reasons(_split_reasons(reason)))
         return ok
     except Exception:
         return False
@@ -2512,11 +2577,13 @@ class NudgeQueue:
             last_reasons: Set[str] = set()
             if last:
                 try:
-                    last_ts, last_reasons = float(last[0]), set(last[1])
+                    last_ts = float(last[0])
+                    last_reasons = _normalize_reasons(set(last[1]))
                 except Exception:
                     last_ts, last_reasons = None, set()
 
-            current_reasons = set(reasons) if reasons else _split_reasons(reason_text)
+            current_reasons_raw = set(reasons) if reasons else _split_reasons(reason_text)
+            current_reasons = _normalize_reasons(current_reasons_raw)
             if last_ts is not None and (now - last_ts) < self.min_interval:
                 if current_reasons.issubset(last_reasons):
                     results.append((agent_name, False, reason_text, "duplicate"))
@@ -2524,7 +2591,7 @@ class NudgeQueue:
 
             ok = nudge_agent(self.root, state, agent_name, reason=reason_text, interrupt=interrupt)
             if ok:
-                reason_set = current_reasons or {reason_text}
+                reason_set = current_reasons or {"NUDGE"}
                 self.last_sent[agent_name] = (now, reason_set)
                 _nudge_history[agent_name] = (now, reason_set)
             results.append((agent_name, ok, reason_text, ""))
@@ -2590,7 +2657,7 @@ def telegram_load_config(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
     cfg_path = telegram_config_path(root, state)
     if not cfg_path.exists():
         raise CTeamError(
-            f"telegram not configured: missing {cfg_path}. Run: python3 cteam.py telegram-configure {shlex.quote(str(root))}"
+            f"telegram not configured: missing {cfg_path}. Run: python3 cteam.py {shlex.quote(str(root))} telegram-configure"
         )
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
@@ -3137,22 +3204,44 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_sender: Optional[str] = None
             last_type: Optional[str] = None
             last_ticket: Optional[str] = None
+            last_body: str = ""
             for fp in new_files[-1:]:
                 try:
                     last_txt = fp.read_text(encoding="utf-8", errors="replace")[:4000]
                 except Exception:
                     last_txt = ""
-                _, last_sender, _, _, _, last_ticket, last_type = _parse_entry(last_txt)
+                _, last_sender, _, _, last_body, last_ticket, last_type = _parse_entry(last_txt)
 
             if last_sender and last_type:
                 maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
 
-            reason = "MAILBOX UPDATED"
-            if last_ticket:
-                reason = f"{last_ticket} {reason}"
-            if last_type:
-                reason = f"{reason} ({last_type})"
+            reason = _mailbox_nudge_reason(last_ticket, last_type)
             nudge_queue.request(name, reason)
+
+            if name == "pm" and (last_sender or "").lower() == "customer":
+                if any(line.strip().lower() == "/tickets" for line in (last_body or "").splitlines()):
+                    try:
+                        store = load_tickets(root, state)
+                        summary = _format_ticket_summary(store)
+                        write_message(
+                            root,
+                            state,
+                            sender="cteam",
+                            recipient="customer",
+                            subject="Ticket summary (open/blocked)",
+                            body=summary,
+                            msg_type="MESSAGE",
+                            nudge=False,
+                            start_if_needed=False,
+                        )
+                        try:
+                            cust_state = load_customer_state(root)
+                            cust_state["last_pm_reply_ts"] = now_iso()
+                            save_customer_state(root, cust_state)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
 
         # Customer wait loop: if last inbound from customer lacks a PM reply, keep nudging PM.
         try:
@@ -3607,7 +3696,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         sender="cteam",
         recipient="pm",
         subject="Kickoff",
-        body="Start by filling shared/GOALS.md, shared/PLAN.md, shared/TASKS.md and then assign tasks.",
+        body="Start by filling shared/GOALS.md and shared/PLAN.md (high-level). Track and assign all work via tickets (`cteam tickets ...`, `cteam assign ...`).",
         msg_type=ASSIGNMENT_TYPE,
         task="PM-KICKOFF",
         nudge=True,
@@ -3616,7 +3705,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     if args.no_tmux:
         print(f"Initialized workspace at {root}")
-        print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
+        print(f"Open tmux later: python3 cteam.py {shlex.quote(str(root))} open")
         return
 
     launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
@@ -3677,7 +3766,7 @@ def cmd_import(args: argparse.Namespace) -> None:
             body=(
                 "This is an imported codebase.\n\n"
                 "1) Inspect README/docs/code and fill shared/GOALS.md with inferred goals + open questions.\n"
-                "2) Write shared/PLAN.md + shared/TASKS.md.\n"
+                "2) Write shared/PLAN.md (high-level only).\n"
                 "3) Create tickets for discovery tasks and assign them with `cteam tickets` + `cteam assign --ticket ...`.\n"
                 "4) Keep agents coordinated; they will wait for ticketed assignments.\n"
             ),
@@ -3711,7 +3800,7 @@ def cmd_import(args: argparse.Namespace) -> None:
 
     if args.no_tmux:
         print(f"Imported workspace at {root}")
-        print(f"Open tmux later: python3 cteam.py open {shlex.quote(str(root))}")
+        print(f"Open tmux later: python3 cteam.py {shlex.quote(str(root))} open")
         return
 
     launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
@@ -3833,7 +3922,7 @@ def cmd_attach(args: argparse.Namespace) -> None:
     ensure_executable("tmux")
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
-        raise CTeamError(f"tmux session not running: {session} (run: python3 cteam.py open {root})")
+        raise CTeamError(f"tmux session not running: {session} (run: python3 cteam.py {root} open)")
     tmux_attach(session, window=args.window)
 
 
@@ -4352,7 +4441,7 @@ def notify_pm_new_agent(root: Path, state: Dict[str, Any], agent: Dict[str, Any]
     lines = [
         f"A new {role} joined: **{agent.get('name','')}** — {agent.get('title','')}.",
         "Please balance work across the team: onboard them, delegate tasks, and adjust the plan if needed.",
-        "Keep assignments explicit (`Type: ASSIGNMENT`) and update PLAN/TASKS to reflect the new capacity.",
+        "Keep assignments explicit (`Type: ASSIGNMENT`) and update PLAN/tickets to reflect the new capacity.",
     ]
     body = "\n".join(lines)
     try:
@@ -4431,6 +4520,34 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
     print(f"added agent: {name} ({title}) role={role}")
 
 
+def cmd_remove_agent(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir))
+    if not root:
+        raise CTeamError("could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    name = args.name.strip()
+    if name == "pm":
+        raise CTeamError("cannot remove the project manager")
+
+    agent = next((a for a in state["agents"] if a["name"] == name), None)
+    if not agent:
+        raise CTeamError(f"agent not found: {name}")
+
+    # Best-effort cleanup before state mutation.
+    _kill_agent_window_if_present(state, name)
+    _archive_or_remove_agent_dirs(root, agent, purge=args.purge)
+    _unassign_tickets_for_agent(root, state, name)
+    _nudge_history.pop(name, None)
+
+    state["agents"] = [a for a in state["agents"] if a["name"] != name]
+    compute_agent_abspaths(state)
+    update_roster(root, state)
+    save_state(root, state)
+
+    print(f"removed agent: {name}")
+
+
 def cmd_doc_walk(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
@@ -4446,7 +4563,7 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
         body=(
             "Please run a documentation sprint over the existing code:\n"
             "- Fill shared/GOALS.md (infer goals)\n"
-            "- Build a doc plan in shared/PLAN.md + shared/TASKS.md\n"
+            "- Build a doc plan in shared/PLAN.md (high-level milestones only)\n"
             "- Assign module ownership to devs for documentation\n"
             "- Ensure we have: how-to-run, how-to-test, architecture overview, ADRs/decisions\n"
         ),
@@ -4524,7 +4641,7 @@ def cmd_telegram_configure(args: argparse.Namespace) -> None:
     print("1) In Telegram, open your bot chat and send /start.")
     print("2) Tap 'Share phone number' to authorize (must match the configured phone).")
     print("3) Enable integration:")
-    print(f"   python3 cteam.py telegram-enable {shlex.quote(str(root))}")
+    print(f"   python3 cteam.py {shlex.quote(str(root))} telegram-enable")
 
 
 def cmd_telegram_enable(args: argparse.Namespace) -> None:
@@ -4544,9 +4661,9 @@ def cmd_telegram_enable(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     print("Telegram integration enabled.")
-    print("If the router is running (`cteam watch`), it will start bridging immediately.")
+    print("If the router is running (`cteam <workdir> watch`), it will start bridging immediately.")
     print("If not, open/start the workspace (tmux router runs the watcher):")
-    print(f"  python3 cteam.py open {shlex.quote(str(root))}")
+    print(f"  python3 cteam.py {shlex.quote(str(root))} open")
 
 
 def cmd_telegram_disable(args: argparse.Namespace) -> None:
@@ -4588,16 +4705,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Common flow: init/import a workspace, open tmux, assign work, chat with agents, and keep the customer updated."
         ),
         epilog=(
-            "Popular: init/import/open/resume, msg/assign/broadcast/nudge, watch, add-agent, customer-chat.\n"
+            "Popular: init/import/open/resume, msg/assign/broadcast/nudge, watch, add-agent/remove-agent, customer-chat.\n"
             "Git/ops: sync, status, seed-sync, update-workdir, restart, doc-walk, telegram-*. "
-            "Run `cteam <command> --help` for details. Full guide: README.md."
+            "Run `cteam <workdir> <command> --help` for details. Full guide: README.md."
         ),
         formatter_class=CTeamHelpFormatter,
     )
+    p.add_argument("workdir", help="Workspace directory or any path inside it.")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common_workspace(pp: argparse.ArgumentParser) -> None:
-        pp.add_argument("workdir", help="Workspace directory or any path inside it.")
         pp.add_argument("--no-tmux", action="store_true", help="Do not start/manage tmux.")
         pp.add_argument("--no-codex", action="store_true", help="Do not launch Codex in windows.")
         pp.add_argument("--no-attach", action="store_true", help="Do not attach to tmux after starting.")
@@ -4661,16 +4778,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_kill.set_defaults(func=cmd_kill)
 
     p_watch = sub.add_parser("watch", help="Router: watch mailboxes and nudge/start agents in tmux.")
-    p_watch.add_argument("workdir")
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
 
     p_pause = sub.add_parser("pause", help="Pause tmux: park agent windows and mark workspace paused.")
-    p_pause.add_argument("workdir")
     p_pause.set_defaults(func=cmd_pause)
 
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent or customer.")
-    p_chat.add_argument("workdir")
     p_chat.add_argument("--to", required=True, help="Recipient agent name or 'customer'.")
     p_chat.add_argument("--sender", help="Override sender name (default: human).")
     p_chat.add_argument("--subject", help="Optional subject.")
@@ -4679,22 +4793,18 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.set_defaults(func=cmd_chat)
 
     p_upload = sub.add_parser("upload", help="Copy files/dirs into shared/drive for sharing with the team.")
-    p_upload.add_argument("workdir")
     p_upload.add_argument("paths", nargs="+", help="Files or directories to copy into shared/drive.")
     p_upload.add_argument("--dest", help="Optional destination name/path under shared/drive (default: use source name).")
     p_upload.add_argument("--from", dest="sender", help="Sender name for PM notification (default: human).")
     p_upload.set_defaults(func=cmd_upload)
 
     p_cust = sub.add_parser("customer-chat", help="Run an interactive customer chat window (tmux-friendly).")
-    p_cust.add_argument("workdir")
     p_cust.set_defaults(func=cmd_customer_chat)
 
     p_status = sub.add_parser("status", help="Show workspace + agent status.")
-    p_status.add_argument("workdir")
     p_status.set_defaults(func=cmd_status)
 
     p_sync = sub.add_parser("sync", help="Fetch/pull and show git statuses.")
-    p_sync.add_argument("workdir")
     p_sync.add_argument("--all", action="store_true", help="Also show agent repo statuses.")
     p_sync.add_argument("--agent", help="Limit to specific agent(s) with --all.")
     p_sync.add_argument("--fetch", action="store_true")
@@ -4704,16 +4814,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_sync.set_defaults(func=cmd_sync)
 
     p_seed = sub.add_parser("seed-sync", help="Copy seed/ and seed-extras/ into agent workdirs.")
-    p_seed.add_argument("workdir")
     p_seed.add_argument("--clean", action="store_true")
     p_seed.set_defaults(func=cmd_seed_sync)
 
     p_update = sub.add_parser("update-workdir", help="Refresh agent AGENTS.md files from current cteam templates.")
-    p_update.add_argument("workdir")
     p_update.set_defaults(func=cmd_update_workdir)
 
     p_tickets = sub.add_parser("tickets", help="Ticket management (list/create/assign/block/reopen/close/show).")
-    p_tickets.add_argument("workdir")
     tickets_sub = p_tickets.add_subparsers(dest="ticket_cmd")
 
     p_t_list = tickets_sub.add_parser("list", help="List tickets.")
@@ -4763,7 +4870,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_t_close.set_defaults(func=cmd_tickets)
 
     p_msg = sub.add_parser("msg", help="Send a message to one agent.")
-    p_msg.add_argument("workdir")
     p_msg.add_argument("--to", required=True)
     p_msg.add_argument("--from", dest="sender")
     p_msg.add_argument("--subject")
@@ -4777,7 +4883,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.set_defaults(func=cmd_msg)
 
     p_b = sub.add_parser("broadcast", help="Broadcast a message to all agents.")
-    p_b.add_argument("workdir")
     p_b.add_argument("--from", dest="sender")
     p_b.add_argument("--subject")
     p_b.add_argument("--file")
@@ -4787,7 +4892,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_b.set_defaults(func=cmd_broadcast)
 
     p_assign = sub.add_parser("assign", help="Send an ASSIGNMENT to an agent (starts them if needed).")
-    p_assign.add_argument("workdir")
     p_assign.add_argument("--to", required=True)
     p_assign.add_argument("--task", help="Task ID (e.g., T001).")
     p_assign.add_argument("--from", dest="sender")
@@ -4804,7 +4908,6 @@ def build_parser() -> argparse.ArgumentParser:
     p_assign.set_defaults(func=cmd_assign)
 
     p_nudge = sub.add_parser("nudge", help="Send a manual nudge to an agent window.")
-    p_nudge.add_argument("workdir")
     p_nudge.add_argument("--to", default="pm", help="agent(s) comma-separated or 'all'")
     p_nudge.add_argument("--reason", default="NUDGE")
     p_nudge.add_argument("--no-follow", action="store_true", help="Do not select the target window.")
@@ -4812,13 +4915,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_nudge.set_defaults(func=cmd_nudge)
 
     p_restart = sub.add_parser("restart", help="Restart Codex in agent tmux windows (respawn).")
-    p_restart.add_argument("workdir")
     p_restart.add_argument("--window", help="agent window name(s) comma-separated or 'all'")
     p_restart.add_argument("--hard", action="store_true", help="send Ctrl-C before respawn (best-effort)")
     p_restart.set_defaults(func=cmd_restart)
 
     p_add = sub.add_parser("add-agent", help="Add a new agent to an existing workspace (one PM only).")
-    p_add.add_argument("workdir")
     p_add.add_argument(
         "--role",
         default="developer",
@@ -4831,8 +4932,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_add.add_argument("--start-codex", action="store_true", help="Start codex immediately for the new agent.")
     p_add.set_defaults(func=cmd_add_agent)
 
+    p_rm = sub.add_parser("remove-agent", help="Remove an agent from the workspace (non-PM only).")
+    p_rm.add_argument("--name", required=True, help="Agent name to remove (not pm).")
+    p_rm.add_argument("--purge", action="store_true", help="Delete agent dirs/mail instead of archiving under _removed/.")
+    p_rm.set_defaults(func=cmd_remove_agent)
+
     p_doc = sub.add_parser("doc-walk", help="Kick off a documentation sprint over the repo (PM-led).")
-    p_doc.add_argument("workdir")
     p_doc.add_argument("--from", dest="sender")
     p_doc.add_argument("--subject")
     p_doc.add_argument("--task")
@@ -4841,18 +4946,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
     p_tg_cfg = sub.add_parser("telegram-configure", help="Configure Telegram bot credentials for customer chat.")
-    p_tg_cfg.add_argument("workdir")
     p_tg_cfg.add_argument("--token", help="Bot token from @BotFather (stored locally).")
     p_tg_cfg.add_argument("--phone", help="Authorized phone number (digits; E.164 preferred).")
     p_tg_cfg.add_argument("--no-interactive", action="store_true", help="Do not prompt (require flags).")
     p_tg_cfg.set_defaults(func=cmd_telegram_configure)
 
     p_tg_en = sub.add_parser("telegram-enable", help="Enable Telegram customer chat bridge (requires prior configure).")
-    p_tg_en.add_argument("workdir")
     p_tg_en.set_defaults(func=cmd_telegram_enable)
 
     p_tg_dis = sub.add_parser("telegram-disable", help="Disable Telegram customer chat bridge.")
-    p_tg_dis.add_argument("workdir")
     p_tg_dis.set_defaults(func=cmd_telegram_disable)
 
     return p

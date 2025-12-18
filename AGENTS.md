@@ -6,23 +6,23 @@
 - Messaging is file-based:
   - canonical mailbox: `shared/mail/<agent>/message.md` (append-only)
   - inbox/outbox copies: `shared/mail/<agent>/{inbox,outbox}/<timestamp>_<sender|recipient>.md`
-  - router loop: `cteam watch` nudges agents and can auto-start Codex when **ASSIGNMENT** mail arrives.
+  - router loop: `cteam <workdir> watch` nudges agents and can auto-start Codex when **ASSIGNMENT** mail arrives.
 - Customer communications use the **same mailbox mechanism** via `shared/mail/customer/…` and can be driven in two ways:
-  - **Local terminal chat**: a dedicated `customer` tmux window runs `cteam customer-chat` (human-typed).
+  - **Local terminal chat**: a dedicated `customer` tmux window runs `cteam <workdir> customer-chat` (human-typed).
   - **Telegram bridge (optional)**: Telegram messages are bridged into the same `customer` mailbox and outbound “to customer” messages are forwarded to Telegram when enabled.
 - When sending messages via cteam CLI, tmux focus jumps to the recipient window by default *only if* the sender’s window is currently active (use `--no-follow` to always stay put). Customer chat will focus PM when the customer sends.
 
 ## Workspace model
 - State lives in `cteam.json` (versioned; upgraded in `upgrade_state_if_needed`). Paths are stored absolute + relative; keep compatibility when editing.
 - Key dirs created by init/import/resume/open:
-  - `shared/` (GOALS/PLAN/TASKS/DECISIONS/TIMELINE/PROTOCOL/TEAM_ROSTER, plus logs)
+- `shared/` (GOALS/PLAN (high-level), TICKETS.json, DECISIONS, TIMELINE, PROTOCOL, TEAM_ROSTER, plus logs)
   - `seed/`, `seed-extras/`
   - `logs/`
   - `agents/`
   - `shared/runtime/` (runtime-only config, secrets, histories)
 - Each agent dir links to the canonical mailbox and shared docs; AGENTS/STATUS templates are generated per role.
 - Shared drive: `shared/drive/` (linked into each agent as `shared-drive/`) for large/non-repo artifacts; **all code/config stays in git**. Keep branches tidy (`agent/<name>/<topic>`), push/pull frequently, avoid history rewrites, and reference shared-drive artifacts in notes/PRs instead of committing them.
-- Upload helper: `cteam upload . path1 [path2 ...] [--dest subpath]` (notifies PM).
+- Upload helper: `cteam <workdir> upload path1 [path2 ...] [--dest subpath]` (notifies PM).
 - Roles clarity (for the cteam tool itself; agent-facing instructions are generated per workspace via `render_agent_agents_md` in cteam.py):
   - PM coordinates sequencing/merge decisions.
   - PM is the planner/owner, not the implementer; delegate execution to architects/devs/testers/researchers and only code as a last resort.
@@ -37,9 +37,9 @@
 
 ## Coordination defaults to preserve
 - PM is the coordinator; non-PM agents must wait for explicit `Type: ASSIGNMENT` before coding.
-- All work is tracked in tickets (managed with `cteam tickets ...`; stored in `shared/TICKETS.json`). Assignments must be linked to a ticket (use `cteam assign --ticket ...` or `--title/--desc` to auto-create).
-- Manage tickets only via `cteam tickets ...`; do not edit ticket files by hand.
-- Usage reminder: `cteam tickets <workdir> list` and `cteam assign <workdir> --ticket T001 --to dev1 "body"`.
+- All work is tracked in tickets (managed with `cteam <workdir> tickets ...`; stored in `shared/TICKETS.json`). Assignments must be linked to a ticket (use `cteam <workdir> assign --ticket ...` or `--title/--desc` to auto-create).
+- Manage tickets only via `cteam <workdir> tickets ...`; do not edit ticket files by hand.
+- Usage reminder: `cteam <workdir> tickets list` and `cteam <workdir> assign --ticket T001 --to dev1 "body"`.
 - Router tmux window name: `router`; session name: `cteam_<slugified project>`.
 - Mail append-only logs: `shared/MESSAGES.log.md`, `shared/ASSIGNMENTS.log.md`.
 - Branch naming guidance emitted to agents: `agent/<agent>/<topic>`.
@@ -52,9 +52,9 @@
 ## Customer channel and Telegram integration
 ### Customer channel (always present)
 - Canonical mailbox: `shared/mail/customer/message.md`
-- Local interactive mode: `cteam customer-chat .` (typically run in tmux window `customer`)
+- Local interactive mode: `cteam <workdir> customer-chat` (typically run in tmux window `customer`)
 - PM/team can send updates to the customer channel with:
-  - `cteam msg . --to customer --from pm --subject "..." "..."`
+  - `cteam <workdir> msg --to customer --from pm --subject "..." "..."`
 
 ### Telegram bridge (optional, single authorized account)
 The Telegram integration exists to make the “customer chat” behave like today, but using Telegram as the transport:
@@ -81,10 +81,13 @@ Persistence model:
 
 ### Coordination
 - `msg`, `broadcast`, `assign` (Type=`ASSIGNMENT`, ticket-linked), `nudge`, `watch` (router loop)
-- `tickets` (list/show/create/assign/block/reopen/close; authoritative over shared/TICKETS.json; rendered view is maintained automatically)
+- `tickets` (list/show/create/assign/block/reopen/close; authoritative over shared/TICKETS.json)
 - Operator convenience:
   - `msg/assign/nudge` default to following (selecting) the recipient window; add `--no-follow` to stay put.
   - Workspace starters attach to tmux by default; add `--no-attach` to just launch without attaching.
+- Agent roster changes:
+  - Add: `cteam add-agent ...`
+  - Remove: `cteam remove-agent ...` (non-PM; archives agent/mail under `_removed/` unless `--purge`)
 
 ### Customer communications
 - Local: `customer-chat` (tmux-friendly)
@@ -134,18 +137,18 @@ Persistence model:
 - Dry run help:
   - `python3 cteam.py --help`
 - Init sandbox:
-  - `python3 cteam.py init /tmp/cteam-sandbox --devs 2 --no-codex --attach`
+  - `python3 cteam.py /tmp/cteam-sandbox init --devs 2 --no-codex --attach`
 - Import flow:
-  - `python3 cteam.py import /tmp/cteam-import --src <repo> --no-codex --recon`
+  - `python3 cteam.py /tmp/cteam-import import --src <repo> --no-codex --recon`
 - Router behavior:
-  - inside a workspace: `python3 cteam.py watch .`
+  - inside a workspace: `python3 cteam.py . watch`
   - append to `shared/mail/dev1/message.md` to confirm nudges + auto-start behavior
 - Telegram (optional):
-  1) `python3 cteam.py telegram-configure .` (enter token + authorized phone)
-  2) `python3 cteam.py telegram-enable .`
+  1) `python3 cteam.py . telegram-configure` (enter token + authorized phone)
+  2) `python3 cteam.py . telegram-enable`
   3) Run `open` or `watch` and DM the bot from the authorized phone; verify:
      - inbound messages land in `shared/mail/customer/…`
-     - sending `cteam msg . --to customer ...` forwards to Telegram
+     - sending `cteam . msg --to customer ...` forwards to Telegram
      - non-authorized users are ignored
 
 ## Updating this doc

@@ -8,7 +8,7 @@ arrives, and can bridge a customer chat (local or Telegram).
 - Starts a tmux session with windows for PM/architect/devs/tester/researcher.
 - Creates a bare repo (`project.git`), an integration checkout (`project/`), and
   per-agent clones (`agents/<name>/proj/`).
-- Maintains shared coordination docs (GOALS, PLAN, TASKS, DECISIONS, TIMELINE).
+- Maintains shared coordination docs (GOALS, PLAN, DECISIONS, TIMELINE) and ticket store.
 - Routes mail via `shared/mail/<agent>/message.md` and nudges/auto-starts Codex
   on assignments.
 - Optional Telegram bridge for the customer channel.
@@ -24,18 +24,18 @@ arrives, and can bridge a customer chat (local or Telegram).
 ## Quick start (new project)
 1) Initialize a workspace (example with two devs):
    ```bash
-   python3 cteam.py init /path/to/workspace --name "My Project" --devs 2
+   python3 cteam.py /path/to/workspace init --name "My Project" --devs 2
    ```
 2) Attach to tmux if not auto-attached:
    ```bash
-   python3 cteam.py attach /path/to/workspace
+   python3 cteam.py /path/to/workspace attach
    ```
-3) PM fills `shared/GOALS.md`, `shared/PLAN.md`, `shared/TASKS.md`, then sends
+3) PM fills `shared/GOALS.md`, `shared/PLAN.md` (high-level), then sends
    assignments (`cteam assign ...`).
 
 ## Import an existing repo
 ```bash
-python3 cteam.py import /path/to/workspace \
+python3 cteam.py /path/to/workspace import \
   --src /path/to/existing/repo \
   --devs 2 \
   --recon
@@ -45,17 +45,19 @@ researcher. The source repo becomes `project.git` and `project/`; each agent
 gets a clone under `agents/<name>/proj/`.
 
 ## Everyday loop (PM-led)
-- Open/resume: `python3 cteam.py open .`
-- Customer channel: `python3 cteam.py customer-chat .`
+- Open/resume: `python3 cteam.py . open`
+- Customer channel: `python3 cteam.py . customer-chat`
 - Assign work (auto-starts Codex):  
-  `python3 cteam.py assign . --to dev1 --task T001 --subject "Feature" "details..."`
-- Message/broadcast: `python3 cteam.py msg . --to dev1 "Ping"` /
-  `python3 cteam.py broadcast . "Standup in 10"`
-- Nudge: `python3 cteam.py nudge . --to dev1 --reason "Check inbox"`; add
+  `python3 cteam.py . assign --to dev1 --task T001 --subject "Feature" "details..."`
+- Message/broadcast: `python3 cteam.py . msg --to dev1 "Ping"` /
+  `python3 cteam.py . broadcast "Standup in 10"`
+- Nudge: `python3 cteam.py . nudge --to dev1 --reason "Check inbox"`; add
   `--interrupt` to send an immediate interrupt (sends Esc before the message).
 - Add agent (PM is unique; PM gets balancing reminder):  
-  `python3 cteam.py add-agent . --role developer --name dev3`
-- Router loop (usually in tmux window `router`): `python3 cteam.py watch .`
+  `python3 cteam.py . add-agent --role developer --name dev3`
+- Remove agent (non-PM):  
+  `python3 cteam.py . remove-agent --name dev3`
+- Router loop (usually in tmux window `router`): `python3 cteam.py . watch`
 
 ## Codex posture
 - Defaults: `--sandbox danger-full-access`, `--ask-for-approval never`,
@@ -92,20 +94,21 @@ python3 -m unittest discover
   `--no-search`, `--full-auto`, `--yolo`
 - tmux/router: `--no-tmux`, `--no-codex`, `--no-attach`, `--window`,
   `--autostart pm|pm+architect|all`, `--no-router` / `--router`
-- Help: usage errors print full `--help`; `cteam <command> --help` shows
+- Help: usage errors print full `--help`; `cteam <workdir> <command> --help` shows
   defaults.
 
 ## Command reference (with explanations)
+All commands use: `python3 cteam.py <workdir> <command> [flags/options]`.
 Lifecycle
-- `init WORKDIR [--name NAME] [--devs N] [--force] [--no-interactive]
+- `<workdir> init [--name NAME] [--devs N] [--force] [--no-interactive]
   [--autostart pm|pm+architect|all]`  
   Create a new workspace with a fresh git repo and agent clones.
-- `import WORKDIR --src <repo|dir> [--name NAME] [--devs N] [--force] [--recon]
+- `<workdir> import --src <repo|dir> [--name NAME] [--devs N] [--force] [--recon]
   [--autostart ...]`  
   Import an existing project. `--src` accepts anything `git clone` accepts
   (GitHub/SSH/HTTP) or a local directory copy. `--recon` sends safe, read-only
   recon tasks to non-PM agents.
-- `open WORKDIR [--no-router]` / `resume WORKDIR [--autostart ...]
+- `<workdir> open [--no-router]` / `<workdir> resume [--autostart ...]
   [--router|--no-router]`  
   Ensure structure exists, start tmux/router/Codex unless suppressed.
 - `attach WORKDIR [--window NAME]`  
@@ -127,44 +130,47 @@ Coordination & chat
 - `nudge WORKDIR [--to NAME|all] [--reason TEXT] [--no-follow]`  
   Manual nudge to a tmux window. Add `--interrupt` to send Escape before the
   message (use for urgent interrupts).
-- `chat WORKDIR --to NAME [--sender NAME] [--subject TEXT] [--no-nudge]
+- `<workdir> chat --to NAME [--sender NAME] [--subject TEXT] [--no-nudge]
   [--start-if-needed]`  
   Interactive chat with an agent.  
-  `customer-chat WORKDIR` — dedicated PM/customer chat window.
+  `<workdir> customer-chat` — dedicated PM/customer chat window.
 
 Ops & repos
-- `upload WORKDIR PATH... [--dest SUBPATH] [--from SENDER]`  
+- `<workdir> upload PATH... [--dest SUBPATH] [--from SENDER]`  
   Copy files/dirs into `shared/drive` and notify PM.
-- `status WORKDIR`  
+- `<workdir> status`  
   Show agent STATUS/inbox timestamps and snippets.
-- `sync WORKDIR [--all] [--agent names] [--fetch] [--pull]
+- `<workdir> sync [--all] [--agent names] [--fetch] [--pull]
   [--no-show-branches]`  
   Git fetch/pull and status for integration checkout and optional agent repos.
-- `seed-sync WORKDIR [--clean]`  
+- `<workdir> seed-sync [--clean]`  
   Propagate `seed/` and `seed-extras/` into agent workdirs.
-- `update-workdir WORKDIR`  
+- `<workdir> update-workdir`  
   Refresh AGENTS.md templates and propagate the latest `cteam.py` into agents.
-- `restart WORKDIR [--window NAME|all] [--hard]`  
+- `<workdir> restart [--window NAME|all] [--hard]`  
   Respawn Codex in agent windows (best-effort Ctrl-C with `--hard`).
-- `add-agent WORKDIR [--role developer|tester|researcher|architect]
+- `<workdir> add-agent [--role developer|tester|researcher|architect]
   [--name NAME] [--title TITLE] [--persona TEXT] [--no-tmux] [--start-codex]`  
   Add an agent (PM is unique). PM is notified to onboard and rebalance work.
-- `doc-walk WORKDIR [--from SENDER] [--subject TEXT] [--task ID] [--auto]`  
+- `<workdir> remove-agent --name NAME [--purge]`  
+  Remove an agent (non-PM). Archives agent/mail under `_removed/` unless
+  `--purge` is passed.
+- `<workdir> doc-walk [--from SENDER] [--subject TEXT] [--task ID] [--auto]`  
   Kick off a documentation sprint; `--auto` seeds doc tasks to other roles.
-- `tickets WORKDIR <subcommand>`  
+- `<workdir> tickets <subcommand>`  
   Manage tickets (list/show/create/assign/block/reopen/close). Tickets live in
-  `shared/TICKETS.json` (view with `cteam tickets list`). `cteam assign` now
+  `shared/TICKETS.json` (view with `cteam <workdir> tickets list`). `cteam assign` now
   requires a ticket (`--ticket`) or will auto-create one with `--title/--desc`.
-  Example: `python3 cteam.py tickets . list` or `python3 cteam.py assign . --ticket T001 --to dev1 "body"`.
+  Example: `python3 cteam.py . tickets list` or `python3 cteam.py . assign --ticket T001 --to dev1 "body"`.
 
 Customer & Telegram
-- `customer-chat WORKDIR`  
+- `<workdir> customer-chat`  
   Local PM/customer chat window (tails `shared/mail/customer/message.md`).
-- `telegram-configure WORKDIR [--token TOKEN] [--phone PHONE] [--no-interactive]`  
+- `<workdir> telegram-configure [--token TOKEN] [--phone PHONE] [--no-interactive]`  
   Store bot credentials for the authorized customer (send `/start` then share your
   phone/contact from that number to link the chat; if it seems quiet, re-share
   contact to re-authorize).
-- `telegram-enable WORKDIR` / `telegram-disable WORKDIR`  
+- `<workdir> telegram-enable` / `<workdir> telegram-disable`  
   Enable/disable Telegram bridge (honored by the router).
 - Telegram images from the authorized customer are saved to `shared/drive/telegram/`
   and referenced in the PM/customer mailboxes.

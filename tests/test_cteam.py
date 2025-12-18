@@ -144,6 +144,62 @@ class MessagingTests(unittest.TestCase):
         cust_mail = (self.root / cteam.DIR_MAIL / "customer" / "message.md").read_text(encoding="utf-8")
         self.assertIn("We received your message", cust_mail)
 
+    def test_write_message_nudge_includes_metadata(self) -> None:
+        calls = []
+
+        def fake_nudge(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED", interrupt: bool = False) -> bool:  # type: ignore
+            calls.append(reason)
+            return True
+
+        orig_nudge = cteam.nudge_agent
+        try:
+            cteam.nudge_agent = fake_nudge  # type: ignore
+            ticket = cteam.ticket_create(
+                self.root,
+                self.state,
+                title="Test ticket",
+                description="desc",
+                creator="pm",
+                assignee="dev1",
+                tags=None,
+                assign_note=None,
+            )
+            cteam.write_message(
+                self.root,
+                self.state,
+                sender="pm",
+                recipient="dev1",
+                subject="Test subject",
+                body="Do the thing",
+                msg_type=cteam.ASSIGNMENT_TYPE,
+                task=None,
+                nudge=True,
+                start_if_needed=False,
+                ticket_id=ticket["id"],
+            )
+            self.assertEqual(len(calls), 1)
+            self.assertIn("MAILBOX UPDATED", calls[0])
+            self.assertIn(ticket["id"], calls[0])
+            self.assertIn(cteam.ASSIGNMENT_TYPE, calls[0])
+        finally:
+            cteam.nudge_agent = orig_nudge  # type: ignore
+
+
+class CustomerCommandTests(unittest.TestCase):
+    def test_ticket_summary_format(self) -> None:
+        store = {
+            "tickets": [
+                {"id": "T002", "title": "Blocked work", "assignee": "dev1", "status": cteam.TICKET_STATUS_BLOCKED, "blocked_on": "T999"},
+                {"id": "T001", "title": "Open work", "assignee": None, "status": cteam.TICKET_STATUS_OPEN},
+                {"id": "T003", "title": "Closed work", "assignee": "dev2", "status": cteam.TICKET_STATUS_CLOSED},
+            ]
+        }
+        out = cteam._format_ticket_summary(store)
+        self.assertIn("T001 [open] @unassigned", out)
+        self.assertIn("T002 [blocked] @dev1", out)
+        self.assertIn("blocked on T999", out)
+        self.assertNotIn("T003", out)
+
 
 class CodexArgsTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -242,6 +298,59 @@ class AddAgentTests(unittest.TestCase):
                 cteam.cmd_add_agent(args)
 
 
+class RemoveAgentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = cteam.build_state(
+            self.root,
+            "Remove Agent",
+            devs=1,
+            mode="new",
+            imported_from=None,
+            codex_cmd="codex",
+            codex_model=None,
+            sandbox=cteam.DEFAULT_CODEX_SANDBOX,
+            approval=cteam.DEFAULT_CODEX_APPROVAL,
+            search=True,
+            full_auto=False,
+            yolo=False,
+            autostart=cteam.DEFAULT_AUTOSTART,
+            router=True,
+        )
+        cteam.save_state(self.root, self.state)
+        cteam.ensure_shared_scaffold(self.root, self.state)
+        (self.root / cteam.DIR_AGENTS / "dev1" / "proj").mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_remove_agent_updates_state_and_unassigns_tickets(self) -> None:
+        ticket = cteam.ticket_create(
+            self.root,
+            self.state,
+            title="Remove me",
+            description="desc",
+            creator="pm",
+            assignee="dev1",
+            tags=None,
+            assign_note=None,
+        )
+        args = argparse.Namespace(workdir=self.root, name="dev1", purge=True)
+        cteam.cmd_remove_agent(args)
+
+        state = cteam.load_state(self.root)
+        self.assertNotIn("dev1", {a["name"] for a in state["agents"]})
+        self.assertFalse((self.root / cteam.DIR_AGENTS / "dev1").exists())
+        self.assertFalse((self.root / cteam.DIR_MAIL / "dev1").exists())
+
+        roster = (self.root / cteam.DIR_SHARED / "TEAM_ROSTER.md").read_text(encoding="utf-8")
+        self.assertNotIn("dev1", roster)
+
+        store = cteam.load_tickets(self.root, state)
+        t = next(t for t in store["tickets"] if t["id"] == ticket["id"])
+        self.assertIsNone(t.get("assignee"))
+
 class NudgeQueueTests(unittest.TestCase):
     def test_queue_deduplicates_recent_nudges(self) -> None:
         calls = []
@@ -270,6 +379,29 @@ class NudgeQueueTests(unittest.TestCase):
             queue.flush(dummy_state)
             self.assertEqual(len(calls), 2)
             self.assertIn("NEW REASON", calls[-1][1])
+        finally:
+            cteam.nudge_agent = orig_nudge  # type: ignore
+            cteam._nudge_history.clear()
+
+    def test_queue_deduplicates_mail_variants(self) -> None:
+        calls = []
+
+        def fake_nudge(root: Path, state: Dict[str, Any], agent_name: str, *, reason: str = "MAILBOX UPDATED", interrupt: bool = False) -> bool:  # type: ignore
+            calls.append((agent_name, reason, interrupt))
+            cteam._nudge_history[agent_name] = (time.time(), cteam._normalize_reasons(cteam._split_reasons(reason)))
+            return True
+
+        orig_nudge = cteam.nudge_agent
+        try:
+            cteam.nudge_agent = fake_nudge  # type: ignore
+            queue = cteam.NudgeQueue(Path("/tmp"), min_interval=30.0, idle_for=0.0)
+            queue._is_idle = lambda state, agent: True  # type: ignore
+            dummy_state = {"tmux": {"session": "s"}}
+
+            cteam._nudge_history["dev1"] = (time.time(), {"MAILBOX UPDATED"})
+            queue.request("dev1", "T123 MAILBOX UPDATED (ASSIGNMENT)")
+            queue.flush(dummy_state)
+            self.assertEqual(len(calls), 0)
         finally:
             cteam.nudge_agent = orig_nudge  # type: ignore
             cteam._nudge_history.clear()
@@ -452,7 +584,7 @@ class ParserHelpTests(unittest.TestCase):
 
     def test_nudge_interrupt_flag_parses(self) -> None:
         parser = cteam.build_parser()
-        args = parser.parse_args(["nudge", "/tmp/workspace", "--to", "dev1", "--interrupt"])
+        args = parser.parse_args(["/tmp/workspace", "nudge", "--to", "dev1", "--interrupt"])
         self.assertTrue(hasattr(args, "interrupt"))
         self.assertTrue(args.interrupt)
 
