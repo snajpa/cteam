@@ -102,8 +102,9 @@ Lifecycle
   Create a new workspace with a fresh git repo and agent clones.
 - `import WORKDIR --src <repo|dir> [--name NAME] [--devs N] [--force] [--recon]
   [--autostart ...]`  
-  Import an existing project. `--recon` sends safe, read-only recon tasks to
-  non-PM agents.
+  Import an existing project. `--src` accepts anything `git clone` accepts
+  (GitHub/SSH/HTTP) or a local directory copy. `--recon` sends safe, read-only
+  recon tasks to non-PM agents.
 - `open WORKDIR [--no-router]` / `resume WORKDIR [--autostart ...]
   [--router|--no-router]`  
   Ensure structure exists, start tmux/router/Codex unless suppressed.
@@ -150,6 +151,11 @@ Ops & repos
   Add an agent (PM is unique). PM is notified to onboard and rebalance work.
 - `doc-walk WORKDIR [--from SENDER] [--subject TEXT] [--task ID] [--auto]`  
   Kick off a documentation sprint; `--auto` seeds doc tasks to other roles.
+- `tickets WORKDIR <subcommand>`  
+  Manage tickets (list/show/create/assign/block/reopen/close). Tickets live in
+  `shared/TICKETS.json` (view with `cteam tickets list`). `cteam assign` now
+  requires a ticket (`--ticket`) or will auto-create one with `--title/--desc`.
+  Example: `python3 cteam.py tickets . list` or `python3 cteam.py assign . --ticket T001 --to dev1 "body"`.
 
 Customer & Telegram
 - `customer-chat WORKDIR`  

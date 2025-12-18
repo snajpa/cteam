@@ -102,13 +102,15 @@ class MessagingTests(unittest.TestCase):
 
     def test_format_and_parse_round_trip(self) -> None:
         ts = cteam.now_iso()
-        entry = cteam.format_message(ts, "pm", "dev1", "Hello", "Body line", msg_type="MESSAGE")
-        parsed_ts, sender, recipient, subject, body = cteam._parse_entry(entry)
+        entry = cteam.format_message(ts, "pm", "dev1", "Hello", "Body line", msg_type="MESSAGE", ticket_id="T001")
+        parsed_ts, sender, recipient, subject, body, ticket_id, msg_type = cteam._parse_entry(entry)
         self.assertEqual(parsed_ts, ts)
         self.assertEqual(sender, "pm")
         self.assertEqual(recipient, "dev1")
         self.assertEqual(subject, "Hello")
         self.assertIn("Body line", body)
+        self.assertEqual(ticket_id, "T001")
+        self.assertEqual(msg_type, "MESSAGE")
 
     def test_write_message_updates_mail_and_logs(self) -> None:
         cteam.write_message(
@@ -304,6 +306,101 @@ class NudgeQueueTests(unittest.TestCase):
             self.assertEqual(len(calls), 1)
         finally:
             cteam.nudge_agent = orig_nudge  # type: ignore
+
+
+class TicketTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.state = cteam.build_state(
+            self.root,
+            "Ticket Test",
+            devs=1,
+            mode="new",
+            imported_from=None,
+            codex_cmd="codex",
+            codex_model=None,
+            sandbox=cteam.DEFAULT_CODEX_SANDBOX,
+            approval=cteam.DEFAULT_CODEX_APPROVAL,
+            search=True,
+            full_auto=False,
+            yolo=False,
+            autostart=cteam.DEFAULT_AUTOSTART,
+            router=True,
+        )
+        cteam.save_state(self.root, self.state)
+        cteam.ensure_shared_scaffold(self.root, self.state)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_ticket_create_and_assign(self) -> None:
+        ticket = cteam.ticket_create(
+            self.root,
+            self.state,
+            title="Test ticket",
+            description="desc",
+            creator="pm",
+            assignee=None,
+            tags=["a", "b"],
+            assign_note=None,
+        )
+        self.assertEqual(ticket["status"], cteam.TICKET_STATUS_OPEN)
+        t2 = cteam.ticket_assign(self.root, self.state, ticket_id=ticket["id"], assignee="dev1", user="pm", note="assign")
+        self.assertEqual(t2["assignee"], "dev1")
+        store = cteam.load_tickets(self.root, self.state)
+        self.assertEqual(store["tickets"][0]["assignee"], "dev1")
+
+    def test_cmd_assign_auto_creates_ticket_and_links_mail(self) -> None:
+        args = argparse.Namespace(
+            workdir=self.root,
+            to="dev1",
+            task=None,
+            sender="pm",
+            subject="Do it",
+            file=None,
+            no_nudge=True,
+            ticket=None,
+            title="New work",
+            desc="Do something important",
+            assign_note=None,
+            tags=None,
+            text="Body text",
+            no_follow=False,
+        )
+        cteam.cmd_assign(args)
+        store = cteam.load_tickets(self.root, self.state)
+        self.assertEqual(len(store["tickets"]), 1)
+        tid = store["tickets"][0]["id"]
+        msg = (self.root / cteam.DIR_MAIL / "dev1" / "message.md").read_text(encoding="utf-8")
+        self.assertIn("Ticket:", msg)
+        self.assertIn(tid, msg)
+
+    def test_ticket_block_command_notifies(self) -> None:
+        t = cteam.ticket_create(
+            self.root,
+            self.state,
+            title="Blockable",
+            description="desc",
+            creator="pm",
+            assignee="dev1",
+            tags=None,
+            assign_note=None,
+        )
+        args = argparse.Namespace(
+            workdir=self.root,
+            ticket_cmd="block",
+            id=t["id"],
+            on="T999",
+            user="pm",
+            note="waiting on API",
+        )
+        cteam.cmd_tickets(args)
+        store = cteam.load_tickets(self.root, self.state)
+        self.assertEqual(store["tickets"][0]["status"], cteam.TICKET_STATUS_BLOCKED)
+        pm_mail = (self.root / cteam.DIR_MAIL / "pm" / "message.md").read_text(encoding="utf-8")
+        self.assertIn("blocked", pm_mail.lower())
+        self.assertIn(t["id"], pm_mail)
 
 
 class UpdateWorkdirTests(unittest.TestCase):

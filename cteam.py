@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import fcntl
 import json
 import os
 import re
@@ -66,6 +67,7 @@ import time
 import urllib.request
 import urllib.error
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -75,7 +77,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # -----------------------------
 
 STATE_FILENAME = "cteam.json"
-STATE_VERSION = 6
+STATE_VERSION = 7
 
 DIR_PROJECT_BARE = "project.git"
 DIR_PROJECT_CHECKOUT = "project"
@@ -83,6 +85,8 @@ DIR_SEED = "seed"
 DIR_SEED_EXTRAS = "seed-extras"
 DIR_SHARED = "shared"
 DIR_SHARED_DRIVE = f"{DIR_SHARED}/drive"
+TICKETS_JSON_REL = f"{DIR_SHARED}/TICKETS.json"
+TICKETS_MD_REL = f"{DIR_SHARED}/TICKETS.md"
 DIR_AGENTS = "agents"
 DIR_LOGS = "logs"
 DIR_MAIL = f"{DIR_SHARED}/mail"
@@ -106,6 +110,13 @@ TELEGRAM_MAX_MESSAGE = 3900  # Telegram hard limit is 4096; keep margin.
 
 # For robust "assignment" detection
 ASSIGNMENT_TYPE = "ASSIGNMENT"
+
+TICKET_STATUS_OPEN = "open"
+TICKET_STATUS_BLOCKED = "blocked"
+TICKET_STATUS_CLOSED = "closed"
+TICKET_STATUSES = {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED}
+
+TICKET_MIGRATION_FLAG = f"{DIR_RUNTIME}/tickets_migration_notified"
 
 _nudge_history: Dict[str, Tuple[float, Set[str]]] = {}
 
@@ -159,6 +170,11 @@ def slugify(s: str) -> str:
     return s or "project"
 
 
+def _looks_like_git_url(src: str) -> bool:
+    s = src.strip()
+    return bool(re.match(r"^(https?://|ssh://|git@|file://|.+\\.git$)", s))
+
+
 def mkdirp(p: Path) -> None:
     p.mkdir(parents=True, exist_ok=True)
 
@@ -195,6 +211,322 @@ def log_line(root: Path, message: str) -> None:
     except Exception:
         pass
 
+
+# -----------------------------
+# Tickets
+# -----------------------------
+
+
+def tickets_json_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Path:
+    rel = None
+    if state:
+        rel = (state.get("tickets") or {}).get("json_rel")
+    rel = rel or TICKETS_JSON_REL
+    return (root / rel).resolve()
+
+
+def tickets_md_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Path:
+    rel = None
+    if state:
+        rel = (state.get("tickets") or {}).get("md_rel")
+    rel = rel or TICKETS_MD_REL
+    return (root / rel).resolve()
+
+
+@contextmanager
+def ticket_lock(root: Path, state: Dict[str, Any]):
+    lock_path = tickets_json_path(root, state).with_suffix(".lock")
+    mkdirp(lock_path.parent)
+    f = lock_path.open("a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
+
+
+def _ticket_store_default() -> Dict[str, Any]:
+    return {"meta": {"next_id": 1}, "tickets": []}
+
+
+def load_tickets(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
+    p = tickets_json_path(root, state)
+    if not p.exists():
+        store = _ticket_store_default()
+        save_tickets(root, state, store)
+        return store
+    try:
+        store = json.loads(p.read_text(encoding="utf-8"))
+        if "meta" not in store or "tickets" not in store:
+            raise ValueError("missing keys")
+    except Exception:
+        store = _ticket_store_default()
+        save_tickets(root, state, store)
+    meta = store.setdefault("meta", {})
+    meta.setdefault("next_id", 1)
+    if not isinstance(store.get("tickets"), list):
+        store["tickets"] = []
+    return store
+
+
+def save_tickets(root: Path, state: Dict[str, Any], store: Dict[str, Any]) -> None:
+    atomic_write_text(tickets_json_path(root, state), json.dumps(store, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(tickets_md_path(root, state), render_tickets_md(store))
+
+
+def _next_ticket_id(meta: Dict[str, Any]) -> str:
+    try:
+        n = int(meta.get("next_id", 1))
+    except Exception:
+        n = 1
+    tid = f"T{n:03d}"
+    meta["next_id"] = n + 1
+    return tid
+
+
+def _find_ticket(store: Dict[str, Any], ticket_id: str) -> Optional[Dict[str, Any]]:
+    tid = (ticket_id or "").upper()
+    for t in store.get("tickets", []):
+        if str(t.get("id", "")).upper() == tid:
+            return t
+    return None
+
+
+def _add_history(ticket: Dict[str, Any], event: Dict[str, Any]) -> None:
+    hist = ticket.setdefault("history", [])
+    hist.append(event)
+
+
+def render_tickets_md(store: Dict[str, Any]) -> str:
+    tickets = store.get("tickets") or []
+    lines = ["# Tickets", ""]
+
+    def fmt_ticket(t: Dict[str, Any]) -> str:
+        tid = t.get("id", "")
+        status = t.get("status", TICKET_STATUS_OPEN)
+        assignee = t.get("assignee") or "unassigned"
+        title = t.get("title") or ""
+        blocked_on = t.get("blocked_on") or ""
+        tag_str = ""
+        tags = t.get("tags") or []
+        if tags:
+            tag_str = f" [tags: {', '.join(tags)}]"
+        block_note = f" (blocked on {blocked_on})" if status == TICKET_STATUS_BLOCKED and blocked_on else ""
+        return f"- {tid} [{status}] @{assignee} — {title}{block_note}{tag_str}"
+
+    by_status: Dict[str, List[Dict[str, Any]]] = {s: [] for s in TICKET_STATUSES}
+    for t in tickets:
+        st = t.get("status", TICKET_STATUS_OPEN)
+        if st not in by_status:
+            st = TICKET_STATUS_OPEN
+        by_status[st].append(t)
+
+    stats = {k: len(v) for k, v in by_status.items()}
+    lines.append(f"Open: {stats.get(TICKET_STATUS_OPEN,0)} | Blocked: {stats.get(TICKET_STATUS_BLOCKED,0)} | Closed: {stats.get(TICKET_STATUS_CLOSED,0)}")
+    lines.append("")
+
+    for status_label in (TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED):
+        section = by_status.get(status_label, [])
+        if not section:
+            continue
+        lines.append(f"## {status_label.title()} ({len(section)})")
+        lines.append("")
+        for t in section:
+            lines.append(fmt_ticket(t))
+        lines.append("")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _ticket_required(store: Dict[str, Any], ticket_id: str) -> Dict[str, Any]:
+    t = _find_ticket(store, ticket_id)
+    if not t:
+        raise CTeamError(f"ticket not found: {ticket_id}")
+    return t
+
+
+def _ticket_summary_block(ticket: Dict[str, Any]) -> str:
+    assignee = ticket.get("assignee") or "unassigned"
+    status = ticket.get("status", TICKET_STATUS_OPEN)
+    blocked_on = ticket.get("blocked_on") or ""
+    lines = [
+        f"Ticket: {ticket.get('id','')} — {ticket.get('title','')}",
+        f"Status: {status}" + (f" (blocked on {blocked_on})" if status == TICKET_STATUS_BLOCKED and blocked_on else ""),
+        f"Assignee: {assignee}",
+    ]
+    desc = (ticket.get("description") or "").strip()
+    if desc:
+        lines.append("")
+        lines.append(desc)
+    return "\n".join(lines).strip()
+
+
+def _notify_ticket_change(
+    root: Path,
+    state: Dict[str, Any],
+    ticket: Dict[str, Any],
+    *,
+    recipients: List[str],
+    subject: str,
+    body: str,
+    nudge: bool = True,
+    start_if_needed: bool = False,
+) -> None:
+    summary = _ticket_summary_block(ticket)
+    combined = f"{summary}\n\n{body.strip()}" if body.strip() else summary
+    for r in recipients:
+        if not r:
+            continue
+        write_message(
+            root,
+            state,
+            sender="pm",
+            recipient=r,
+            subject=subject,
+            body=combined,
+            msg_type="MESSAGE",
+            task=None,
+            nudge=nudge,
+            start_if_needed=start_if_needed,
+            ticket_id=ticket.get("id"),
+        )
+
+
+def _parse_tags(tag_str: Optional[str]) -> List[str]:
+    if not tag_str:
+        return []
+    tags = [t.strip() for t in tag_str.split(",") if t.strip()]
+    return list(dict.fromkeys(tags))  # dedupe preserving order
+
+
+def ticket_create(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    title: str,
+    description: str,
+    creator: str,
+    assignee: Optional[str],
+    tags: Optional[List[str]] = None,
+    assign_note: Optional[str] = None,
+) -> Dict[str, Any]:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        ts = now_iso()
+        tid = _next_ticket_id(store["meta"])
+        ticket = {
+            "id": tid,
+            "title": title.strip(),
+            "description": description.strip(),
+            "status": TICKET_STATUS_OPEN,
+            "assignee": assignee or None,
+            "blocked_on": "",
+            "created_at": ts,
+            "updated_at": ts,
+            "created_by": creator,
+            "tags": tags or [],
+            "history": [],
+        }
+        _add_history(ticket, {"ts": ts, "type": "created", "user": creator, "note": title.strip()})
+        if assignee:
+            _add_history(
+                ticket,
+                {
+                    "ts": ts,
+                    "type": "assigned",
+                    "user": creator,
+                    "from": None,
+                    "to": assignee,
+                    "note": (assign_note or "").strip(),
+                },
+            )
+        store["tickets"].append(ticket)
+        save_tickets(root, state, store)
+        return ticket
+
+
+def ticket_assign(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    ticket_id: str,
+    assignee: str,
+    user: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        t = _ticket_required(store, ticket_id)
+        if t.get("status") == TICKET_STATUS_CLOSED:
+            raise CTeamError(f"ticket {ticket_id} is closed; reopen before assigning")
+        prev = t.get("assignee")
+        t["assignee"] = assignee
+        t["updated_at"] = now_iso()
+        _add_history(t, {"ts": t["updated_at"], "type": "assigned", "user": user, "from": prev, "to": assignee, "note": (note or "").strip()})
+        save_tickets(root, state, store)
+        return t
+
+
+def ticket_block(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    ticket_id: str,
+    user: str,
+    blocked_on: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        t = _ticket_required(store, ticket_id)
+        t["status"] = TICKET_STATUS_BLOCKED
+        t["blocked_on"] = blocked_on.strip()
+        t["updated_at"] = now_iso()
+        _add_history(t, {"ts": t["updated_at"], "type": "blocked", "user": user, "blocked_on": blocked_on, "note": (note or '').strip()})
+        save_tickets(root, state, store)
+        return t
+
+
+def ticket_reopen(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    ticket_id: str,
+    user: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        t = _ticket_required(store, ticket_id)
+        t["status"] = TICKET_STATUS_OPEN
+        t["blocked_on"] = ""
+        t["updated_at"] = now_iso()
+        _add_history(t, {"ts": t["updated_at"], "type": "reopened", "user": user, "note": (note or "").strip()})
+        save_tickets(root, state, store)
+        return t
+
+
+def ticket_close(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    ticket_id: str,
+    user: str,
+    note: Optional[str] = None,
+) -> Dict[str, Any]:
+    with ticket_lock(root, state):
+        store = load_tickets(root, state)
+        t = _ticket_required(store, ticket_id)
+        t["status"] = TICKET_STATUS_CLOSED
+        t["blocked_on"] = ""
+        t["updated_at"] = now_iso()
+        _add_history(t, {"ts": t["updated_at"], "type": "closed", "user": user, "note": (note or "").strip()})
+        save_tickets(root, state, store)
+        return t
 
 
 # -----------------------------
@@ -933,6 +1265,10 @@ def build_state(
             "router": bool(router),
             "paused": False,
         },
+        "tickets": {
+            "json_rel": TICKETS_JSON_REL,
+            "md_rel": TICKETS_MD_REL,
+        },
                 "telegram": {
             "enabled": False,
             "config_rel": TELEGRAM_CONFIG_REL,
@@ -1022,6 +1358,18 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         coord.setdefault("start_agents_on_assignment", True)
         coord.setdefault("pm_is_boss", True)
         state["coordination"] = coord
+    # --- v < 7 upgrades (tickets) ---
+    if v < 7:
+        tickets_cfg = state.get("tickets") or {}
+        if not isinstance(tickets_cfg, dict):
+            tickets_cfg = {}
+        tickets_cfg.setdefault("json_rel", TICKETS_JSON_REL)
+        tickets_cfg.setdefault("md_rel", TICKETS_MD_REL)
+        state["tickets"] = tickets_cfg
+        try:
+            _ = load_tickets(root, state)
+        except Exception:
+            save_tickets(root, state, _ticket_store_default())
 
     state["version"] = STATE_VERSION
     compute_agent_abspaths(state)
@@ -1301,6 +1649,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
           - `Type: {ASSIGNMENT_TYPE}`
         - If unassigned, you may do *lightweight reconnaissance* and send a short note to PM,
           but avoid code changes/commits.
+        - All work is tracked in tickets (managed via `cteam tickets ...`). Only work on tickets assigned to you. Reference ticket IDs in STATUS updates and commits. Do not edit ticket files directly—use `cteam tickets ...` and `cteam assign`.
 
         ## Where to work
         - Your repo clone: `proj/` (work here)
@@ -1370,7 +1719,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             1) Read seed/ (if any) and repo README/docs.
             2) Fill `shared/GOALS.md` with assumptions + questions.
             3) Write `shared/PLAN.md` and `shared/TASKS.md`.
-            4) Start assigning work using `cteam assign`.
+            4) Start assigning work using tickets: create with `cteam tickets create ...` or `cteam assign --title/--desc` and assign with `cteam assign --ticket ...`.
 
             Important:
             - Keep non-PM agents focused on one assignment at a time.
@@ -1381,6 +1730,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
               (sends Escape before the message); use sparingly and follow up with clear instructions.
             - You own alignment with the customer and overall quality; ensure deliveries match customer intent and standards before they go out.
             - Delegation: you are the planner/owner, not the implementer. Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty. Only code yourself as a last resort and keep changes minimal.
+            - Keep tickets as the single source of truth. Migrate legacy TASKS/PLAN items into tickets and close out duplicates there.
             - Customer channel: when you read a customer message, reply immediately with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”). If you file work, tell the customer what you filed and when you’ll return with results.
             """
         )
@@ -1392,6 +1742,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Record major decisions in shared/DECISIONS.md.
             - Coordinate with PM before making broad changes.
             - Keep the customer out of engineering tasks; they provide context/feedback only via PM.
+            - Work only on tickets assigned to you; propose/shape tickets with PM for new design work.
 
             Default behavior if unassigned:
             - create a short "architecture map" note for PM
@@ -1407,9 +1758,10 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Keep changes small and mergeable.
             - Write tests when feasible.
             - Do not ask the customer to do engineering work; request clarifications via PM.
+            - Work only on tickets assigned to you; include ticket IDs in commits/STATUS updates.
 
             Default behavior if unassigned:
-            - scan repo quickly, propose a task to PM
+            - scan repo quickly, propose a ticket to PM
             - do NOT start coding without assignment
             """
         )
@@ -1421,6 +1773,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             - Add smoke tests and regression tests.
             - Verify fixes.
             - You own quality; never push testing effort onto the customer.
+            - Work only on tickets assigned to you; reference ticket IDs in STATUS updates and test notes.
 
             Default behavior if unassigned:
             - find how to run the project/tests, write a short note to PM
@@ -1456,7 +1809,9 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
             "You are the Project Manager. First open message.md for any kickoff notes. "
             "Then immediately infer what this codebase is for. "
             "Open shared/GOALS.md and fill it with inferred goals, non-goals, and questions. "
-            "Then write shared/PLAN.md + shared/TASKS.md, and assign first tasks using `cteam assign`. "
+            "Then write shared/PLAN.md + shared/TASKS.md. Track all work in tickets via `cteam tickets ...`. "
+            "Plan discovery work as tickets and assign them to the team to map the imported repo. "
+            "Assign work with `cteam assign --ticket ...` (auto-create tickets with --title/--desc). "
             "Keep everyone coordinated; do not let others work unassigned. "
             "Start now. "
             f"{path_hint}"
@@ -1464,7 +1819,8 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
     return (
         "You are the Project Manager. First open message.md for any kickoff notes. "
         "Then read seed/ and write shared/GOALS.md + shared/PLAN.md + shared/TASKS.md. "
-        "Then assign tasks to the team using `cteam assign`. Keep everyone coordinated. Start now. "
+        "Track work via `cteam tickets ...`. Assign tasks with `cteam assign --ticket ...` "
+        "or auto-create tickets using --title/--desc. Keep everyone coordinated. Start now. "
         f"{path_hint}"
     )
 
@@ -1487,6 +1843,7 @@ def standby_banner(agent: Dict[str, Any], state: Dict[str, Any]) -> str:
         Standby mode (PM-led coordination):
         - Waiting for PM/human assignment.
         - Your inbox: {DIR_MAIL}/{agent['name']}/message.md
+        - Tickets: managed via `cteam tickets ...` (work only on tickets assigned to you)
         - If you are assigned work, this window will be repurposed to run Codex automatically.
 
         Tip: If you want to manually check mail:
@@ -1499,7 +1856,7 @@ def standby_banner(agent: Dict[str, Any], state: Dict[str, Any]) -> str:
 # Workspace creation
 # -----------------------------
 
-def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
+def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> bool:
     mkdirp(root / DIR_LOGS)
     mkdirp(root / DIR_SEED)
     mkdirp(root / DIR_SEED_EXTRAS)
@@ -1507,6 +1864,13 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
     mkdirp(root / DIR_SHARED_DRIVE)
     mkdirp(root / DIR_AGENTS)
     mkdirp(root / DIR_RUNTIME)
+
+    tickets_existed = tickets_json_path(root, state).exists()
+    try:
+        _ = load_tickets(root, state)
+    except Exception:
+        save_tickets(root, state, _ticket_store_default())
+    created_tickets = not tickets_existed
 
     if not (root / DIR_SEED / "README.md").exists():
         atomic_write_text(root / DIR_SEED / "README.md", render_seed_readme())
@@ -1565,6 +1929,8 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> None:
             "# Customer channel\n\nUse this file to record customer updates, questions, and answers.\n\n",
         )
 
+    return created_tickets
+
 
 def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
     bare = root / DIR_PROJECT_BARE
@@ -1608,6 +1974,8 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
         imported_as_git = True
     except CTeamError:
         imported_as_git = False
+        if _looks_like_git_url(src):
+            raise
 
     if imported_as_git:
         if not checkout.exists():
@@ -1749,6 +2117,7 @@ def format_message(
     *,
     msg_type: str = "MESSAGE",
     task: Optional[str] = None,
+    ticket_id: Optional[str] = None,
 ) -> str:
     subject_line = subject.strip() if subject.strip() else "(no subject)"
     lines = [
@@ -1756,6 +2125,8 @@ def format_message(
         f"**Type:** {msg_type}",
         f"**Subject:** {subject_line}",
     ]
+    if ticket_id:
+        lines.append(f"**Ticket:** {ticket_id}")
     if task:
         lines.append(f"**Task:** {task}")
     lines.append("")  # blank line before body
@@ -1788,9 +2159,12 @@ def write_message(
     task: Optional[str] = None,
     nudge: bool = True,
     start_if_needed: bool = False,
+    ticket_id: Optional[str] = None,
 ) -> None:
     ts = now_iso()
-    entry = format_message(ts, sender, recipient, subject, body, msg_type=msg_type, task=task)
+    if ticket_id:
+        ticket_id = ticket_id.strip()
+    entry = format_message(ts, sender, recipient, subject, body, msg_type=msg_type, task=task, ticket_id=ticket_id or None)
     if not entry.endswith("\n"):
         entry += "\n"
 
@@ -1807,6 +2181,25 @@ def write_message(
         raise CTeamError("only pm can message customer")
     if msg_type == ASSIGNMENT_TYPE and sender not in {"pm", "cteam"}:
         raise CTeamError("assignments must come from pm")
+    if ticket_id:
+        with ticket_lock(root, state):
+            store = load_tickets(root, state)
+            t = _find_ticket(store, ticket_id)
+            if not t:
+                raise CTeamError(f"unknown ticket: {ticket_id}")
+            snippet = (body or "").strip().splitlines()[0] if body else ""
+            _add_history(
+                t,
+                {
+                    "ts": ts,
+                    "type": "message",
+                    "user": sender,
+                    "note": f"{subject}".strip(),
+                    "snippet": snippet[:200],
+                },
+            )
+            t["updated_at"] = ts
+            save_tickets(root, state, store)
 
     msg_path, inbox_dir, _ = mailbox_paths(root, recipient)
     mkdirp(inbox_dir)
@@ -1994,13 +2387,21 @@ def start_codex_in_window(
         if agent["name"] == "pm":
             first_prompt = initial_prompt_for_pm(state)
         else:
-            first_prompt = (
-                f"You are {agent['title']} ({agent['name']}). "
-                f"Open AGENTS.md and message.md. "
-                f"If you do not have an assignment (Type: {ASSIGNMENT_TYPE}), do NOT start coding; "
-                f"send a short recon note to PM, then wait. "
-                f"cteam.py location: {state.get('root_abs','')}/cteam.py"
-            )
+            if state.get("mode") == "import":
+                first_prompt = (
+                    f"You are {agent['title']} ({agent['name']}). Imported project; wait for ticketed assignments. "
+                    f"Open AGENTS.md and message.md. Do NOT change code without a ticketed assignment (Type: {ASSIGNMENT_TYPE}). "
+                    f"Send a short discovery note to PM if needed, then wait for a ticket. "
+                    f"Tickets are managed via `cteam tickets ...`. cteam.py location: {state.get('root_abs','')}/cteam.py"
+                )
+            else:
+                first_prompt = (
+                    f"You are {agent['title']} ({agent['name']}). "
+                    f"Open AGENTS.md and message.md. "
+                    f"If you do not have an assignment (Type: {ASSIGNMENT_TYPE}), do NOT start coding; "
+                    f"send a short recon note to PM, then wait. "
+                    f"cteam.py location: {state.get('root_abs','')}/cteam.py"
+                )
     else:
         first_prompt = prompt_on_mail(agent["name"])
 
@@ -2290,11 +2691,13 @@ def _telegram_request_contact(cfg: Dict[str, Any], chat_id: int) -> None:
     )
 
 
-def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str], str, str]:
+def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str], str, str, Optional[str], Optional[str]]:
     ts = None
     sender = None
     recipient = None
     subject = ""
+    ticket_id: Optional[str] = None
+    msg_type: Optional[str] = None
     lines = entry.splitlines()
     if lines:
         m = re.match(r"^##\s+(.+?)\s+—\s+From:\s*([^\s→]+)\s+→\s+To:\s*([^\s]+)\s*$", lines[0].strip())
@@ -2306,6 +2709,12 @@ def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str
     m2 = re.search(r"\*\*Subject:\*\*\s*(.+)", entry)
     if m2:
         subject = m2.group(1).strip()
+    m_type = re.search(r"\*\*Type:\*\*\s*([A-Z_]+)", entry)
+    if m_type:
+        msg_type = m_type.group(1).strip()
+    m3 = re.search(r"\*\*Ticket:\*\*\s*([A-Za-z0-9_-]+)", entry)
+    if m3:
+        ticket_id = m3.group(1).strip()
 
     body_start = 0
     for i, line in enumerate(lines[:25]):
@@ -2323,7 +2732,7 @@ def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str
             break
         body_lines.append(line)
     body = "\n".join(body_lines).rstrip()
-    return ts, sender, recipient, subject, body
+    return ts, sender, recipient, subject, body, ticket_id, msg_type
 
 
 def _sanitize_filename(name: str, fallback: str = "file") -> str:
@@ -2600,7 +3009,7 @@ class TelegramBridge:
             if not entry:
                 continue
             entry = entry + "\n---\n"
-            ts, sender, recipient, subject, body = _parse_entry(entry)
+            ts, sender, recipient, subject, body, _, _ = _parse_entry(entry)
             if recipient != "customer":
                 continue
             if sender == "customer":
@@ -2727,17 +3136,23 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_txt = ""
             last_sender: Optional[str] = None
             last_type: Optional[str] = None
+            last_ticket: Optional[str] = None
             for fp in new_files[-1:]:
                 try:
                     last_txt = fp.read_text(encoding="utf-8", errors="replace")[:4000]
                 except Exception:
                     last_txt = ""
-                last_sender, last_type = parse_sender_and_type_from_message(last_txt)
+                _, last_sender, _, _, _, last_ticket, last_type = _parse_entry(last_txt)
 
             if last_sender and last_type:
                 maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
 
-            nudge_queue.request(name, "MAILBOX UPDATED")
+            reason = "MAILBOX UPDATED"
+            if last_ticket:
+                reason = f"{last_ticket} {reason}"
+            if last_type:
+                reason = f"{reason} ({last_type})"
+            nudge_queue.request(name, reason)
 
         # Customer wait loop: if last inbound from customer lacks a PM reply, keep nudging PM.
         try:
@@ -2845,7 +3260,7 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
                     if not entry:
                         continue
                     entry = entry + "\n---\n"
-                    _, sender, recipient, _, _ = _parse_entry(entry)
+                    _, sender, recipient, _, _, _, _ = _parse_entry(entry)
                     if recipient and recipient != "customer":
                         continue
                     print("\n" + entry, end="", flush=True)
@@ -3062,12 +3477,13 @@ def cmd_pause(args: argparse.Namespace) -> None:
 # High-level operations: init/import/resume/open
 # -----------------------------
 
-def create_root_structure(root: Path, state: Dict[str, Any]) -> None:
+def create_root_structure(root: Path, state: Dict[str, Any]) -> bool:
     mkdirp(root)
     install_self_into_root(root)
-    ensure_shared_scaffold(root, state)
+    created_tickets = ensure_shared_scaffold(root, state)
     update_roster(root, state)
     save_state(root, state)
+    return created_tickets
 
 
 def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
@@ -3175,7 +3591,7 @@ def cmd_init(args: argparse.Namespace) -> None:
     )
     save_state(root, state)
 
-    create_root_structure(root, state)
+    _ = create_root_structure(root, state)
     create_git_scaffold_new(root, state)
     ensure_agents_created(root, state)
     update_roster(root, state)
@@ -3244,30 +3660,34 @@ def cmd_import(args: argparse.Namespace) -> None:
     )
     save_state(root, state)
 
-    create_root_structure(root, state)
+    _ = create_root_structure(root, state)
     create_git_scaffold_import(root, state, src)
     ensure_agents_created(root, state)
     update_roster(root, state)
     save_state(root, state)
 
     state = load_state(root)
-    write_message(
-        root,
-        state,
-        sender="cteam",
-        recipient="pm",
-        subject="Import kickoff: infer goals + plan",
-        body=(
-            "This is an imported codebase.\n\n"
-            "1) Inspect README/docs/code and fill shared/GOALS.md with inferred goals + open questions.\n"
-            "2) Write shared/PLAN.md + shared/TASKS.md.\n"
-            "3) Assign first tasks to architect/devs/tester/researcher using `cteam assign`.\n"
-        ),
-        msg_type=ASSIGNMENT_TYPE,
-        task="PM-IMPORT-KICKOFF",
-        nudge=True,
-        start_if_needed=True,
-    )
+    try:
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient="pm",
+            subject="Import kickoff: infer goals + plan",
+            body=(
+                "This is an imported codebase.\n\n"
+                "1) Inspect README/docs/code and fill shared/GOALS.md with inferred goals + open questions.\n"
+                "2) Write shared/PLAN.md + shared/TASKS.md.\n"
+                "3) Create tickets for discovery tasks and assign them with `cteam tickets` + `cteam assign --ticket ...`.\n"
+                "4) Keep agents coordinated; they will wait for ticketed assignments.\n"
+            ),
+            msg_type=ASSIGNMENT_TYPE,
+            task="PM-IMPORT-KICKOFF",
+            nudge=True,
+            start_if_needed=True,
+        )
+    except Exception:
+        pass
 
     if args.recon:
         for who, subj, task, body in [
@@ -3315,7 +3735,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
         state["tmux"]["router"] = True
     save_state(root, state)
 
-    create_root_structure(root, state)
+    new_tickets = create_root_structure(root, state)
     if not (root / DIR_PROJECT_BARE).exists() or not (root / DIR_PROJECT_BARE / "HEAD").exists():
         git_init_bare(root / DIR_PROJECT_BARE, branch=state["git"]["default_branch"])
     if not (root / DIR_PROJECT_CHECKOUT).exists():
@@ -3325,6 +3745,27 @@ def cmd_resume(args: argparse.Namespace) -> None:
     update_roster(root, state)
     state["tmux"]["paused"] = False
     save_state(root, state)
+
+    if new_tickets and not (root / TICKET_MIGRATION_FLAG).exists():
+        try:
+            write_message(
+                root,
+                state,
+                sender="cteam",
+                recipient="pm",
+                subject="Ticket system initialized",
+                body=(
+                    "A ticket database was created automatically (shared/TICKETS.json). "
+                    "Please migrate any outstanding tasks/plan items into tickets and retire duplicate entries in legacy files. "
+                    "Use `cteam tickets` to manage tickets and `cteam assign --ticket ...` for all assignments."
+                ),
+                msg_type="MESSAGE",
+                nudge=True,
+                start_if_needed=True,
+            )
+            atomic_write_text(root / TICKET_MIGRATION_FLAG, now_iso())
+        except Exception:
+            pass
 
     if args.no_tmux:
         print(f"Workspace ready at {root} (tmux disabled)")
@@ -3343,7 +3784,7 @@ def cmd_open(args: argparse.Namespace) -> None:
         raise CTeamError("could not find cteam.json in this directory or its parents")
     state = load_state(root)
 
-    create_root_structure(root, state)
+    new_tickets = create_root_structure(root, state)
     if not (root / DIR_PROJECT_BARE).exists() or not (root / DIR_PROJECT_BARE / "HEAD").exists():
         git_init_bare(root / DIR_PROJECT_BARE, branch=state["git"]["default_branch"])
     if not (root / DIR_PROJECT_CHECKOUT).exists():
@@ -3352,6 +3793,27 @@ def cmd_open(args: argparse.Namespace) -> None:
     ensure_agents_created(root, state)
     update_roster(root, state)
     save_state(root, state)
+
+    if new_tickets and not (root / TICKET_MIGRATION_FLAG).exists():
+        try:
+            write_message(
+                root,
+                state,
+                sender="cteam",
+                recipient="pm",
+                subject="Ticket system initialized",
+                body=(
+                    "A ticket database was created automatically (shared/TICKETS.json). "
+                    "Please migrate any outstanding tasks/plan items into tickets and retire duplicate entries in legacy files. "
+                    "Use `cteam tickets` to manage tickets and `cteam assign --ticket ...` for all assignments."
+                ),
+                msg_type="MESSAGE",
+                nudge=True,
+                start_if_needed=True,
+            )
+            atomic_write_text(root / TICKET_MIGRATION_FLAG, now_iso())
+        except Exception:
+            pass
     if not args.no_tmux:
         launch_codex = not args.no_codex and not state["tmux"].get("paused", False)
         ensure_tmux(root, state, launch_codex=launch_codex)
@@ -3508,6 +3970,7 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
         raise CTeamError("could not find cteam.json in this directory or its parents")
     state = load_state(root)
 
+    ensure_shared_scaffold(root, state)
     install_self_into_root(root)
     ensure_agents_created(root, state)
     sync_cteam_into_agents(root, state)
@@ -3524,6 +3987,170 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
         updated.append(a["name"])
 
     print("updated AGENTS.md for agents: " + ", ".join(updated))
+
+
+def _print_ticket_cli(t: Dict[str, Any]) -> str:
+    blocked_on = t.get("blocked_on") or ""
+    status = t.get("status", TICKET_STATUS_OPEN)
+    assignee = t.get("assignee") or "unassigned"
+    bits = [t.get("id", ""), f"[{status}]", f"@{assignee}", "—", t.get("title", "")]
+    if status == TICKET_STATUS_BLOCKED and blocked_on:
+        bits.append(f"(blocked on {blocked_on})")
+    return " ".join(str(b) for b in bits if b != "")
+
+
+def cmd_tickets(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir))
+    if not root:
+        raise CTeamError("could not find cteam.json in this directory or its parents")
+    state = load_state(root)
+
+    cmd = args.ticket_cmd
+    if not cmd:
+        raise CTeamError("tickets: missing subcommand")
+
+    if cmd == "list":
+        store = load_tickets(root, state)
+        tickets = store.get("tickets", [])
+        if args.status:
+            tickets = [t for t in tickets if t.get("status") == args.status]
+        if args.assignee:
+            tickets = [t for t in tickets if (t.get("assignee") or "").lower() == args.assignee.lower()]
+        if args.json:
+            print(json.dumps(tickets, indent=2, sort_keys=True))
+            return
+        if not tickets:
+            print("no tickets match filters")
+            return
+        for t in tickets:
+            print(_print_ticket_cli(t))
+        return
+
+    if cmd == "create":
+        tags = _parse_tags(args.tags)
+        ticket = ticket_create(
+            root,
+            state,
+            title=args.title,
+            description=args.desc,
+            creator=args.creator or "pm",
+            assignee=args.assignee,
+            tags=tags,
+            assign_note=args.assign_note,
+        )
+        print(f"created ticket {ticket['id']} (assignee: {ticket.get('assignee') or 'unassigned'})")
+        return
+
+    if cmd == "assign":
+        ticket = ticket_assign(
+            root,
+            state,
+            ticket_id=args.id,
+            assignee=args.assignee,
+            user=args.user or "pm",
+            note=args.note,
+        )
+        print(f"assigned {ticket['id']} to {ticket.get('assignee') or 'unassigned'}")
+        if args.notify:
+            _notify_ticket_change(
+                root,
+                state,
+                ticket,
+                recipients=[ticket.get("assignee")],
+                subject=f"{ticket['id']} assigned",
+                body=args.note or "New assignment.",
+                nudge=True,
+                start_if_needed=True,
+            )
+        return
+
+    if cmd == "block":
+        ticket = ticket_block(
+            root,
+            state,
+            ticket_id=args.id,
+            user=args.user or "pm",
+            blocked_on=args.on,
+            note=args.note,
+        )
+        print(f"blocked {ticket['id']} on {args.on}")
+        recipients = [ticket.get("assignee"), "pm"]
+        _notify_ticket_change(
+            root,
+            state,
+            ticket,
+            recipients=recipients,
+            subject=f"{ticket['id']} blocked",
+            body=f"Blocked on: {args.on}\nNote: {args.note or ''}",
+            nudge=True,
+            start_if_needed=False,
+        )
+        return
+
+    if cmd == "reopen":
+        ticket = ticket_reopen(
+            root,
+            state,
+            ticket_id=args.id,
+            user=args.user or "pm",
+            note=args.note,
+        )
+        print(f"reopened {ticket['id']}")
+        if ticket.get("assignee"):
+            _notify_ticket_change(
+                root,
+                state,
+                ticket,
+                recipients=[ticket.get("assignee")],
+                subject=f"{ticket['id']} reopened",
+                body=args.note or "Ticket reopened.",
+                nudge=True,
+                start_if_needed=False,
+            )
+        return
+
+    if cmd == "close":
+        ticket = ticket_close(
+            root,
+            state,
+            ticket_id=args.id,
+            user=args.user or "pm",
+            note=args.note,
+        )
+        print(f"closed {ticket['id']}")
+        recipients = [ticket.get("assignee"), "pm"]
+        _notify_ticket_change(
+            root,
+            state,
+            ticket,
+            recipients=recipients,
+            subject=f"{ticket['id']} closed",
+            body=args.note or "Ticket closed.",
+            nudge=False,
+            start_if_needed=False,
+        )
+        return
+
+    if cmd == "show":
+        store = load_tickets(root, state)
+        ticket = _ticket_required(store, args.id)
+        print(_ticket_summary_block(ticket))
+        hist = ticket.get("history") or []
+        if hist:
+            print("")
+            print("History:")
+            for h in hist:
+                h_ts = h.get("ts", "")
+                h_type = h.get("type", "")
+                note = h.get("note", "")
+                from_to = ""
+                if "from" in h or "to" in h:
+                    from_to = f" (from {h.get('from')} to {h.get('to')})"
+                extra = f" blocked_on={h.get('blocked_on')}" if h_type == "blocked" else ""
+                print(f"- {h_ts} {h_type}{from_to}{extra} — {h.get('user','')} {note}")
+        return
+
+    raise CTeamError(f"unknown tickets subcommand: {cmd}")
 
 
 def cmd_msg(args: argparse.Namespace) -> None:
@@ -3549,6 +4176,7 @@ def cmd_msg(args: argparse.Namespace) -> None:
         task=None,
         nudge=not args.no_nudge,
         start_if_needed=args.start_if_needed,
+        ticket_id=getattr(args, "ticket", None),
     )
     if args.start_if_needed:
         ensure_tmux_session(root, state)
@@ -3609,19 +4237,61 @@ def cmd_assign(args: argparse.Namespace) -> None:
     if not body.strip():
         raise CTeamError("assignment body is empty (provide TEXT or --file)")
 
+    sender = args.sender or "pm"
+    ticket: Optional[Dict[str, Any]] = None
+    created = False
+    ticket_id = (args.ticket or "").strip() if hasattr(args, "ticket") else ""
+
+    if ticket_id:
+        store = load_tickets(root, state)
+        ticket = _find_ticket(store, ticket_id)
+        if not ticket:
+            raise CTeamError(f"ticket not found: {ticket_id}")
+    else:
+        if not args.title or not args.desc:
+            raise CTeamError("assignment requires --ticket or --title/--desc to auto-create a ticket")
+        ticket = ticket_create(
+            root,
+            state,
+            title=args.title,
+            description=args.desc,
+            creator=sender,
+            assignee=args.to,
+            tags=_parse_tags(getattr(args, "tags", None)),
+            assign_note=getattr(args, "assign_note", None),
+        )
+        created = True
+        ticket_id = ticket["id"]
+
+    if not created:
+        ticket = ticket_assign(
+            root,
+            state,
+            ticket_id=ticket["id"],
+            assignee=args.to,
+            user=sender,
+            note=getattr(args, "assign_note", None) or args.subject,
+        )
+
+    ticket_id = ticket["id"]
+    summary = _ticket_summary_block(ticket)
+    full_body = f"{summary}\n\n{body.strip()}"
+    subject = args.subject or f"{ticket_id} — {ticket.get('title','')}"
+
     write_message(
         root,
         state,
-        sender=args.sender or "pm",
+        sender=sender,
         recipient=args.to,
-        subject=args.subject or "",
-        body=body,
+        subject=subject,
+        body=full_body,
         msg_type=ASSIGNMENT_TYPE,
         task=args.task,
         nudge=not args.no_nudge,
         start_if_needed=True,
+        ticket_id=ticket_id,
     )
-    print(f"assigned to {args.to}")
+    print(f"assigned {ticket_id} to {args.to}")
 
 
 def cmd_nudge(args: argparse.Namespace) -> None:
@@ -4042,6 +4712,56 @@ def build_parser() -> argparse.ArgumentParser:
     p_update.add_argument("workdir")
     p_update.set_defaults(func=cmd_update_workdir)
 
+    p_tickets = sub.add_parser("tickets", help="Ticket management (list/create/assign/block/reopen/close/show).")
+    p_tickets.add_argument("workdir")
+    tickets_sub = p_tickets.add_subparsers(dest="ticket_cmd")
+
+    p_t_list = tickets_sub.add_parser("list", help="List tickets.")
+    p_t_list.add_argument("--status", choices=[TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED])
+    p_t_list.add_argument("--assignee")
+    p_t_list.add_argument("--json", action="store_true")
+    p_t_list.set_defaults(func=cmd_tickets)
+
+    p_t_show = tickets_sub.add_parser("show", help="Show one ticket with history.")
+    p_t_show.add_argument("--id", required=True)
+    p_t_show.set_defaults(func=cmd_tickets)
+
+    p_t_create = tickets_sub.add_parser("create", help="Create a ticket.")
+    p_t_create.add_argument("--title", required=True)
+    p_t_create.add_argument("--desc", required=True)
+    p_t_create.add_argument("--assignee")
+    p_t_create.add_argument("--creator", help="Ticket creator (default: pm)")
+    p_t_create.add_argument("--tags", help="Comma-separated tags")
+    p_t_create.add_argument("--assign-note", help="Optional note for initial assignment")
+    p_t_create.set_defaults(func=cmd_tickets)
+
+    p_t_assign = tickets_sub.add_parser("assign", help="Assign an existing ticket.")
+    p_t_assign.add_argument("--id", required=True)
+    p_t_assign.add_argument("--assignee", required=True)
+    p_t_assign.add_argument("--user", help="User performing the assignment (default: pm)")
+    p_t_assign.add_argument("--note")
+    p_t_assign.add_argument("--notify", action="store_true", help="Also notify the assignee.")
+    p_t_assign.set_defaults(func=cmd_tickets)
+
+    p_t_block = tickets_sub.add_parser("block", help="Mark a ticket as blocked.")
+    p_t_block.add_argument("--id", required=True)
+    p_t_block.add_argument("--on", required=True, help="Ticket ID or external issue causing the block.")
+    p_t_block.add_argument("--user", help="User performing the change (default: pm)")
+    p_t_block.add_argument("--note")
+    p_t_block.set_defaults(func=cmd_tickets)
+
+    p_t_reopen = tickets_sub.add_parser("reopen", help="Reopen a ticket.")
+    p_t_reopen.add_argument("--id", required=True)
+    p_t_reopen.add_argument("--user", help="User performing the change (default: pm)")
+    p_t_reopen.add_argument("--note")
+    p_t_reopen.set_defaults(func=cmd_tickets)
+
+    p_t_close = tickets_sub.add_parser("close", help="Close a ticket.")
+    p_t_close.add_argument("--id", required=True)
+    p_t_close.add_argument("--user", help="User performing the change (default: pm)")
+    p_t_close.add_argument("--note")
+    p_t_close.set_defaults(func=cmd_tickets)
+
     p_msg = sub.add_parser("msg", help="Send a message to one agent.")
     p_msg.add_argument("workdir")
     p_msg.add_argument("--to", required=True)
@@ -4052,6 +4772,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.add_argument("--start-if-needed", action="store_true",
                        help="If recipient is not running Codex, start it in their tmux window.")
     p_msg.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
+    p_msg.add_argument("--ticket", help="Ticket ID to link this message.")
     p_msg.add_argument("text", nargs="?", default="")
     p_msg.set_defaults(func=cmd_msg)
 
@@ -4073,6 +4794,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_assign.add_argument("--subject")
     p_assign.add_argument("--file")
     p_assign.add_argument("--no-nudge", action="store_true")
+    p_assign.add_argument("--ticket", help="Existing ticket ID; if omitted, requires --title and --desc.")
+    p_assign.add_argument("--title", help="Title when auto-creating a ticket.")
+    p_assign.add_argument("--desc", help="Description when auto-creating a ticket.")
+    p_assign.add_argument("--assign-note", help="Note to record on assignment.")
+    p_assign.add_argument("--tags", help="Comma-separated tags when auto-creating a ticket.")
     p_assign.add_argument("text", nargs="?", default="")
     p_assign.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
     p_assign.set_defaults(func=cmd_assign)

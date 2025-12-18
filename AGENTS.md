@@ -37,6 +37,9 @@
 
 ## Coordination defaults to preserve
 - PM is the coordinator; non-PM agents must wait for explicit `Type: ASSIGNMENT` before coding.
+- All work is tracked in tickets (managed with `cteam tickets ...`; stored in `shared/TICKETS.json`). Assignments must be linked to a ticket (use `cteam assign --ticket ...` or `--title/--desc` to auto-create).
+- Manage tickets only via `cteam tickets ...`; do not edit ticket files by hand.
+- Usage reminder: `cteam tickets <workdir> list` and `cteam assign <workdir> --ticket T001 --to dev1 "body"`.
 - Router tmux window name: `router`; session name: `cteam_<slugified project>`.
 - Mail append-only logs: `shared/MESSAGES.log.md`, `shared/ASSIGNMENTS.log.md`.
 - Branch naming guidance emitted to agents: `agent/<agent>/<topic>`.
@@ -77,7 +80,8 @@ Persistence model:
 - `init`, `import --src <git|dir>`, `resume`, `open`, `attach`, `kill`, `pause`
 
 ### Coordination
-- `msg`, `broadcast`, `assign` (Type=`ASSIGNMENT`), `nudge`, `watch` (router loop)
+- `msg`, `broadcast`, `assign` (Type=`ASSIGNMENT`, ticket-linked), `nudge`, `watch` (router loop)
+- `tickets` (list/show/create/assign/block/reopen/close; authoritative over shared/TICKETS.json; rendered view is maintained automatically)
 - Operator convenience:
   - `msg/assign/nudge` default to following (selecting) the recipient window; add `--no-follow` to stay put.
   - Workspace starters attach to tmux by default; add `--no-attach` to just launch without attaching.
@@ -114,6 +118,9 @@ Persistence model:
   - bump `STATE_VERSION`
   - add upgrade logic
   - ensure `compute_agent_abspaths` (and integration defaults) are applied
+- Ticket system:
+  - Authoritative store: `shared/TICKETS.json`; manage via `cteam tickets ...` (view with `cteam tickets list`).
+  - All assignments should go through tickets (no manual text edits); use `cteam assign` or `cteam tickets ...`.
 - Mind symlink fallbacks: `safe_link_file/dir` replaces links with copies/pointer files if the FS disallows symlinks.
 - When touching tmux/Codex startup, keep PM-led flow intact:
   - `autostart_agent_names`, `start_codex_in_window`, `maybe_start_agent_on_message`
