@@ -144,6 +144,21 @@ class MessagingTests(unittest.TestCase):
         cust_mail = (self.root / cteam.DIR_MAIL / "customer" / "message.md").read_text(encoding="utf-8")
         self.assertIn("We received your message", cust_mail)
 
+    def test_customer_inbound_sends_pm_summary(self) -> None:
+        cteam.write_message(
+            self.root,
+            self.state,
+            sender="customer",
+            recipient="pm",
+            subject="Need help",
+            body="Hello from customer",
+            nudge=False,
+            start_if_needed=False,
+        )
+        pm_mail = (self.root / cteam.DIR_MAIL / "pm" / "message.md").read_text(encoding="utf-8")
+        self.assertIn("Customer message received — review and reply", pm_mail)
+        self.assertIn("Hello from customer", pm_mail)
+
     def test_write_message_nudge_includes_metadata(self) -> None:
         calls = []
 

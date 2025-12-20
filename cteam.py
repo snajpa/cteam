@@ -1681,8 +1681,10 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             ## Role: Project Manager (the coordinator)
             Customer expectation: operate autonomously. Exhaust team options before contacting the customer. Only reach out after several concrete attempts (reading docs/code, small spikes, reproductions) have failed, and bundle any outreach with a concise summary of what was tried and the proposed next move.
 
+            Your primary objective: drive every ticket to completion against the customer-approved acceptance criteria. Acceptance criteria may evolve, but only after explicit approval of the full text of all criteria. Keep criteria visible in tickets and align work/QA to them.
+
             You are responsible for:
-            - clarifying goals and constraints
+            - clarifying goals/constraints and capturing acceptance criteria per ticket
             - producing/maintaining the plan and task breakdown
             - assigning work to other agents and rebalancing load
             - keeping everyone in sync and unblocked
@@ -1695,6 +1697,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             4) Create tickets (`cteam tickets create ...` or `cteam assign --title/--desc`) and assign via `cteam assign --ticket ...`.
 
             Execution cadence:
+            - For every ticket, keep acceptance criteria up to date; seek explicit customer approval for any change in criteria text before proceeding.
             - Keep non-PM agents focused on one assignment at a time; rebalance when capacity or priorities change.
             - Onboard new agents quickly and redistribute work to maintain momentum.
             - Require agents to keep `STATUS.md` current; collect short status updates regularly.
@@ -1709,7 +1712,7 @@ def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
             Delegation and quality:
             - You are the planner/owner, not the implementer; only code as a last resort and keep changes minimal.
             - Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty reduction.
-            - Ensure deliveries match customer intent and quality before sending anything out.
+            - Ensure deliveries match customer intent and the ticket’s acceptance criteria before sending anything out.
             """
         )
     elif role == "architect":
@@ -1788,7 +1791,7 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
             "Then immediately infer what this codebase is for. "
             "Open shared/GOALS.md and fill it with inferred goals, non-goals, and questions. "
             "Then write shared/PLAN.md (high-level only). Track all work in tickets via `cteam tickets ...`. "
-            "Plan discovery work as tickets and assign them to the team to map the imported repo. "
+            "Plan discovery work as tickets and assign them to the team to map the imported repo. Capture acceptance criteria per ticket and get explicit customer approval before changing them. "
             "Assign work with `cteam assign --ticket ...` (auto-create tickets with --title/--desc). "
             "Keep everyone coordinated; do not let others work unassigned. "
             "Start now. "
@@ -1797,7 +1800,8 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
     return (
         "You are the Project Manager. First open message.md for any kickoff notes. "
         "Then read seed/ and write shared/GOALS.md + shared/PLAN.md (high-level only). "
-        "Track work via `cteam tickets ...`. Assign tasks with `cteam assign --ticket ...` "
+        "Track work via `cteam tickets ...`. Assign tasks with `cteam assign --ticket ...`. "
+        "For each ticket, maintain explicit acceptance criteria; seek customer approval before changing them. "
         "or auto-create tickets using --title/--desc. Keep everyone coordinated. Start now. "
         f"{path_hint}"
     )
@@ -2303,6 +2307,31 @@ def write_message(
                 task=None,
                 nudge=False,
                 start_if_needed=False,
+            )
+        except Exception:
+            pass
+        try:
+            snippet = (body or "").strip()
+            if len(snippet) > 1200:
+                snippet = snippet[:1200] + " ..."
+            summary = (
+                f"Customer message at {ts}\n"
+                f"Subject: {subject.strip() or '(no subject)'}\n\n"
+                f"{snippet}\n\n"
+                "Action: reply with specifics; do not re-ask for details already in this chat. "
+                "Search `shared/mail/customer/message.md` or use your terminal editor to confirm prior answers before asking."
+            )
+            write_message(
+                root,
+                state,
+                sender="cteam",
+                recipient="pm",
+                subject="Customer message received — review and reply",
+                body=summary,
+                msg_type="MESSAGE",
+                task=None,
+                nudge=True,
+                start_if_needed=True,
             )
         except Exception:
             pass
@@ -3249,9 +3278,14 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_in = iso_to_unix(str(cust_state.get("last_customer_msg_ts", "")))
             last_out = iso_to_unix(str(cust_state.get("last_pm_reply_ts", "")))
             last_nag = iso_to_unix(str(cust_state.get("last_pm_nag_ts", "")))
+            nag_count = int(cust_state.get("pm_nag_count", 0) or 0)
             if last_in and (not last_out or last_out < last_in):
                 now_ts = time.time()
-                should_nag = not last_nag or last_nag < last_in or (now_ts - last_nag) >= 60
+                should_nag = False
+                if not last_nag or last_nag < last_in:
+                    nag_count = 0
+                if nag_count < 3 and (not last_nag or (now_ts - last_nag) >= 300):
+                    should_nag = True
                 if should_nag:
                     nudge_queue.request("pm", reason="CUSTOMER WAITING — REPLY NOW")
                     customer_nag_pending = True
@@ -3288,6 +3322,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     try:
                         cust_state = customer_state_for_nag or load_customer_state(root)
                         cust_state["last_pm_nag_ts"] = now_iso()
+                        cust_state["pm_nag_count"] = int(cust_state.get("pm_nag_count", 0) or 0) + 1
                         save_customer_state(root, cust_state)
                     except Exception:
                         pass
