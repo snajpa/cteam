@@ -610,5 +610,27 @@ class ParserHelpTests(unittest.TestCase):
         self.assertEqual(cteam._telegram_initial_offset(cfg2), 5)
 
 
+class ArgRewriteTests(unittest.TestCase):
+    def test_rewrite_infers_cwd_when_command_first(self) -> None:
+        out = cteam.rewrite_argv_with_default_workdir(["telegram-enable"])
+        self.assertEqual(out[:2], [".", "telegram-enable"])
+
+    def test_rewrite_keeps_existing_workdir(self) -> None:
+        out = cteam.rewrite_argv_with_default_workdir(["/tmp/ws", "status"])
+        self.assertEqual(out[:2], ["/tmp/ws", "status"])
+
+    def test_rewrite_skips_when_extra_positional_present(self) -> None:
+        out = cteam.rewrite_argv_with_default_workdir(["init", "init"])
+        self.assertEqual(out[:2], ["init", "init"])
+
+    def test_rewrite_allows_flags_only(self) -> None:
+        out = cteam.rewrite_argv_with_default_workdir(["status", "--no-attach"])
+        self.assertEqual(out[:2], [".", "status"])
+
+    def test_rewrite_handles_flag_with_value(self) -> None:
+        out = cteam.rewrite_argv_with_default_workdir(["import", "--src", "/tmp/repo.git"])
+        self.assertEqual(out[:2], [".", "import"])
+
+
 if __name__ == "__main__":
     unittest.main()
