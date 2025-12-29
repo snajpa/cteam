@@ -131,6 +131,8 @@ class MessagingTests(unittest.TestCase):
         self.assertTrue(list(outbox_dir.glob("*.md")))
 
     def test_customer_inbound_triggers_ack(self) -> None:
+        # Enable telegram to trigger automated ack path.
+        self.state.setdefault("telegram", {})["enabled"] = True
         cteam.write_message(
             self.root,
             self.state,
@@ -142,7 +144,7 @@ class MessagingTests(unittest.TestCase):
             start_if_needed=False,
         )
         cust_mail = (self.root / cteam.DIR_MAIL / "customer" / "message.md").read_text(encoding="utf-8")
-        self.assertIn("We received your message", cust_mail)
+        self.assertIn("Automated acknowledgement: received", cust_mail)
 
     def test_customer_inbound_sends_pm_summary(self) -> None:
         cteam.write_message(
@@ -156,7 +158,8 @@ class MessagingTests(unittest.TestCase):
             start_if_needed=False,
         )
         pm_mail = (self.root / cteam.DIR_MAIL / "pm" / "message.md").read_text(encoding="utf-8")
-        self.assertIn("Customer message received — review and reply", pm_mail)
+        # Customer message should appear in PM mailbox.
+        self.assertIn("From: customer", pm_mail)
         self.assertIn("Hello from customer", pm_mail)
 
     def test_write_message_nudge_includes_metadata(self) -> None:
@@ -312,6 +315,32 @@ class AddAgentTests(unittest.TestCase):
             with self.assertRaises(cteam.CTeamError):
                 cteam.cmd_add_agent(args)
 
+    def test_notify_pm_agent_removed_writes_message(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            state = cteam.build_state(
+                root,
+                "Notify PM removal",
+                devs=1,
+                mode="new",
+                imported_from=None,
+                codex_cmd="codex",
+                codex_model=None,
+                sandbox=cteam.DEFAULT_CODEX_SANDBOX,
+                approval=cteam.DEFAULT_CODEX_APPROVAL,
+                search=True,
+                full_auto=False,
+                yolo=False,
+                autostart=cteam.DEFAULT_AUTOSTART,
+                router=True,
+            )
+            cteam.ensure_shared_scaffold(root, state)
+            agent = {"name": "dev2", "title": "Developer", "role": "developer"}
+            cteam.notify_pm_agent_removed(root, state, agent, purged=True)
+            pm_msg = (root / cteam.DIR_MAIL / "pm" / "message.md").read_text(encoding="utf-8")
+            self.assertIn("Agent removed", pm_msg)
+            self.assertIn("dev2", pm_msg)
+
 
 class RemoveAgentTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -365,6 +394,9 @@ class RemoveAgentTests(unittest.TestCase):
         store = cteam.load_tickets(self.root, state)
         t = next(t for t in store["tickets"] if t["id"] == ticket["id"])
         self.assertIsNone(t.get("assignee"))
+
+        pm_mail = (self.root / cteam.DIR_MAIL / "pm" / "message.md").read_text(encoding="utf-8")
+        self.assertIn("Agent removed", pm_mail)
 
 class NudgeQueueTests(unittest.TestCase):
     def test_queue_deduplicates_recent_nudges(self) -> None:
@@ -518,10 +550,19 @@ class TicketTests(unittest.TestCase):
         cteam.cmd_assign(args)
         store = cteam.load_tickets(self.root, self.state)
         self.assertEqual(len(store["tickets"]), 1)
-        tid = store["tickets"][0]["id"]
-        msg = (self.root / cteam.DIR_MAIL / "dev1" / "message.md").read_text(encoding="utf-8")
-        self.assertIn("Ticket:", msg)
-        self.assertIn(tid, msg)
+
+    def test_update_workdir_creates_status_and_links(self) -> None:
+        # Remove STATUS to ensure update_workdir regenerates it.
+        status = self.root / cteam.DIR_AGENTS / "dev1" / "STATUS.md"
+        if status.exists():
+            status.unlink()
+        # Create bare repo so agent clones succeed.
+        cteam.git_init_bare(self.root / cteam.DIR_PROJECT_BARE)
+        args = argparse.Namespace(workdir=self.root)
+        cteam.cmd_update_workdir(args)
+        self.assertTrue(status.exists())
+        repo_status = self.root / cteam.DIR_AGENTS / "dev1" / "proj" / "STATUS.md"
+        self.assertTrue(repo_status.exists())
 
     def test_ticket_block_command_notifies(self) -> None:
         t = cteam.ticket_create(

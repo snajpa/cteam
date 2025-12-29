@@ -52,10 +52,13 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import fcntl
 import json
 import os
 import re
+import secrets
+import string
 import shlex
 import shutil
 import subprocess
@@ -77,7 +80,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 # -----------------------------
 
 STATE_FILENAME = "cteam.json"
-STATE_VERSION = 7
+STATE_VERSION = 11
 
 DIR_PROJECT_BARE = "project.git"
 DIR_PROJECT_CHECKOUT = "project"
@@ -106,9 +109,18 @@ DEFAULT_AUTOSTART = "all"  # pm | pm+architect | all
 
 TELEGRAM_CONFIG_REL = f"{DIR_RUNTIME}/telegram.json"
 TELEGRAM_MAX_MESSAGE = 3900  # Telegram hard limit is 4096; keep margin.
+# Runtime / UX extras
+DASHBOARD_JSON_REL = f"{DIR_RUNTIME}/dashboard.json"
+STATUS_BOARD_MD_REL = f"{DIR_SHARED}/STATUS_BOARD.md"
+BRIEF_MD_REL = f"{DIR_SHARED}/BRIEF.md"
+CUSTOMER_BURST_BUFFER_REL = f"{DIR_RUNTIME}/customer_burst_buffer.md"
+SPAWN_REQUESTS_REL = f"{DIR_RUNTIME}/spawn_requests.json"
+
 
 # For robust "assignment" detection
 ASSIGNMENT_TYPE = "ASSIGNMENT"
+
+AGENT_ROLES = ["project_manager", "developer", "tester", "researcher", "architect"]
 
 TICKET_STATUS_OPEN = "open"
 TICKET_STATUS_BLOCKED = "blocked"
@@ -118,6 +130,8 @@ TICKET_STATUSES = {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOS
 TICKET_MIGRATION_FLAG = f"{DIR_RUNTIME}/tickets_migration_notified"
 
 _nudge_history: Dict[str, Tuple[float, Set[str]]] = {}
+_router_noise_until: Dict[str, float] = {}
+_router_noise_until: Dict[str, float] = {}
 
 class CTeamError(RuntimeError):
     pass
@@ -1320,8 +1334,24 @@ def build_state(
             "start_agents_on_assignment": True,
             "assignment_type": ASSIGNMENT_TYPE,
             "assignment_from": ["pm", "cteam"],   # who can "start" an agent by messaging them
-        },
-        "tmux": {
+    "stage": "discovery",
+    "auto_dispatch": False,
+},
+"supervision": {
+    "customer_burst_seconds": 20,
+    "customer_ack_cooldown_seconds": 25,
+    "agent_idle_seconds": 120,
+    "agent_stalled_nudge_seconds": 300,
+    "agent_unassigned_nudge_seconds": 600,
+    "pm_digest_interval_seconds": 600,
+    "dashboard_write_seconds": 10,
+    "agent_resume_seconds": 180,
+    "agent_resume_cooldown_seconds": 180,
+    "agent_resume_max_prompts": 2,
+    "mailbox_nudge_cooldown_seconds": 90,
+    "assigned_ticket_reminder_seconds": 60,
+},
+"tmux": {
             "session": session,
             "router": bool(router),
             "paused": False,
@@ -1436,6 +1466,49 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
             tickets_cfg.pop("md_rel", None)
             state["tickets"] = tickets_cfg
 
+    # --- v < 8 upgrades (supervision / stage / auto-dispatch) ---
+    if v < 8:
+        coord = state.get("coordination") or {}
+        if not isinstance(coord, dict):
+            coord = {}
+        coord.setdefault("stage", "discovery")
+        coord.setdefault("auto_dispatch", False)
+        state["coordination"] = coord
+
+        sup = state.get("supervision") or {}
+        if not isinstance(sup, dict):
+            sup = {}
+        sup.setdefault("customer_burst_seconds", 20)
+        sup.setdefault("customer_ack_cooldown_seconds", 25)
+        sup.setdefault("agent_idle_seconds", 120)
+        sup.setdefault("agent_stalled_nudge_seconds", 300)
+        sup.setdefault("agent_unassigned_nudge_seconds", 600)
+        sup.setdefault("pm_digest_interval_seconds", 600)
+        sup.setdefault("dashboard_write_seconds", 10)
+        sup.setdefault("agent_resume_seconds", 180)
+        sup.setdefault("agent_resume_cooldown_seconds", 180)
+        sup.setdefault("agent_resume_max_prompts", 2)
+        sup.setdefault("mailbox_nudge_cooldown_seconds", 90)
+        sup.setdefault("assigned_ticket_reminder_seconds", 60)
+        state["supervision"] = sup
+    # --- v < 9 upgrades (agent resume cadence) ---
+    if v < 9:
+        sup = state.get("supervision") or {}
+        if not isinstance(sup, dict):
+            sup = {}
+        sup.setdefault("agent_resume_seconds", 180)
+        sup.setdefault("agent_resume_cooldown_seconds", 180)
+        sup.setdefault("agent_resume_max_prompts", 2)
+        sup.setdefault("mailbox_nudge_cooldown_seconds", 90)
+        state["supervision"] = sup
+    # --- v < 11 upgrades (tighter reminder cadence) ---
+    if v < 11:
+        sup = state.get("supervision") or {}
+        if not isinstance(sup, dict):
+            sup = {}
+        sup["assigned_ticket_reminder_seconds"] = float(sup.get("assigned_ticket_reminder_seconds", 60) or 60)
+        state["supervision"] = sup
+
     state["version"] = STATE_VERSION
     compute_agent_abspaths(state)
     save_state(root, state)
@@ -1500,28 +1573,123 @@ def render_seed_extras_readme() -> str:
 def render_protocol_md() -> str:
     return textwrap.dedent(
         f"""\
-        # Coordination protocol (PM-led)
+        # Coordination protocol (PM-led, router-supervised)
 
-        This workspace uses a PM-led protocol to avoid "everyone doing random work".
+        This workspace runs a **PM-led** process with a lightweight **router/supervisor** (the `cteam watch` loop).
+        The router exists because each model is effectively single-threaded: it prevents silent idling, batches bursty
+        customer IM, and keeps a live status board.
 
-        ## Rules
-        1) The **PM** owns coordination: goals, plan, tasks, sequencing, and merges.
-        2) Non-PM agents **must not** start implementing work without an explicit message of:
-           - `Type: {ASSIGNMENT_TYPE}`
-        3) Default behavior for non-PM agents when unassigned:
-           - do a quick scan if helpful
-           - send a short note to the PM
-           - then wait
-        4) Agents communicate via mailboxes in `shared/mail/<agent>/`.
+        ## Shared memory and ground truth
+        - `shared/BRIEF.md` is the **living memory**. Keep it current.
+        - `shared/GOALS.md` lists goals and success criteria.
+        - `shared/PLAN.md` holds the current plan and milestones.
+        - `shared/DECISIONS.md` records decisions and rationale.
+        - `shared/TICKETS.json` is the work queue.
+        - `shared/STATUS_BOARD.md` is generated by the router (do not edit).
 
-        ## How to assign work
-        - Human or PM should use:
-          - `python3 cteam.py <workdir> assign --to dev1 --task T001 --subject "..." "instructions..."`
+        ## Stages
+        The team works in explicit stages (stored in `cteam.json` under `coordination.stage`):
+        1) **discovery**: clarify the job, constraints, and acceptance criteria; produce an initial plan.
+        2) **planning**: break work into tickets with clear scope, dependencies, and test strategy.
+        3) **execution**: implement tickets, review/merge, and iterate.
 
-        ## Router
-        - A tmux window named `{ROUTER_WINDOW}` runs `cteam <workdir> watch`:
-          - nudges agents when mail arrives
-          - can auto-start Codex in an agent window when an assignment arrives
+        The router can auto-dispatch work **only** in `execution`.
+
+        ## Ticket protocol
+        Tickets live in `shared/TICKETS.json` and have a `status`:
+        - `open`: ready to be assigned or in progress
+        - `blocked`: cannot proceed (must specify why)
+        - `closed`: done
+
+        **READY tickets**:
+        - A ticket is considered **ready** if it is `open`, unassigned, and tagged with `ready` (or `auto`).
+        - If `coordination.auto_dispatch=true` and stage is `execution`, the router may **auto-assign** ready tickets to idle agents.
+
+        PM responsibilities for tickets:
+        - Keep ticket descriptions concrete (what to change, where, how to test).
+        - Mark tickets `ready` only when requirements are known enough that an engineer can execute without re-asking.
+        - Keep dependencies explicit (`depends_on`), and close tickets promptly when done.
+        - Actively manage load: ensure each active ticket has an assignee, ETA, and next step; reassign or split work when agents are idle/stalled.
+
+        ## Messaging protocol
+        Agents communicate via mailbox files in `shared/mail/<agent>/...`.
+
+        - PM assigns work by sending messages with:
+          - `Type: {ASSIGNMENT_TYPE}`
+          - `Ticket: Txxx` (whenever applicable)
+        - Non-PM agents **must not** start implementation without an assignment.
+
+        If you are unassigned:
+        - Check `shared/STATUS_BOARD.md`, `shared/BRIEF.md`, and the ticket queue.
+        - Propose 1–3 next tickets or improvements to PM (short + actionable).
+        - Do not idle silently.
+
+        ## Status protocol (prevents idling)
+        Every agent maintains an `agents/<name>/STATUS.md` file:
+        - Current ticket / task
+        - Last action taken
+        - Next step (one concrete thing)
+        - Blockers (if any)
+
+        The router nudges:
+        - Assigned agents who appear stalled
+        - Unassigned agents who are idle
+        - PM when the whole team is idle
+
+        **Important (Codex is single-shot):** models only act when prompted. The router will automatically re-prompt assigned agents who go quiet so they resume work and send status back to PM. Expect explicit updates; do not assume silent background progress.
+
+        ## Customer IM batching + commands
+        Customer messages may arrive bursty (message-per-thought). The router batches them and sends PM a digest after a short quiet window.
+
+        Customer can use:
+        - `/tickets`
+        - `/ticket T001`
+        - `/status`
+        - `/tail <agent> [N]`
+        - `/approve <TOKEN>` / `/deny <TOKEN>` (for spawning new agents)
+
+        ## Spawning new agents
+        The PM may request new agents, but the **customer must explicitly approve**.
+        Use: `cteam request-agent --role developer --reason "..."`
+        The customer approves in IM with `/approve <TOKEN>`.
+
+        """
+    )
+
+
+def render_brief_template(project_name: str) -> str:
+    return textwrap.dedent(
+        f"""\
+        # Project brief (living memory)
+
+        This file is the **shared short-term memory** for the whole team.
+        Keep it current. If you learn something important from the customer, capture it here.
+
+        ## One-sentence goal
+        - TODO
+
+        ## User / customer
+        - TODO (who are we building for? what do they care about?)
+
+        ## Non-goals
+        - TODO
+
+        ## Constraints
+        - TODO (languages, platforms, deadlines, performance, security, licensing, etc.)
+
+        ## Environment
+        - Repo: {project_name}
+        - How to run: TODO
+        - How to test: TODO
+
+        ## Definition of done
+        - TODO (what must be true for the customer to accept the work?)
+
+        ## Open questions
+        - TODO
+
+        ## Prior answers from the customer
+        - TODO (add bullets with dates / links to messages when possible)
         """
     )
 
@@ -1687,192 +1855,83 @@ def render_agent_status_template(agent: Dict[str, Any]) -> str:
     )
 
 
-def render_agent_agents_md(state: Dict[str, Any], agent: Dict[str, Any]) -> str:
-    role = agent["role"]
-    mode = state.get("mode", "new")
-    agent_cteam_rel = Path("..") / ".." / "cteam.py"
-    repo_cteam_rel = Path("cteam.py")
+def render_agent_agents_md(agent_or_state: Dict[str, Any], agent: Optional[Dict[str, Any]] = None) -> str:
+    # Accepts either (agent) or (state, agent) for convenience/backcompat.
+    if agent is None:
+        agent = agent_or_state
+    header = f"""# Agent: {agent['name']}
+Role: {agent['role']}
+Title: {agent.get('title','')}
+"""
 
-    common = textwrap.dedent(
-        f"""\
-        # AGENTS.md — {agent['name']} ({agent['title']})
+    block = f"""## Your mission
+You are part of a multi-agent developer team. The PM coordinates. You execute assigned work efficiently and keep the team unblocked.
 
-        You are a Codex agent in a multi-agent team managed by **Clanker Team (cteam)**.
+This repo is structured for **models**:
+- Shared memory is in `shared/`
+- Your private workspace is `agents/{agent['name']}/`
+- Messages arrive in `shared/mail/{agent['name']}/inbox/` and `shared/mail/{agent['name']}/message.md`
 
-        Project: **{state['project_name']}**
-        Mode: `{mode}`
-        Your identity/persona: {agent.get('persona','')}
+## Start here (always)
+1) Read `shared/PROTOCOL.md`
+2) Read `shared/BRIEF.md` (this is the living memory / current truth)
+3) Check your inbox for the latest assignment
 
-        ## Evolving this file
-        You may update **this AGENTS.md** as you learn better ways to work (tools, conventions, shortcuts),
-        *as long as* you keep the PM-led coordination rules intact.
+## Rules of engagement
+- **Do not start implementation** unless you have an assignment (`Type: {ASSIGNMENT_TYPE}`) or a clear PM directive.
+- If you think the customer already answered something, **verify**:
+  - search `shared/MESSAGES.log.md` and `shared/mail/customer/message.md`
+  - check `shared/BRIEF.md`
+- When unsure, ask **one compact message** to PM with:
+  - what you tried
+  - what you found
+  - the single question you need answered
 
-        ## Coordination (IMPORTANT)
-        This project uses a **PM-led** protocol. Unless you are the PM:
+## Work loop (when assigned a ticket)
+1) Acknowledge quickly to PM: what you will do next.
+2) Create a branch in your repo clone: `agents/{agent['name']}/proj`
+3) Implement the change.
+4) Run tests / reproduce bug fix.
+5) Update your `agents/{agent['name']}/STATUS.md`:
+   - ticket id
+   - last action
+   - next step
+   - blockers (if any)
+6) Report back to PM with:
+   - what changed (files/areas)
+   - commands you ran
+   - results (tests, repro, benchmarks)
+   - follow-ups / risks
 
-        - Do NOT start implementing random work.
-        - Wait for a message with:
-          - `Type: {ASSIGNMENT_TYPE}`
-        - If unassigned, you may do *lightweight reconnaissance* and send a short note to PM,
-          but avoid code changes/commits.
-        - All work is tracked in tickets (managed via `cteam tickets ...`). Only work on tickets assigned to you. Reference ticket IDs in STATUS updates and commits. Do not edit ticket files directly—use `cteam tickets ...` and `cteam assign`.
+## If you are blocked
+- Mark the ticket `blocked` (include the reason).
+- Message PM with the exact blocker and at least one proposed option.
 
-        ## Where to work
-        - Your repo clone: `proj/` (work here)
-        - Your inbox: `message.md` (check frequently)
-        - Update: `STATUS.md`
-        - Shared drive (non-repo artifacts): `shared-drive/` (links to shared/drive)
+## If you are unassigned / idle
+- Check `shared/STATUS_BOARD.md` (or `cteam dashboard`) for what is idle/unassigned.
+- Skim open tickets in `shared/TICKETS.json`.
+- Propose 1–3 concrete next tickets to PM (small, testable units).
+- Do **not** idle silently.
 
-        Shared coordination:
-        - `shared/GOALS.md`, `shared/PLAN.md` (high-level), tickets via `cteam tickets ...`, `shared/DECISIONS.md`
-        - `shared/TEAM_ROSTER.md` (who is on the team)
-        - `shared/drive/` for large/binary assets; keep code/config in git.
+## Useful commands
+- Send a message: `cteam msg <sender> <recipient> --subject "..." --body "..." [--type MESSAGE|ASSIGNMENT] [--ticket T001]`
+- Show live board: `cteam dashboard`
+- Capture tmux output: `cteam capture <agent> --lines 200 --to pm`
+- Ticket summary: `cteam tickets list`
 
-        ## Tooling
-        - cteam CLI from your agent dir: `python3 {agent_cteam_rel} ...`
-        - From your repo clone `proj/`: `python3 {repo_cteam_rel} ...`
+## Router supervision nudges
+The router may nudge you when:
+- you are idle without a ticket
+- you are stalled on an assigned ticket
 
-        ## Team roles (who does what)
-        - Project Manager (PM): owns scope/priorities and customer comms; plans work and delegates; avoids doing implementation unless absolutely necessary.
-        - Architect: owns technical direction/design; records decisions; partners with PM on scope/impact.
-        - Developers: implement assigned tasks; keep changes small/mergeable; do not self-assign from customer asks.
-        - Tester/QA: owns verification; adds/executes tests; never offload testing to the customer.
-        - Researcher: reduces uncertainty with actionable notes; no direct customer asks.
-        - Customer: provides inputs/feedback only through PM; never asked to do engineering.
+When nudged, immediately:
+1) update `STATUS.md`
+2) continue work or report the blocker to PM
 
-        ## Background runs / long tasks
-        - If you start a long-running or background command, record it in `STATUS.md` with owner, command, working dir, start time, expected finish, and purpose.
-        - Tell PM when it starts/finishes; if it stalls, update PM/STATUS.
+"""
 
-        ## Messaging
-        Preferred: use cteam CLI so delivery+nudge is reliable:
+    return header + "\n" + block.strip() + "\n"
 
-        - Send message:
-          - `python3 cteam.py $CTEAM_ROOT msg --to pm --subject "..." "text..."`
-        - Interactive chat:
-          - `python3 cteam.py $CTEAM_ROOT chat --to pm`
-        - Assignments (PM/human):
-          - `python3 cteam.py $CTEAM_ROOT assign --to dev1 --task T001 --subject "..." "instructions"`
-
-        If you must write manually, append to:
-        - `shared/mail/<agent>/message.md`
-
-        ## Git rules
-        - Branch naming: `agent/{agent['name']}/<topic>`
-        - Push early, push often; pull/rebase frequently to avoid conflicts.
-        - Avoid rewriting shared history.
-        - Keep large binaries out of git; put them in `shared/drive/` and reference them in notes/PRs.
-
-        ## Role clarity
-        - The customer never performs engineering tasks; they provide inputs, feedback, and clarifications.
-        - Respect your lane: do your role’s work well; do not offload your duties to the customer.
-        """
-    )
-
-    if role == "project_manager":
-        block = textwrap.dedent(
-            f"""\
-            ## Role: Project Manager (the coordinator)
-            Customer expectation: operate autonomously. Exhaust team options before contacting the customer. Only reach out after several concrete attempts (reading docs/code, small spikes, reproductions) have failed, and bundle any outreach with a concise summary of what was tried and the proposed next move.
-
-            Your primary objective: drive every ticket to completion against the customer-approved acceptance criteria. Acceptance criteria may evolve, but only after explicit approval of the full text of all criteria. Keep criteria visible in tickets and align work/QA to them.
-
-            You are responsible for:
-            - clarifying goals/constraints and capturing acceptance criteria per ticket
-            - producing/maintaining the plan and task breakdown
-            - assigning work to other agents and rebalancing load
-            - keeping everyone in sync and unblocked
-            - ensuring the project completes with quality and customer intent intact
-
-            Startup checklist:
-            1) Read seed/ (if any) and repo README/docs.
-            2) Capture assumptions + open questions in `shared/GOALS.md`.
-            3) Draft `shared/PLAN.md` (goals/milestones only) and create tickets for all work.
-            4) Create tickets (`cteam tickets create ...` or `cteam assign --title/--desc`) and assign via `cteam assign --ticket ...`.
-
-            Execution cadence:
-            - For every ticket, keep acceptance criteria up to date; seek explicit customer approval for any change in criteria text before proceeding.
-            - Keep non-PM agents focused on one assignment at a time; rebalance when capacity or priorities change.
-            - Onboard new agents quickly and redistribute work to maintain momentum.
-            - Require agents to keep `STATUS.md` current; collect short status updates regularly.
-            - Track long-running/background work; note owner/command/timing in STATUS and nudge until complete or fixed.
-            - If you must stop an agent’s input urgently, use `cteam nudge . --to <agent> --reason "..." --interrupt` (sends Escape first); follow with clear instructions.
-
-            Customer channel policy:
-            - Reply promptly when reading a customer message with at least an acknowledgement (e.g., “Received; filed Txxx, will report back”).
-            - Minimize new asks; only ask questions after multiple self-serve attempts fail. When you do ask, include what was attempted and the proposed path forward.
-            - Keep tickets as the single source of truth; migrate any stray PLAN/TASKS checklists into tickets and close duplicates there.
-
-            Delegation and quality:
-            - You are the planner/owner, not the implementer; only code as a last resort and keep changes minimal.
-            - Lean on architect for design, developers for execution, tester for verification, researcher for uncertainty reduction.
-            - Ensure deliveries match customer intent and the ticket’s acceptance criteria before sending anything out.
-            """
-        )
-    elif role == "architect":
-        block = textwrap.dedent(
-            """\
-            ## Role: Architect
-            - Produce/maintain architecture docs.
-            - Record major decisions in shared/DECISIONS.md.
-            - Coordinate with PM before making broad changes.
-            - Keep the customer out of engineering tasks; they provide context/feedback only via PM.
-            - Work only on tickets assigned to you; propose/shape tickets with PM for new design work.
-
-            Default behavior if unassigned:
-            - create a short "architecture map" note for PM
-            - propose 1-3 concrete tasks
-            - then wait
-            """
-        )
-    elif role == "developer":
-        block = textwrap.dedent(
-            """\
-            ## Role: Developer
-            - Implement assigned tasks.
-            - Keep changes small and mergeable.
-            - Write tests when feasible.
-            - Do not ask the customer to do engineering work; request clarifications via PM.
-            - Work only on tickets assigned to you; include ticket IDs in commits/STATUS updates.
-
-            Default behavior if unassigned:
-            - scan repo quickly, propose a ticket to PM
-            - do NOT start coding without assignment
-            """
-        )
-    elif role == "tester":
-        block = textwrap.dedent(
-            """\
-            ## Role: Tester / QA
-            - Establish how to run tests.
-            - Add smoke tests and regression tests.
-            - Verify fixes.
-            - You own quality; never push testing effort onto the customer.
-            - Work only on tickets assigned to you; reference ticket IDs in STATUS updates and test notes.
-
-            Default behavior if unassigned:
-            - find how to run the project/tests, write a short note to PM
-            - do NOT change code without assignment
-            """
-        )
-    elif role == "researcher":
-        block = textwrap.dedent(
-            """\
-            ## Role: Researcher
-            - Inventory dependencies and risks.
-            - Provide actionable notes to PM/Architect.
-            - Use seed-extras and (optional) web search.
-            - Do not ask the customer to do research; route questions through PM.
-
-            Default behavior if unassigned:
-            - write a dependency inventory note and send it to PM
-            - then wait
-            """
-        )
-    else:
-        block = ""
-
-    return common + "\n" + block
 
 
 def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
@@ -1957,6 +2016,8 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> bool:
         "README.md": render_shared_readme(state),
         "TEAM_ROSTER.md": render_team_roster(state),
         "PROTOCOL.md": render_protocol_md(),
+        "BRIEF.md": render_brief_template(state["project_name"]),
+        "STATUS_BOARD.md": "# Status board (generated by cteam)\n\n",
         "GOALS.md": render_goals_template(state["project_name"]),
         "PLAN.md": render_plan_template(),
         "TASKS.md": render_tasks_template(),
@@ -2166,8 +2227,10 @@ def _kill_agent_window_if_present(state: Dict[str, Any], agent_name: str) -> Non
     if not session or not tmux_has_session(session):
         return
     try:
-        if agent_name in set(tmux_list_windows(session)):
-            tmux(["kill-window", "-t", f"{session}:{agent_name}"], capture=True)
+        wins = set(tmux_list_windows(session))
+        targets = [w for w in wins if w == agent_name or w.startswith(f"{agent_name}-")]
+        for w in targets:
+            tmux(["kill-window", "-t", f"{session}:{w}"], capture=True, check=False)
     except Exception:
         pass
 
@@ -2301,7 +2364,7 @@ def _normalize_reasons(reasons: Set[str]) -> Set[str]:
 
 
 def _mailbox_nudge_reason(ticket_id: Optional[str], msg_type: Optional[str]) -> str:
-    reason = "MAILBOX UPDATED"
+    reason = "ACT NOW — MAILBOX UPDATED"
     if ticket_id:
         reason = f"{ticket_id} {reason}"
     if msg_type:
@@ -2383,52 +2446,51 @@ def write_message(
     if sender == "customer" and recipient == "pm":
         cust_state = load_customer_state(root)
         cust_state["last_customer_msg_ts"] = ts
+
+        # Burst buffering: customers often send message-per-thought. Buffer entries so the router can
+        # send one digest after a short quiet window, instead of spamming the PM.
+        try:
+            buf_path = (root / CUSTOMER_BURST_BUFFER_REL).resolve()
+            mkdirp(buf_path.parent)
+            append_text(buf_path, entry)
+            cust_state["burst_pending"] = True
+            cust_state["burst_last_ts"] = ts
+            cust_state["burst_count"] = int(cust_state.get("burst_count", 0) or 0) + 1
+            if not cust_state.get("burst_start_ts"):
+                cust_state["burst_start_ts"] = ts
+        except Exception:
+            pass
+
+        # Throttled automated acknowledgement to the customer (useful for IM).
+        if (state.get("telegram") or {}).get("enabled", False):
+            try:
+                sup = state.get("supervision") or {}
+                cooldown = int(sup.get("customer_ack_cooldown_seconds", 25) or 25)
+                last_ack = iso_to_unix(str(cust_state.get("last_customer_ack_ts", "")))
+                if not last_ack or (time.time() - last_ack) >= cooldown:
+                    ack_body = (
+                        "Automated acknowledgement: received. "
+                        "You can keep sending details; rapid messages will be batched. "
+                        "The PM will reply here when available."
+                    )
+                    write_message(
+                        root,
+                        state,
+                        sender="cteam",
+                        recipient="customer",
+                        subject="Received — PM notified",
+                        body=ack_body,
+                        msg_type="MESSAGE",
+                        task=None,
+                        nudge=False,
+                        start_if_needed=False,
+                    )
+                    cust_state["last_customer_ack_ts"] = ts
+            except Exception:
+                pass
+
         save_customer_state(root, cust_state)
-        ack_body = (
-            "Automated acknowledgement: we received your message and notified the PM. "
-            "They will reply in this chat promptly. If action is needed, the PM will file the task "
-            "and share status/results here."
-        )
-        try:
-            write_message(
-                root,
-                state,
-                sender="cteam",
-                recipient="customer",
-                subject="We received your message — PM notified",
-                body=ack_body,
-                msg_type="MESSAGE",
-                task=None,
-                nudge=False,
-                start_if_needed=False,
-            )
-        except Exception:
-            pass
-        try:
-            snippet = (body or "").strip()
-            if len(snippet) > 1200:
-                snippet = snippet[:1200] + " ..."
-            summary = (
-                f"Customer message at {ts}\n"
-                f"Subject: {subject.strip() or '(no subject)'}\n\n"
-                f"{snippet}\n\n"
-                "Action: reply with specifics; do not re-ask for details already in this chat. "
-                "Search `shared/mail/customer/message.md` or use your terminal editor to confirm prior answers before asking."
-            )
-            write_message(
-                root,
-                state,
-                sender="cteam",
-                recipient="pm",
-                subject="Customer message received — review and reply",
-                body=summary,
-                msg_type="MESSAGE",
-                task=None,
-                nudge=True,
-                start_if_needed=True,
-            )
-        except Exception:
-            pass
+
         # For imported workspaces, treat this as the signal that the customer
         # is ready for the team to start working autonomously.
         try:
@@ -2616,6 +2678,8 @@ def nudge_agent(
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
         return False
+    # Ignore tmux pane noise we inject ourselves when calculating idleness.
+    _router_noise_until[agent_name] = time.time() + 5.0
     try:
         if agent_name not in set(tmux_list_windows(session)):
             ensure_agent_windows(root, state, launch_codex=True)
@@ -2623,12 +2687,24 @@ def nudge_agent(
         pass
 
     extra = ""
-    if agent_name == "pm" and "IDLE" in reason.upper():
-        extra = " Check who should be working, unblock them, and assign next steps. Confirm any background tasks are still running."
+    if agent_name == "pm":
+        extra = (
+            " PM checklist: "
+            "1) Read/reply to new mail. "
+            "2) Check STATUS.md for every agent; chase missing updates. "
+            "3) Triage tickets: ensure each has assignee+ETA+next step; reassign or split if idle/stalled. "
+            "4) Unblock: resolve dependencies, answer questions, or set customer asks. "
+            "5) Merge/close duplicate work: dedup tickets/assignments and align owners. "
+            "6) Drive your own PM tickets (plan/brief/status/comm updates) to done. "
+            "7) Refresh plan/BRIEF/STATUS_BOARD if scope/timelines changed and tell the team/customer."
+        )
     if interrupt:
-        msg = f"INTERRUPT — {reason}: open message.md now and check if you replied to everything. Update STATUS.md after acting. {extra}"
+        msg = f"INTERRUPT — {reason}: open message.md, do the next concrete action, reply to PM if needed, then update STATUS.md. {extra}"
     else:
-        msg = f"{reason}: open message.md and act. Respect the historical context of the conversation and also check if you replied to everything. Read and update STATUS.md. Make sure progress is being made. If you need anything from me, the customer, you can only reach me via the customer-pm chat, not here. {extra}"
+        msg = (
+            f"{reason}: open message.md now. Do the next concrete task, send PM a short status (result + next step + ETA), "
+            f"and update STATUS.md. {extra}"
+        )
     try:
         if interrupt:
             try:
@@ -3237,11 +3313,376 @@ def parse_sender_and_type_from_message(text: str) -> Tuple[Optional[str], Option
     return sender, msg_type
 
 
+
+# -----------------------------
+# Router helpers (dashboard, spawn approvals, IM commands)
+
+@contextmanager
+def file_lock(lock_path: Path):
+    """Exclusive lock using a lock file."""
+    mkdirp(lock_path.parent)
+    f = lock_path.open("a+")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        f.close()
+
+
+def dashboard_json_path(root: Path) -> Path:
+    return (root / DASHBOARD_JSON_REL).resolve()
+
+
+def status_board_path(root: Path) -> Path:
+    return (root / STATUS_BOARD_MD_REL).resolve()
+
+
+def customer_burst_buffer_path(root: Path) -> Path:
+    return (root / CUSTOMER_BURST_BUFFER_REL).resolve()
+
+
+def spawn_requests_path(root: Path) -> Path:
+    return (root / SPAWN_REQUESTS_REL).resolve()
+
+
+def _spawn_store_default() -> Dict[str, Any]:
+    return {"meta": {"next": 1}, "requests": []}
+
+
+@contextmanager
+def spawn_lock(root: Path):
+    lock_path = spawn_requests_path(root).with_suffix(".lock")
+    with file_lock(lock_path):
+        yield
+
+
+def load_spawn_requests(root: Path) -> Dict[str, Any]:
+    p = spawn_requests_path(root)
+    if not p.exists():
+        return _spawn_store_default()
+    try:
+        raw = p.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("meta", {"next": 1})
+    data.setdefault("requests", [])
+    return data
+
+
+def save_spawn_requests(root: Path, store: Dict[str, Any]) -> None:
+    p = spawn_requests_path(root)
+    mkdirp(p.parent)
+    atomic_write_text(p, json.dumps(store, indent=2, sort_keys=True) + "\n")
+
+
+def _new_approval_token(n: int = 8) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(max(6, int(n))))
+
+
+def create_spawn_request(
+    root: Path,
+    *,
+    requested_by: str,
+    role: str,
+    name: Optional[str],
+    title: Optional[str],
+    persona: Optional[str],
+    start_codex: bool,
+    reason: str,
+) -> Dict[str, Any]:
+    ts = now_iso()
+    with spawn_lock(root):
+        store = load_spawn_requests(root)
+        nxt = int((store.get("meta") or {}).get("next", 1) or 1)
+        rid = f"S{nxt:03d}"
+        (store.setdefault("meta", {}))["next"] = nxt + 1
+        req = {
+            "id": rid,
+            "token": _new_approval_token(),
+            "created_at": ts,
+            "requested_by": requested_by,
+            "status": "pending",  # pending|approved|denied|fulfilled
+            "role": role,
+            "name": name,
+            "title": title,
+            "persona": persona,
+            "start_codex": bool(start_codex),
+            "reason": reason,
+        }
+        store.setdefault("requests", []).append(req)
+        save_spawn_requests(root, store)
+        return req
+
+
+def find_spawn_request_by_token(store: Dict[str, Any], token: str) -> Optional[Dict[str, Any]]:
+    token = (token or "").strip().upper()
+    for r in (store.get("requests") or []):
+        if str(r.get("token", "")).strip().upper() == token:
+            return r
+    return None
+
+
+def tmux_capture_tail(session: str, window: str, *, lines: int = 200) -> str:
+    try:
+        n = max(1, int(lines))
+    except Exception:
+        n = 200
+    try:
+        cp = tmux(
+            ["capture-pane", "-p", "-t", f"{session}:{window}", "-J", "-S", str(-n)],
+            capture=True,
+            check=False,
+        )
+        return (cp.stdout or "")
+    except Exception:
+        return ""
+
+
+def _human_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    try:
+        s = int(max(0, seconds))
+    except Exception:
+        return "-"
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    if m:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
+
+
+def _ticket_priority_value(t: Dict[str, Any]) -> int:
+    p = str(t.get("priority") or "").strip().upper()
+    if p.startswith("P") and p[1:].isdigit():
+        return int(p[1:])
+    return 9
+
+
+def ticket_is_ready(store: Dict[str, Any], t: Dict[str, Any]) -> bool:
+    if (t.get("status") or TICKET_STATUS_OPEN) != TICKET_STATUS_OPEN:
+        return False
+    if t.get("assignee"):
+        return False
+    tags = set((t.get("tags") or []) if isinstance(t.get("tags"), list) else [])
+    ready_flag = bool(t.get("ready", False)) or ("ready" in tags) or ("auto" in tags)
+    if not ready_flag:
+        return False
+    deps = t.get("depends_on") or t.get("dependencies") or []
+    if isinstance(deps, str):
+        deps = [deps]
+    if isinstance(deps, list):
+        for dep in deps:
+            dt = _find_ticket(store, str(dep))
+            if dt and (dt.get("status") or TICKET_STATUS_OPEN) != TICKET_STATUS_CLOSED:
+                return False
+    return True
+
+
+def compute_dashboard_snapshot(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    session: str,
+    last_pane_change: Dict[str, float],
+    last_mail_activity: Dict[str, float],
+) -> Dict[str, Any]:
+    now_ts = time.time()
+    stage = (state.get("coordination") or {}).get("stage", "discovery")
+    auto_dispatch = bool((state.get("coordination") or {}).get("auto_dispatch", False))
+    windows = set(tmux_list_windows(session))
+
+    try:
+        store = load_tickets(root, state)
+    except Exception:
+        store = _ticket_store_default()
+    tickets = store.get("tickets") or []
+    active = [t for t in tickets if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+    unassigned = [t for t in active if not t.get("assignee")]
+    blocked = [t for t in active if t.get("status") == TICKET_STATUS_BLOCKED]
+    open_tickets = [t for t in active if t.get("status") == TICKET_STATUS_OPEN]
+
+    by_assignee: Dict[str, List[str]] = {}
+    for tt in active:
+        a = tt.get("assignee") or ""
+        if not a:
+            continue
+        by_assignee.setdefault(a, []).append(tt.get("id", ""))
+
+    agents_out: List[Dict[str, Any]] = []
+
+    codex_cmd = str((state.get("codex") or {}).get("cmd") or DEFAULT_CODEX_CMD).split()[0]
+    codex_basename = Path(codex_cmd).name
+
+    for a in state["agents"]:
+        name = a["name"]
+        window_exists = name in windows
+        pane_cmd = tmux_pane_current_command(session, name) if window_exists else ""
+        codex_running = bool(window_exists and pane_cmd in {codex_basename, "codex"})
+        idle_for = None
+        if window_exists:
+            idle_for = now_ts - float(last_pane_change.get(name, now_ts))
+        status_path = root / a["dir_rel"] / "STATUS.md"
+        try:
+            status_age = now_ts - status_path.stat().st_mtime
+        except Exception:
+            status_age = None
+        mail_age = None
+        try:
+            mail_age = now_ts - float(last_mail_activity.get(name, now_ts))
+        except Exception:
+            mail_age = None
+        agents_out.append(
+            {
+                "name": name,
+                "role": a.get("role", ""),
+                "window": bool(window_exists),
+                "pane_cmd": pane_cmd,
+                "codex": bool(codex_running),
+                "idle_for_s": idle_for,
+                "status_age_s": status_age,
+                "mail_age_s": mail_age,
+                "tickets": sorted([x for x in by_assignee.get(name, []) if x]),
+            }
+        )
+
+    dash = {
+        "ts": now_iso(),
+        "stage": stage,
+        "auto_dispatch": auto_dispatch,
+        "tickets": {
+            "open": len(open_tickets),
+            "blocked": len(blocked),
+            "active": len(active),
+            "unassigned": len(unassigned),
+            "unassigned_list": [
+                {"id": tt.get("id", ""), "title": tt.get("title", ""), "priority": tt.get("priority")}
+                for tt in sorted(unassigned, key=lambda x: (_ticket_priority_value(x), x.get("id", "")))[:12]
+            ],
+        },
+        "agents": agents_out,
+    }
+    return dash
+
+
+def format_status_board_md(dash: Dict[str, Any]) -> str:
+    ts = dash.get("ts", "")
+    stage = dash.get("stage", "")
+    auto_dispatch = dash.get("auto_dispatch", False)
+    t = dash.get("tickets") or {}
+    agents = dash.get("agents") or []
+    lines: List[str] = []
+    lines.append(f"# Status board — {ts}")
+    lines.append("")
+    lines.append(f"Stage: `{stage}` | Auto-dispatch: `{str(bool(auto_dispatch)).lower()}`")
+    lines.append("")
+    lines.append("## Tickets")
+    lines.append(
+        f"Active: {t.get('active',0)}  | Open: {t.get('open',0)}  | Blocked: {t.get('blocked',0)}  | Unassigned: {t.get('unassigned',0)}"
+    )
+    ul = t.get("unassigned_list") or []
+    if ul:
+        lines.append("")
+        lines.append("Top unassigned:")
+        for it in ul:
+            tid = it.get("id", "")
+            title = it.get("title", "")
+            pr = it.get("priority") or ""
+            pr_txt = f" {pr}" if pr else ""
+            lines.append(f"- {tid}{pr_txt} — {title}")
+    lines.append("")
+    lines.append("## Agents")
+    lines.append("| agent | role | tmux | codex | idle | tickets | status_age | mail_age | pane |")
+    lines.append("|---|---|---:|---:|---:|---|---:|---:|---|")
+    for a in agents:
+        name = a.get("name", "")
+        role = a.get("role", "")
+        window = "yes" if a.get("window") else "no"
+        codex = "yes" if a.get("codex") else "no"
+        idle = _human_duration(a.get("idle_for_s"))
+        tickets = ",".join(a.get("tickets") or []) or "-"
+        s_age = _human_duration(a.get("status_age_s"))
+        m_age = _human_duration(a.get("mail_age_s"))
+        pane = (a.get("pane_cmd") or "-")[:40]
+        lines.append(f"| {name} | {role} | {window} | {codex} | {idle} | {tickets} | {s_age} | {m_age} | {pane} |")
+    lines.append("")
+    lines.append("_Generated by router. Do not edit by hand._")
+    return "\n".join(lines) + "\n"
+
+
+def format_dashboard_for_customer(dash: Dict[str, Any]) -> str:
+    stage = dash.get("stage", "")
+    t = dash.get("tickets") or {}
+    agents = dash.get("agents") or []
+    lines: List[str] = []
+    lines.append(f"Stage: {stage}")
+    lines.append(
+        f"Tickets: active={t.get('active',0)} open={t.get('open',0)} blocked={t.get('blocked',0)} unassigned={t.get('unassigned',0)}"
+    )
+    ul = t.get("unassigned_list") or []
+    if ul:
+        lines.append("Unassigned (top):")
+        for it in ul[:8]:
+            lines.append(f"- {it.get('id','?')} — {it.get('title','')}")
+    lines.append("Agents:")
+    for a in agents:
+        idle = a.get("idle_for_s")
+        status = "active" if idle is not None and idle < 30 else "idle"
+        ticket_txt = ",".join(a.get("tickets") or []) or "(no ticket)"
+        lines.append(f"- {a.get('name')} ({a.get('role')}): {status} — {ticket_txt}")
+    return "\n".join(lines)
+
+
+def _split_slash_commands(text: str) -> List[Tuple[str, List[str]]]:
+    cmds: List[Tuple[str, List[str]]] = []
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s.startswith("/"):
+            continue
+        parts = s[1:].split()
+        if not parts:
+            continue
+        cmds.append((parts[0].lower(), parts[1:]))
+    return cmds
+
+
+def _format_ticket_detail(store: Dict[str, Any], ticket_id: str) -> str:
+    t = _find_ticket(store, ticket_id)
+    if not t:
+        return f"Ticket not found: {ticket_id}"
+    summary = _ticket_summary_block(t)
+    desc = (t.get("description") or "").rstrip()
+    hist = t.get("history") or []
+    tail = hist[-5:] if isinstance(hist, list) else []
+    hist_lines = []
+    for e in tail:
+        try:
+            hist_lines.append(
+                f"- {e.get('ts','')}: {e.get('type','')} {e.get('by','')} {e.get('note','') or e.get('snippet','')}"
+            )
+        except Exception:
+            pass
+    extra = ("\n\nRecent history:\n" + "\n".join(hist_lines)) if hist_lines else ""
+    return f"{summary}\n\nDescription:\n{desc if desc else '(none)'}{extra}"
+
+
 def cmd_watch(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
     if not (root / STATE_FILENAME).exists():
         raise CTeamError("watch: could not find cteam.json in this directory or its parents")
     state = load_state(root)
+    agent_names = {a["name"] for a in state["agents"]}
+    ensure_shared_scaffold(root, state)
     ensure_tmux_session(root, state)
 
     interval = max(0.5, float(args.interval))
@@ -3253,20 +3694,442 @@ def cmd_watch(args: argparse.Namespace) -> None:
     last_mail_sig: Dict[str, Tuple[int, int]] = {}
     nudge_queue = NudgeQueue(root)
 
+    # Activity tracking: last time the tmux pane content changed.
+    pane_sig: Dict[str, Tuple[int, str]] = {}
+    last_pane_change: Dict[str, float] = {}
+    last_mail_activity: Dict[str, float] = {}
+    last_agent_reply: Dict[str, float] = {}
+    last_resume_prompt: Dict[str, float] = {}
+    resume_prompt_count: Dict[str, int] = {}
+    last_status_mtime: Dict[str, float] = {}
+    last_resume_escalation: Dict[str, float] = {}
+    last_seen_mail_ts: Dict[str, str] = {}
+    last_seen_mail_sig: Dict[str, str] = {}
+    last_mailbox_nudge: Dict[str, float] = {}
+    last_assigned_reminder: Dict[str, float] = {}
+
+    # Debounce / rate limits
+    last_dashboard_write = 0.0
+    last_pm_digest = 0.0
+    last_agent_stall_nudge: Dict[str, float] = {}
+    last_agent_unassigned_nudge: Dict[str, float] = {}
+
+    now_ts = time.time()
     for a in state["agents"]:
         msg_path, inbox_dir, _ = mailbox_paths(root, a["name"])
-        mkdirp(inbox_dir)
-        seen_inbox[a["name"]] = set(p.name for p in inbox_dir.glob("*.md"))
+        try:
+            current = set(p.name for p in inbox_dir.glob("*.md"))
+        except FileNotFoundError:
+            current = set()
+        seen_inbox[a["name"]] = current
+
         try:
             st = msg_path.stat()
             last_mail_sig[a["name"]] = (st.st_mtime_ns, st.st_size)
         except FileNotFoundError:
             last_mail_sig[a["name"]] = (0, 0)
 
+        last_pane_change[a["name"]] = now_ts
+        last_mail_activity[a["name"]] = now_ts
+        last_agent_reply[a["name"]] = now_ts
+        last_resume_prompt[a["name"]] = 0.0
+        resume_prompt_count[a["name"]] = 0
+        last_resume_escalation[a["name"]] = 0.0
+        try:
+            last_status_mtime[a["name"]] = (root / a["dir_rel"] / "STATUS.md").stat().st_mtime
+        except FileNotFoundError:
+            last_status_mtime[a["name"]] = now_ts
+        try:
+            entry = read_last_entry(msg_path)
+            ts0, *_ = _parse_entry(entry)
+            if ts0:
+                last_seen_mail_ts[a["name"]] = ts0
+            if entry and entry.strip():
+                last_seen_mail_sig[a["name"]] = hashlib.sha256(entry.strip().encode("utf-8", "ignore")).hexdigest()
+        except Exception:
+            pass
+        last_mailbox_nudge[a["name"]] = 0.0
+        last_assigned_reminder[a["name"]] = 0.0
+
     log_line(root, f"[router] watching mailboxes under {root} (interval={interval}s)")
 
-    now_ts = time.time()
-    last_activity: Dict[str, float] = {a["name"]: now_ts for a in state["agents"]}
+    def maybe_write_dashboard(session: str) -> Optional[Dict[str, Any]]:
+        nonlocal last_dashboard_write
+        sup = state.get("supervision") or {}
+        every = float(sup.get("dashboard_write_seconds", 10) or 10)
+        if every <= 0:
+            return None
+        if time.time() - last_dashboard_write < every:
+            return None
+        last_dashboard_write = time.time()
+        try:
+            dash = compute_dashboard_snapshot(
+                root,
+                state,
+                session=session,
+                last_pane_change=last_pane_change,
+                last_mail_activity=last_mail_activity,
+            )
+            atomic_write_text(dashboard_json_path(root), json.dumps(dash, indent=2, sort_keys=True) + "\n")
+            atomic_write_text(status_board_path(root), format_status_board_md(dash))
+            return dash
+        except Exception as e:
+            log_line(root, f"[router] failed to write dashboard: {e}")
+            return None
+
+    def maybe_send_pm_digest(dash: Dict[str, Any]) -> None:
+        nonlocal last_pm_digest
+        sup = state.get("supervision") or {}
+        every = float(sup.get("pm_digest_interval_seconds", 600) or 600)
+        if every <= 0:
+            return
+        now = time.time()
+        if now - last_pm_digest < every:
+            return
+
+        idle_thresh = float(sup.get("agent_idle_seconds", 120) or 120)
+        agents = dash.get("agents") or []
+        idle_agents = [a for a in agents if a.get("name") != "pm" and a.get("window") and (a.get("idle_for_s") or 0) >= idle_thresh]
+        unassigned = int((dash.get("tickets") or {}).get("unassigned", 0) or 0)
+        blocked = int((dash.get("tickets") or {}).get("blocked", 0) or 0)
+        if not idle_agents and unassigned == 0 and blocked == 0:
+            return
+
+        last_pm_digest = now
+        lines: List[str] = []
+        lines.append("Supervisor digest (router)")
+        lines.append(f"Stage: {dash.get('stage','')}")
+        lines.append(f"Tickets: unassigned={unassigned} blocked={blocked} active={int((dash.get('tickets') or {}).get('active',0) or 0)}")
+        if idle_agents:
+            lines.append("Idle agents:")
+            for a in idle_agents[:10]:
+                lines.append(
+                    f"- {a.get('name')} ({a.get('role')}): idle { _human_duration(a.get('idle_for_s')) } — tickets: {','.join(a.get('tickets') or []) or '(none)'}"
+                )
+        lines.append("")
+        lines.append("Tip: open shared/STATUS_BOARD.md for the live board.")
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient="pm",
+            subject="Supervisor digest",
+            body="\n".join(lines),
+            msg_type="MESSAGE",
+            nudge=True,
+            start_if_needed=True,
+        )
+
+    def handle_customer_commands(last_body: str) -> bool:
+        cmds = _split_slash_commands(last_body or "")
+        if not cmds:
+            return False
+
+        handled_any = False
+        try:
+            store = load_tickets(root, state)
+        except Exception:
+            store = _ticket_store_default()
+
+        for cmd, argv in cmds:
+            if cmd in {"help", "commands"}:
+                help_txt = "\n".join(
+                    [
+                        "Customer commands:",
+                        "- /tickets            (list open/blocked tickets)",
+                        "- /ticket T001        (show one ticket)",
+                        "- /status             (team + ticket snapshot)",
+                        "- /tail <agent> [N]   (capture last N lines from tmux pane, default 120)",
+                        "- /approve <TOKEN>    (approve a pending 'spawn agent' request)",
+                        "- /deny <TOKEN>       (deny a pending 'spawn agent' request)",
+                    ]
+                )
+                write_message(root, state, sender="cteam", recipient="customer", subject="Available commands", body=help_txt, nudge=False)
+                handled_any = True
+            elif cmd == "tickets":
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient="customer",
+                    subject="Ticket summary (open/blocked)",
+                    body=_format_ticket_summary(store),
+                    nudge=False,
+                )
+                handled_any = True
+            elif cmd == "ticket":
+                body = "Usage: /ticket T001" if not argv else _format_ticket_detail(store, argv[0])
+                write_message(root, state, sender="cteam", recipient="customer", subject="Ticket detail", body=body, nudge=False)
+                handled_any = True
+            elif cmd in {"status", "dashboard"}:
+                try:
+                    dash = compute_dashboard_snapshot(
+                        root,
+                        state,
+                        session=state["tmux"]["session"],
+                        last_pane_change=last_pane_change,
+                        last_mail_activity=last_mail_activity,
+                    )
+                    body = format_dashboard_for_customer(dash)
+                except Exception:
+                    body = "Dashboard unavailable."
+                write_message(root, state, sender="cteam", recipient="customer", subject="Status", body=body, nudge=False)
+                handled_any = True
+            elif cmd in {"tail", "pane"}:
+                if not argv:
+                    body = "Usage: /tail <agent> [N]"
+                else:
+                    agent = argv[0]
+                    try:
+                        n = int(argv[1]) if len(argv) > 1 else 120
+                    except Exception:
+                        n = 120
+                    txt = tmux_capture_tail(state["tmux"]["session"], agent, lines=n)
+                    if not txt.strip():
+                        body = f"(no pane output captured for {agent})"
+                    else:
+                        body = f"Last {n} lines from tmux:{agent}\n\n```\n{txt.rstrip()}\n```"
+                write_message(root, state, sender="cteam", recipient="customer", subject="tmux capture", body=body, nudge=False)
+                handled_any = True
+            elif cmd in {"approve", "deny"}:
+                if not argv:
+                    body = f"Usage: /{cmd} <TOKEN>"
+                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn approval", body=body, nudge=False)
+                    handled_any = True
+                else:
+                    token = argv[0].strip().upper()
+                    with spawn_lock(root):
+                        store_sr = load_spawn_requests(root)
+                        req = find_spawn_request_by_token(store_sr, token)
+                        if not req:
+                            write_message(
+                                root,
+                                state,
+                                sender="cteam",
+                                recipient="customer",
+                                subject="Spawn approval",
+                                body=f"Unknown token: {token}",
+                                nudge=False,
+                            )
+                            handled_any = True
+                        elif req.get("status") != "pending":
+                            write_message(
+                                root,
+                                state,
+                                sender="cteam",
+                                recipient="customer",
+                                subject="Spawn approval",
+                                body=f"Request {req.get('id')} is already {req.get('status')}.",
+                                nudge=False,
+                            )
+                            handled_any = True
+                        else:
+                            if cmd == "deny":
+                                req["status"] = "denied"
+                                req["decided_at"] = now_iso()
+                                req["decided_by"] = "customer"
+                                save_spawn_requests(root, store_sr)
+                                note = f"Denied request {req.get('id')} (role={req.get('role')})."
+                                write_message(root, state, sender="cteam", recipient="customer", subject="Spawn denied", body=note, nudge=False)
+                                write_message(root, state, sender="cteam", recipient="pm", subject="Spawn denied by customer", body=note, nudge=True)
+                                handled_any = True
+                            else:
+                                req["status"] = "approved"
+                                req["decided_at"] = now_iso()
+                                req["decided_by"] = "customer"
+                                save_spawn_requests(root, store_sr)
+                                try:
+                                    agent = add_agent_to_workspace(
+                                        root,
+                                        state,
+                                        role=req.get("role") or "developer",
+                                        name=req.get("name"),
+                                        title=req.get("title"),
+                                        persona=req.get("persona"),
+                                        start_codex=bool(req.get("start_codex", True)),
+                                    )
+                                    req["status"] = "fulfilled"
+                                    req["fulfilled_at"] = now_iso()
+                                    req["fulfilled_agent"] = agent.get("name")
+                                    save_spawn_requests(root, store_sr)
+                                    note = f"Approved {req.get('id')} — spawned agent {agent.get('name')} ({agent.get('role')})."
+                                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn approved", body=note, nudge=False)
+                                    write_message(root, state, sender="cteam", recipient="pm", subject="Spawn approved — agent created", body=note, nudge=True)
+                                    handled_any = True
+                                except Exception as e:
+                                    note = f"Spawn failed after approval: {e}"
+                                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn failed", body=note, nudge=False)
+                                    write_message(root, state, sender="cteam", recipient="pm", subject="Spawn failed", body=note, nudge=True)
+                                    handled_any = True
+
+        if handled_any:
+            # Treat automated command responses as "reply" to avoid PM nag spam.
+            try:
+                cust_state = load_customer_state(root)
+                cust_state["last_pm_reply_ts"] = now_iso()
+                save_customer_state(root, cust_state)
+            except Exception:
+                pass
+        return handled_any
+
+    def maybe_send_customer_burst_digest() -> None:
+        sup = state.get("supervision") or {}
+        quiet_s = float(sup.get("customer_burst_seconds", 20) or 20)
+        if quiet_s <= 0:
+            return
+        try:
+            cust_state = load_customer_state(root)
+        except Exception:
+            return
+        if not cust_state.get("burst_pending"):
+            return
+        last_ts = iso_to_unix(str(cust_state.get("burst_last_ts") or ""))
+        if not last_ts:
+            return
+        if time.time() - last_ts < quiet_s:
+            return
+
+        buf_path = customer_burst_buffer_path(root)
+        try:
+            buf = buf_path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            buf = ""
+        if not buf.strip():
+            cust_state["burst_pending"] = False
+            cust_state["burst_count"] = 0
+            cust_state.pop("burst_start_ts", None)
+            cust_state.pop("burst_last_ts", None)
+            save_customer_state(root, cust_state)
+            return
+
+        parts = re.split(r"(?m)^(?=## )", buf)
+        entries = [p for p in (x.strip() for x in parts) if p.startswith("## ")]
+        blocks: List[str] = []
+        for e in entries[-12:]:
+            ts0, sender, _, subj, body, _, _ = _parse_entry(e[:4000])
+            # Filter out pure slash-command messages from the digest; those are handled immediately.
+            if (body or "").lstrip().startswith("/"):
+                continue
+            blocks.append(f"---\n{ts0 or ''} | {subj or '(no subject)'}\n{(body or '').strip()}")
+
+        digest = "\n\n".join(blocks).strip()
+        if not digest:
+            digest = f"(customer burst had {len(entries)} message(s), mostly commands)"
+        if len(digest) > 6500:
+            digest = digest[:6500] + "\n...(truncated)"
+
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient="pm",
+            subject=f"Customer burst digest ({len(entries)} msgs)",
+            body=digest + "\n\nAction: reply in the customer channel and update shared/BRIEF.md.",
+            msg_type="MESSAGE",
+            nudge=True,
+            start_if_needed=True,
+        )
+
+        # Keep the team moving: ask a non-PM agent to draft a response if available.
+        try:
+            helper = None
+            for a in state["agents"]:
+                if a["name"] == "pm":
+                    continue
+                if a.get("role") in {"researcher", "architect"}:
+                    helper = a["name"]
+                    break
+            if helper:
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient=helper,
+                    subject="Assist PM: draft response + propose tickets",
+                    body=digest + "\n\nTask: draft a customer reply and propose concrete tickets; send your draft to PM.",
+                    msg_type="MESSAGE",
+                    nudge=True,
+                    start_if_needed=True,
+                )
+        except Exception:
+            pass
+
+        cust_state["burst_pending"] = False
+        cust_state["burst_count"] = 0
+        cust_state["burst_digest_ts"] = now_iso()
+        cust_state.pop("burst_start_ts", None)
+        cust_state.pop("burst_last_ts", None)
+        save_customer_state(root, cust_state)
+        try:
+            atomic_write_text(buf_path, "")
+        except Exception:
+            pass
+
+    def maybe_autodispatch() -> None:
+        coord = state.get("coordination") or {}
+        if not bool(coord.get("auto_dispatch", False)):
+            return
+        if str(coord.get("stage", "discovery")).lower() not in {"execution", "implement", "implementation"}:
+            return
+        try:
+            store = load_tickets(root, state)
+        except Exception:
+            return
+        ready = [tt for tt in (store.get("tickets") or []) if ticket_is_ready(store, tt)]
+        if not ready:
+            return
+
+        active_by_assignee: Dict[str, int] = {}
+        for tt in (store.get("tickets") or []):
+            if tt.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED} and tt.get("assignee"):
+                a = str(tt.get("assignee"))
+                active_by_assignee[a] = active_by_assignee.get(a, 0) + 1
+
+        sup = state.get("supervision") or {}
+        idle_thresh = float(sup.get("agent_idle_seconds", 120) or 120)
+        candidates: List[str] = []
+        for a in state["agents"]:
+            if a["name"] == "pm":
+                continue
+            if active_by_assignee.get(a["name"], 0) > 0:
+                continue
+            idle_for = time.time() - float(last_pane_change.get(a["name"], time.time()))
+            if idle_for < idle_thresh:
+                continue
+            candidates.append(a["name"])
+
+        if not candidates:
+            return
+
+        ready_sorted = sorted(ready, key=lambda x: (_ticket_priority_value(x), x.get("id", "")))
+        assignee = candidates[0]
+        tt = ready_sorted[0]
+        tid = tt.get("id", "")
+        if not tid:
+            return
+        try:
+            ticket_assign(root, state, tid, assignee, note="auto-dispatch")
+        except Exception:
+            return
+        body = (
+            _ticket_summary_block(tt)
+            + "\n\nYou were auto-assigned this READY ticket.\n"
+            + "Protocol: implement, run tests, update STATUS.md, and report back to PM with results + next steps."
+        )
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient=assignee,
+            subject=f"Auto-assignment: {tid}",
+            body=body,
+            msg_type=ASSIGNMENT_TYPE,
+            ticket_id=tid,
+            nudge=True,
+            start_if_needed=True,
+        )
+        nudge_queue.request("pm", reason=f"AUTO-DISPATCHED {tid} to @{assignee}")
+
     while True:
         customer_nag_pending = False
         customer_state_for_nag: Optional[Dict[str, Any]] = None
@@ -3274,10 +4137,23 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
         try:
             state = load_state(root)
+            agent_names = {a["name"] for a in state["agents"]}
         except Exception:
             pass
+        now_for_new = time.time()
+        for a in state["agents"]:
+            n = a["name"]
+            last_agent_reply.setdefault(n, now_for_new)
+            last_resume_prompt.setdefault(n, 0.0)
+            resume_prompt_count.setdefault(n, 0)
+            last_resume_escalation.setdefault(n, 0.0)
+            try:
+                mt = (root / a["dir_rel"] / "STATUS.md").stat().st_mtime
+                last_status_mtime[n] = mt
+            except FileNotFoundError:
+                last_status_mtime[n] = last_status_mtime.get(n, now_for_new)
 
-        # Start/stop Telegram bridge based on persisted state.
+        # Start/stop Telegram bridge based on state.
         want_enabled = bool((state.get("telegram") or {}).get("enabled", False))
         if want_enabled != telegram_enabled:
             telegram_enabled = want_enabled
@@ -3301,6 +4177,27 @@ def cmd_watch(args: argparse.Namespace) -> None:
             time.sleep(interval)
             continue
 
+        windows = set(tmux_list_windows(session))
+        now = time.time()
+
+        # Update pane activity signatures (for true idleness).
+        for a in state["agents"]:
+            name = a["name"]
+            if name not in windows:
+                continue
+            sig = _pane_sig(session, name)
+            noise_until = float(_router_noise_until.get(name, 0.0) or 0.0)
+            if noise_until and now < noise_until:
+                # Skip router-injected noise so we don't reset idleness falsely.
+                continue
+            if name not in pane_sig:
+                pane_sig[name] = sig
+                last_pane_change[name] = now
+            elif sig != pane_sig[name]:
+                pane_sig[name] = sig
+                last_pane_change[name] = now
+
+        # Scan inboxes + message.md changes.
         for a in state["agents"]:
             name = a["name"]
             msg_path, inbox_dir, _ = mailbox_paths(root, name)
@@ -3324,7 +4221,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if last_mail_sig.get(name) != sig:
                 last_mail_sig[name] = sig
                 new_files.append(msg_path)
-                last_activity[name] = time.time()
+                last_mail_activity[name] = time.time()
 
             if not new_files:
                 continue
@@ -3334,45 +4231,78 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_type: Optional[str] = None
             last_ticket: Optional[str] = None
             last_body: str = ""
+            last_ts: Optional[str] = None
+            last_sig: Optional[str] = None
             for fp in new_files[-1:]:
                 try:
-                    last_txt = fp.read_text(encoding="utf-8", errors="replace")[:4000]
+                    last_txt = read_last_entry(fp)
                 except Exception:
                     last_txt = ""
-                _, last_sender, _, _, last_body, last_ticket, last_type = _parse_entry(last_txt)
+                last_ts, last_sender, _, _, last_body, last_ticket, last_type = _parse_entry(last_txt)
+                if last_txt and last_txt.strip():
+                    last_sig = hashlib.sha256(last_txt.strip().encode("utf-8", "ignore")).hexdigest()
 
+            # Deduplicate mailbox nudges: only react when the newest entry changes.
+            if last_sig and last_seen_mail_sig.get(name) == last_sig:
+                continue
+            if last_ts:
+                last_seen_mail_ts[name] = last_ts
+            if last_sig:
+                last_seen_mail_sig[name] = last_sig
+
+            if last_sender and last_sender in agent_names:
+                last_agent_reply[last_sender] = time.time()
+                resume_prompt_count[last_sender] = 0
+                last_resume_escalation[last_sender] = 0.0
+
+            # Start agent only on assignment.
             if last_sender and last_type:
-                maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
+                if last_type == ASSIGNMENT_TYPE or (
+                    bool((state.get("coordination") or {}).get("start_agents_on_assignment", True))
+                    and str(last_sender) in set((state.get("coordination") or {}).get("assignment_from", ["pm", "cteam"]))
+                ):
+                    maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
+
+            # Customer-to-PM: handle commands immediately, but avoid interrupting PM on every burst message.
+            if name == "pm" and (last_sender or "").lower() == "customer":
+                try:
+                    handled = handle_customer_commands(last_body or "")
+                except Exception:
+                    handled = False
+                if handled:
+                    continue
+                # Don't nudge PM for each customer message; the burst digest will do one high-signal nudge.
+                continue
 
             reason = _mailbox_nudge_reason(last_ticket, last_type)
-            nudge_queue.request(name, reason)
+            sup = state.get("supervision") or {}
+            cooldown = float(sup.get("mailbox_nudge_cooldown_seconds", 90) or 90)
+            now_nudge = time.time()
+            if (now_nudge - float(last_mailbox_nudge.get(name, 0.0))) >= cooldown:
+                last_mailbox_nudge[name] = now_nudge
+                nudge_queue.request(name, reason)
 
-            if name == "pm" and (last_sender or "").lower() == "customer":
-                if any(line.strip().lower() == "/tickets" for line in (last_body or "").splitlines()):
-                    try:
-                        store = load_tickets(root, state)
-                        summary = _format_ticket_summary(store)
-                        write_message(
-                            root,
-                            state,
-                            sender="cteam",
-                            recipient="customer",
-                            subject="Ticket summary (open/blocked)",
-                            body=summary,
-                            msg_type="MESSAGE",
-                            nudge=False,
-                            start_if_needed=False,
-                        )
-                        try:
-                            cust_state = load_customer_state(root)
-                            cust_state["last_pm_reply_ts"] = now_iso()
-                            save_customer_state(root, cust_state)
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
+        # Digest bursty customer messages once they stop typing.
+        try:
+            maybe_send_customer_burst_digest()
+        except Exception:
+            pass
 
-        # Customer wait loop: if last inbound from customer lacks a PM reply, keep nudging PM.
+        # Auto-dispatch ready tickets if enabled.
+        try:
+            maybe_autodispatch()
+        except Exception:
+            pass
+
+        # Dashboard output + PM digest
+        dash = maybe_write_dashboard(session)
+        if dash:
+            try:
+                maybe_send_pm_digest(dash)
+            except Exception:
+                pass
+
+        # Customer wait loop (nag PM if customer hasn't been replied to).
         try:
             cust_state = load_customer_state(root)
             last_in = iso_to_unix(str(cust_state.get("last_customer_msg_ts", "")))
@@ -3380,43 +4310,199 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_nag = iso_to_unix(str(cust_state.get("last_pm_nag_ts", "")))
             nag_count = int(cust_state.get("pm_nag_count", 0) or 0)
             if last_in and (not last_out or last_out < last_in):
-                now_ts = time.time()
-                should_nag = False
+                now_ts2 = time.time()
                 if not last_nag or last_nag < last_in:
                     nag_count = 0
-                if nag_count < 3 and (not last_nag or (now_ts - last_nag) >= 300):
-                    should_nag = True
-                if should_nag:
+                if nag_count < 3 and (not last_nag or (now_ts2 - last_nag) >= 300):
                     nudge_queue.request("pm", reason="CUSTOMER WAITING — REPLY NOW")
                     customer_nag_pending = True
                     customer_state_for_nag = cust_state
         except Exception:
             pass
 
-        # PM-level idle nudging: if all non-PM agents are idle >30s, ping PM.
-        now = time.time()
-        non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
-        if non_pm:
-            pm_idle = now - last_activity.get("pm", 0) >= 30
-            team_idle = all(now - last_activity.get(n, 0) >= 30 for n in non_pm)
-            if pm_idle and team_idle:
-                if not state["tmux"].get("paused", False):
-                    nudge_queue.request("pm", reason="TEAM IDLE — CHECK IN")
-                    pm_idle_pending = True
+        # Agent-level stall/idle nudges based on pane idleness + ticket assignment.
+        by_assignee: Dict[str, List[str]] = {}
+        try:
+            store = load_tickets(root, state)
+            tickets = store.get("tickets") or []
+            active = [tt for tt in tickets if tt.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+            for tt in active:
+                ass = tt.get("assignee") or ""
+                if not ass:
+                    continue
+                by_assignee.setdefault(ass, []).append(tt.get("id", ""))
 
-        results = nudge_queue.flush(state)
-        if results:
-            for agent_name, ok, reason_text, skip_reason in results:
-                if skip_reason == "duplicate":
-                    log_line(root, f"[router] nudge skipped for {agent_name} (recent duplicate: {reason_text})")
+            sup = state.get("supervision") or {}
+            stalled_s = float(sup.get("agent_stalled_nudge_seconds", 300) or 300)
+            unassigned_s = float(sup.get("agent_unassigned_nudge_seconds", 600) or 600)
+            # Track STATUS.md freshness for progress signals.
+            for a in state["agents"]:
+                try:
+                    mt = (root / a["dir_rel"] / "STATUS.md").stat().st_mtime
+                    if mt > last_status_mtime.get(a["name"], 0.0):
+                        last_status_mtime[a["name"]] = mt
+                        resume_prompt_count[a["name"]] = 0
+                        last_resume_escalation[a["name"]] = 0.0
+                except FileNotFoundError:
+                    pass
+
+            for a in state["agents"]:
+                name = a["name"]
+                if name == "pm":
                     continue
-                if skip_reason == "busy":
-                    log_line(root, f"[router] nudge deferred for {agent_name} (pane active)")
-                    continue
-                if ok:
-                    log_line(root, f"[router] nudged {agent_name} ({reason_text})")
+                idle_for = time.time() - float(last_pane_change.get(name, time.time()))
+                assigned = [x for x in by_assignee.get(name, []) if x]
+                if assigned:
+                    if idle_for >= stalled_s and (time.time() - float(last_agent_stall_nudge.get(name, 0.0))) >= stalled_s:
+                        last_agent_stall_nudge[name] = time.time()
+                        nudge_queue.request(
+                            name,
+                            reason=f"STALLED — tickets {','.join(assigned)}. Deliver the next concrete step now; if blocked, mark ticket blocked and tell PM immediately.",
+                            interrupt=True,
+                        )
                 else:
-                    log_line(root, f"[router] could not nudge {agent_name} ({reason_text})")
+                    if idle_for >= unassigned_s and (time.time() - float(last_agent_unassigned_nudge.get(name, 0.0))) >= unassigned_s:
+                        last_agent_unassigned_nudge[name] = time.time()
+                        nudge_queue.request(
+                            name,
+                            reason="NO WORK IN PROGRESS — pick a ready ticket or propose 1–2 concrete tasks to PM now.",
+                            interrupt=True,
+                        )
+        except Exception:
+            pass
+
+        # Auto-resume assigned agents (Codex is single-shot; keep them moving).
+        try:
+            sup = state.get("supervision") or {}
+            resume_s = float(sup.get("agent_resume_seconds", 180) or 180)
+            resume_cooldown = float(sup.get("agent_resume_cooldown_seconds", resume_s) or resume_s)
+            resume_max = int(sup.get("agent_resume_max_prompts", 2) or 2)
+            remind_s = float(sup.get("assigned_ticket_reminder_seconds", 60) or 60)
+            now_resume = time.time()
+            for agent_name, assigned in by_assignee.items():
+                if not assigned or agent_name == "pm":
+                    continue
+                # Idle reminder listing assigned tickets.
+                idle_for = now_resume - float(last_pane_change.get(agent_name, now_resume))
+                if idle_for >= remind_s and (now_resume - float(last_assigned_reminder.get(agent_name, 0.0))) >= remind_s:
+                    assigned_list = ", ".join(sorted(assigned))
+                    body = (
+                        "You still own these tickets:\n"
+                        + "\n".join(f"- {tid}" for tid in sorted(assigned))
+                        + "\n\nPick one now, do the next concrete step, and send PM a brief status (result, next step, ETA). "
+                        "If blocked, mark the ticket blocked with the reason and tell PM immediately."
+                    )
+                    write_message(
+                        root,
+                        state,
+                        sender="cteam",
+                        recipient=agent_name,
+                        subject=f"Reminder: assigned tickets ({assigned_list})",
+                        body=body,
+                        msg_type="MESSAGE",
+                        nudge=True,
+                        start_if_needed=True,
+                    )
+                    last_assigned_reminder[agent_name] = now_resume
+                    # Avoid double messaging in the same loop.
+                    continue
+                # If already escalated beyond threshold and no new progress, pause re-prompts until STATUS or message.
+                if resume_prompt_count.get(agent_name, 0) >= resume_max:
+                    if (now_resume - float(last_resume_escalation.get(agent_name, 0.0))) >= resume_cooldown:
+                        pm_body = (
+                            f"Agent @{agent_name} has exceeded resume prompts ({resume_prompt_count.get(agent_name, 0)}x) "
+                            f"on tickets {', '.join(sorted(assigned))} with no STATUS.md update. "
+                            "Intervene: ask for concrete progress, reassign, or adjust scope."
+                        )
+                        write_message(
+                            root,
+                            state,
+                            sender="cteam",
+                            recipient="pm",
+                            subject=f"Agent may be stuck: {agent_name}",
+                            body=pm_body,
+                            msg_type="MESSAGE",
+                            nudge=True,
+                            start_if_needed=True,
+                        )
+                        last_resume_escalation[agent_name] = now_resume
+                    continue
+                idle_since_pane = now_resume - float(last_pane_change.get(agent_name, now_resume))
+                if idle_since_pane < resume_s:
+                    continue
+                if (now_resume - float(last_agent_reply.get(agent_name, 0.0))) < resume_s:
+                    continue
+                if (now_resume - float(last_resume_prompt.get(agent_name, 0.0))) < resume_cooldown:
+                    continue
+                status_age = now_resume - float(last_status_mtime.get(agent_name, now_resume))
+
+                assigned_list = ", ".join(sorted(assigned))
+                body = (
+                    f"You are still assigned: {assigned_list}.\n\n"
+                    "Resume work now. Pick the first ticket, do the next concrete change/test, then send PM a brief status "
+                    "(what you did, result, next step, ETA). If blocked, mark the ticket blocked with the reason and notify PM. "
+                    "Do not just acknowledge; ship the next increment in this run."
+                )
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient=agent_name,
+                    subject="Resume assigned work",
+                    body=body,
+                    msg_type="MESSAGE",
+                    nudge=True,
+                    start_if_needed=True,
+                )
+                last_resume_prompt[agent_name] = now_resume
+                resume_prompt_count[agent_name] = resume_prompt_count.get(agent_name, 0) + 1
+
+                # Escalate to PM if an agent keeps looping without visible progress (stale STATUS).
+                if (
+                    resume_prompt_count[agent_name] >= max(resume_max, 2)
+                    and status_age >= resume_s
+                    and (now_resume - float(last_resume_escalation.get(agent_name, 0.0))) >= resume_cooldown
+                ):
+                    pm_body = (
+                        f"Agent @{agent_name} has been re-prompted {resume_prompt_count[agent_name]} times "
+                        f"for tickets {assigned_list} without a recent STATUS.md update "
+                        f"(stale for ~{int(status_age)}s). Consider intervening: ask for concrete progress, "
+                        "reassign, or adjust scope."
+                    )
+                    write_message(
+                        root,
+                        state,
+                        sender="cteam",
+                        recipient="pm",
+                        subject=f"Agent may be looping: {agent_name}",
+                        body=pm_body,
+                        msg_type="MESSAGE",
+                        nudge=True,
+                        start_if_needed=True,
+                    )
+                    last_resume_escalation[agent_name] = now_resume
+        except Exception:
+            pass
+
+        # PM-level idle: if everyone is idle, prompt PM to assign/dispatch.
+        try:
+            sup = state.get("supervision") or {}
+            idle_s = float(sup.get("agent_idle_seconds", 120) or 120)
+            non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
+            if non_pm:
+                pm_idle = (time.time() - float(last_pane_change.get("pm", time.time()))) >= idle_s
+                team_idle = all((time.time() - float(last_pane_change.get(n, time.time()))) >= idle_s for n in non_pm)
+                if pm_idle and team_idle and not state["tmux"].get("paused", False):
+                    nudge_queue.request("pm", reason="TEAM IDLE — check STATUS_BOARD.md and assign next tickets")
+                    pm_idle_pending = True
+        except Exception:
+            pass
+
+        # Flush pending nudges (dedup + defer while panes are busy).
+        try:
+            for agent_name, ok, reason_text, skip_reason in nudge_queue.flush(state):
+                if skip_reason in {"duplicate", "busy"}:
+                    continue
 
                 if ok and customer_nag_pending and agent_name == "pm" and "CUSTOMER WAITING" in reason_text:
                     try:
@@ -3427,9 +4513,14 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
                 if ok and pm_idle_pending and agent_name == "pm" and "TEAM IDLE" in reason_text:
-                    last_activity["pm"] = time.time()
+                    # Acknowledge for logging
+                    pass
+        except Exception:
+            pass
 
         time.sleep(interval)
+
+
 
 
 def cmd_customer_chat(args: argparse.Namespace) -> None:
@@ -4044,6 +5135,163 @@ def cmd_kill(args: argparse.Namespace) -> None:
     print(f"killed tmux session: {state['tmux']['session']}")
 
 
+def cmd_dashboard(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    state = load_state(root)
+
+    dash: Optional[Dict[str, Any]] = None
+    p = dashboard_json_path(root)
+    if p.exists() and not getattr(args, "fresh", False):
+        try:
+            dash = json.loads(p.read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            dash = None
+
+    if dash is None:
+        session = state["tmux"]["session"]
+        if not tmux_has_session(session):
+            raise CTeamError(f"tmux session not running: {session} (start router with: cteam watch)")
+        now_ts = time.time()
+        dummy = {a["name"]: now_ts for a in state["agents"]}
+        dash = compute_dashboard_snapshot(
+            root,
+            state,
+            session=session,
+            last_pane_change=dummy,
+            last_mail_activity=dummy,
+        )
+
+    if getattr(args, "json", False):
+        sys.stdout.write(json.dumps(dash, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(format_status_board_md(dash))
+
+
+def cmd_capture(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    state = load_state(root)
+
+    session = state["tmux"]["session"]
+    if not tmux_has_session(session):
+        raise CTeamError(f"tmux session not running: {session}")
+
+    window = args.agent
+    txt = tmux_capture_tail(session, window, lines=int(args.lines or 200))
+    if not txt.strip():
+        txt = "(no pane output captured)"
+
+    if getattr(args, "to", None):
+        body = f"Capture from tmux:{window} (last {int(args.lines or 200)} lines)\n\n```\n{txt.rstrip()}\n```"
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient=args.to,
+            subject=f"tmux capture: {window}",
+            body=body,
+            msg_type="MESSAGE",
+            nudge=(args.to != "customer"),
+            start_if_needed=True,
+        )
+    else:
+        sys.stdout.write(txt)
+
+
+def cmd_request_agent(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    state = load_state(root)
+
+    requested_by = os.environ.get("CTEAM_AGENT") or "pm"
+    reason = (args.reason or "").strip()
+    if not reason:
+        raise CTeamError("--reason is required")
+
+    req = create_spawn_request(
+        root,
+        requested_by=requested_by,
+        role=args.role,
+        name=args.name,
+        title=args.title,
+        persona=args.persona,
+        start_codex=bool(args.start_codex),
+        reason=reason,
+    )
+
+    customer_body = textwrap.dedent(
+        f"""\
+        PM requests spawning a new agent.
+
+        Request: {req.get('id')}
+        Role: {req.get('role')}
+        Name: {req.get('name') or '(auto)'}
+        Start codex immediately: {str(bool(req.get('start_codex'))).lower()}
+
+        Reason:
+        {reason}
+
+        To approve:  /approve {req.get('token')}
+        To deny:     /deny {req.get('token')}
+        """
+    ).strip()
+
+    write_message(
+        root,
+        state,
+        sender="cteam",
+        recipient="customer",
+        subject="Approval requested: spawn new agent",
+        body=customer_body,
+        msg_type="MESSAGE",
+        nudge=False,
+        start_if_needed=False,
+    )
+    write_message(
+        root,
+        state,
+        sender="cteam",
+        recipient="pm",
+        subject="Spawn request sent to customer",
+        body=f"Sent spawn request {req.get('id')} (role={req.get('role')}, token={req.get('token')}).",
+        msg_type="MESSAGE",
+        nudge=True,
+        start_if_needed=True,
+    )
+
+
+def cmd_stage(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    state = load_state(root)
+    stage = (args.stage or "").strip().lower()
+    if stage not in {"discovery", "planning", "execution"}:
+        raise CTeamError("stage must be one of: discovery, planning, execution")
+    coord = state.get("coordination") or {}
+    if not isinstance(coord, dict):
+        coord = {}
+    coord["stage"] = stage
+    state["coordination"] = coord
+    save_state(root, state)
+    sys.stdout.write(f"Set coordination.stage = {stage}\n")
+
+
+def cmd_autodispatch(args: argparse.Namespace) -> None:
+    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    state = load_state(root)
+    mode = (args.mode or "").strip().lower()
+    if mode in {"on", "true", "1", "yes"}:
+        val = True
+    elif mode in {"off", "false", "0", "no"}:
+        val = False
+    else:
+        raise CTeamError("mode must be on/off (or true/false)")
+    coord = state.get("coordination") or {}
+    if not isinstance(coord, dict):
+        coord = {}
+    coord["auto_dispatch"] = bool(val)
+    state["coordination"] = coord
+    save_state(root, state)
+    sys.stdout.write(f"Set coordination.auto_dispatch = {str(bool(val)).lower()}\n")
+
+
 def cmd_status(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
@@ -4176,9 +5424,19 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
     for a in state["agents"]:
         a_dir = root / a["dir_rel"]
         atomic_write_text(a_dir / "AGENTS.md", render_agent_agents_md(state, a))
+        status_path = a_dir / "STATUS.md"
+        if not status_path.exists():
+            atomic_write_text(status_path, render_agent_status_template(a))
+
         repo_dir = root / a["repo_dir_rel"]
         try:
+            safe_link_dir(Path("..") / "inbox", repo_dir / "inbox")
+            safe_link_dir(Path("..") / "outbox", repo_dir / "outbox")
             safe_link_file(Path("..") / "AGENTS.md", repo_dir / "AGENTS.md")
+            safe_link_file(Path("..") / "STATUS.md", repo_dir / "STATUS.md")
+            safe_link_file(Path("..") / "message.md", repo_dir / "message.md")
+            safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED, repo_dir / "shared")
+            safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive")
         except Exception:
             pass
         updated.append(a["name"])
@@ -4569,18 +5827,195 @@ def notify_pm_new_agent(root: Path, state: Dict[str, Any], agent: Dict[str, Any]
         pass
 
 
+def notify_pm_agent_removed(root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, purged: bool) -> None:
+    """
+    Inform the PM that an agent was removed so roster/tickets stay aligned.
+    """
+    if not any(a["name"] == "pm" for a in state["agents"]):
+        return
+    subject = f"Agent removed: {agent.get('name','(unknown)')}"
+    note = "purged from disk" if purged else "archived under agents/_removed and mail/_removed"
+    lines = [
+        f"Agent **{agent.get('name','')}** ({agent.get('title','') or agent.get('role','agent')}) was removed ({note}).",
+        "Tickets assigned to this agent were unassigned; reassign or close as needed.",
+    ]
+    body = "\n".join(lines)
+    try:
+        write_message(
+            root,
+            state,
+            sender="cteam",
+            recipient="pm",
+            subject=subject,
+            body=body,
+            msg_type="MESSAGE",
+            task=None,
+            nudge=True,
+            start_if_needed=True,
+        )
+    except Exception:
+        pass
+
+
+def add_agent_to_workspace(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    role: str,
+    name: Optional[str] = None,
+    title: Optional[str] = None,
+    persona: Optional[str] = None,
+    start_codex: bool = False,
+    no_tmux: bool = False,
+) -> Dict[str, Any]:
+    """Internal helper to add an agent (used by CLI and router approvals)."""
+    if role == "project_manager" or (name and name.strip().lower() == "pm"):
+        raise CTeamError("cannot add another project manager; workspace already has a PM")
+
+    existing = {a["name"] for a in state["agents"]}
+    if not name:
+        if role == "developer":
+            i = 1
+            while f"dev{i}" in existing:
+                i += 1
+            name = f"dev{i}"
+        elif role == "tester":
+            i = 1
+            while f"test{i}" in existing:
+                i += 1
+            name = f"test{i}"
+        elif role == "researcher":
+            i = 1
+            while f"res{i}" in existing:
+                i += 1
+            name = f"res{i}"
+        elif role == "architect":
+            i = 1
+            while f"arch{i}" in existing:
+                i += 1
+            name = f"arch{i}"
+        else:
+            base = (role or "agent")[:4]
+            i = 1
+            while f"{base}{i}" in existing:
+                i += 1
+            name = f"{base}{i}"
+
+    if name in existing:
+        raise CTeamError(f"agent already exists: {name}")
+
+    title = title or role.replace("_", " ").title()
+    agent = {
+        "name": name,
+        "role": role,
+        "title": title,
+        "persona": persona or role_persona(role),
+        "dir_rel": f"{DIR_AGENTS}/{name}",
+        "repo_dir_rel": f"{DIR_AGENTS}/{name}/proj",
+    }
+    state["agents"].append(agent)
+    compute_agent_abspaths(state)
+    save_state(root, state)
+
+    ensure_shared_scaffold(root, state)
+    create_agent_dirs(root, state, agent)
+    update_roster(root, state)
+    save_state(root, state)
+
+    if not no_tmux:
+        ensure_tmux_session(root, state)
+        cmd_args = standby_window_command(root, state, agent)
+        tmux_new_window(state["tmux"]["session"], name, Path(agent["dir_abs"]), command_args=cmd_args)
+        if start_codex:
+            start_codex_in_window(root, state, agent, boot=False)
+
+    notify_pm_new_agent(root, state, agent)
+    return agent
+
+
 def cmd_add_agent(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
         raise CTeamError("could not find cteam.json in this directory or its parents")
     state = load_state(root)
 
+    interactive = sys.stdout.isatty() and sys.stdin.isatty()
+
+    def _prompt_choice(prompt: str, options: List[str], default_idx: int = 0) -> str:
+        if not options:
+            return ""
+        for i, opt in enumerate(options, 1):
+            print(f"{i}) {opt}")
+        raw = input(f"{prompt} [{default_idx+1}]: ").strip()
+        if not raw:
+            return options[default_idx]
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(options):
+                return options[idx]
+        except Exception:
+            pass
+        return options[default_idx]
+
+    def _prompt_text(prompt: str, default: str = "") -> str:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        return raw or default
+
+    def _prompt_yes_no(prompt: str, default: bool = True) -> bool:
+        suffix = "Y/n" if default else "y/N"
+        raw = input(f"{prompt} ({suffix}): ").strip().lower()
+        if not raw:
+            return default
+        return raw in {"y", "yes"}
+
     role = args.role
     if role == "project_manager" or (args.name and args.name.strip().lower() == "pm"):
         raise CTeamError("cannot add another project manager; workspace already has a PM")
-    name = args.name
+    existing = {a["name"] for a in state["agents"]}
+
+    # Interactive Q/A when running in a TTY.
+    if interactive:
+        roles = ["developer", "tester", "researcher", "architect"]
+        if role not in roles:
+            role = "developer"
+        role = _prompt_choice("Role", roles, roles.index(role))
+
+        def _default_name_for(role_val: str) -> str:
+            if role_val == "developer":
+                i = 1
+                while f"dev{i}" in existing:
+                    i += 1
+                return f"dev{i}"
+            base = role_val
+            if base not in existing:
+                return base
+            i = 2
+            while f"{base}{i}" in existing:
+                i += 1
+            return f"{base}{i}"
+
+        name_default = args.name or _default_name_for(role)
+        name = _prompt_text("Agent name", name_default)
+        title_default = args.title or role.replace("_", " ").title()
+        title = _prompt_text("Title", title_default)
+        persona_default = args.persona or role_persona(role)
+        persona = _prompt_text("Persona (optional)", persona_default)
+
+        tmux_running = tmux_has_session(state["tmux"]["session"])
+        create_window_default = (not args.no_tmux) and tmux_running
+        if not tmux_running:
+            print("(tmux session not running; will skip window creation regardless of choice)")
+            create_window_default = False
+        no_tmux = not _prompt_yes_no("Create tmux window now?", create_window_default)
+        start_codex = _prompt_yes_no("Start codex immediately?", args.start_codex)
+    else:
+        name = args.name
+        title = args.title
+        persona = args.persona
+        no_tmux = args.no_tmux
+        start_codex = args.start_codex
+
     if not name:
-        existing = {a["name"] for a in state["agents"]}
         if role == "developer":
             i = 1
             while f"dev{i}" in existing:
@@ -4599,12 +6034,12 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
     if any(a["name"] == name for a in state["agents"]):
         raise CTeamError(f"agent already exists: {name}")
 
-    title = args.title or role.replace("_", " ").title()
+    title = title or role.replace("_", " ").title()
     agent = {
         "name": name,
         "role": role,
         "title": title,
-        "persona": args.persona or role_persona(role),
+        "persona": persona or role_persona(role),
         "dir_rel": f"{DIR_AGENTS}/{name}",
         "repo_dir_rel": f"{DIR_AGENTS}/{name}/proj",
     }
@@ -4617,12 +6052,12 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
     update_roster(root, state)
     save_state(root, state)
 
-    if not args.no_tmux:
-        ensure_tmux_session(root, state)
-        cmd_args = standby_window_command(root, state, agent)
-        tmux_new_window(state["tmux"]["session"], name, Path(agent["dir_abs"]), command_args=cmd_args)
-        if args.start_codex:
-            start_codex_in_window(root, state, agent, boot=False)
+    if not no_tmux:
+        if tmux_has_session(state["tmux"]["session"]):
+            cmd_args = standby_window_command(root, state, agent)
+            tmux_new_window(state["tmux"]["session"], name, Path(agent["dir_abs"]), command_args=cmd_args)
+            if start_codex:
+                start_codex_in_window(root, state, agent, boot=False)
 
     notify_pm_new_agent(root, state, agent)
     print(f"added agent: {name} ({title}) role={role}")
@@ -4642,16 +6077,31 @@ def cmd_remove_agent(args: argparse.Namespace) -> None:
     if not agent:
         raise CTeamError(f"agent not found: {name}")
 
-    # Best-effort cleanup before state mutation.
-    _kill_agent_window_if_present(state, name)
-    _archive_or_remove_agent_dirs(root, agent, purge=args.purge)
-    _unassign_tickets_for_agent(root, state, name)
+    # Best-effort cleanup before state mutation; do not abort on errors.
+    try:
+        if tmux_has_session(state["tmux"]["session"]):
+            _kill_agent_window_if_present(state, name)
+    except Exception:
+        pass
+    try:
+        _archive_or_remove_agent_dirs(root, agent, purge=args.purge)
+    except Exception:
+        pass
+    try:
+        _unassign_tickets_for_agent(root, state, name)
+    except Exception:
+        pass
     _nudge_history.pop(name, None)
 
     state["agents"] = [a for a in state["agents"] if a["name"] != name]
     compute_agent_abspaths(state)
     update_roster(root, state)
     save_state(root, state)
+
+    try:
+        notify_pm_agent_removed(root, state, agent, purged=args.purge)
+    except Exception:
+        pass
 
     print(f"removed agent: {name}")
 
@@ -4818,6 +6268,11 @@ COMMAND_NAMES = [
     "telegram-configure",
     "telegram-enable",
     "telegram-disable",
+    "dashboard",
+    "capture",
+    "request-agent",
+    "stage",
+    "autodispatch",
 ]
 
 
@@ -4961,6 +6416,35 @@ def build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="Show workspace + agent status.")
     p_status.set_defaults(func=cmd_status)
 
+
+    p_dashboard = sub.add_parser("dashboard", help="Show the live status board (written by the router).")
+    p_dashboard.add_argument("--json", action="store_true", help="print JSON")
+    p_dashboard.add_argument("--fresh", action="store_true", help="compute a best-effort snapshot (ignores router cache)")
+    p_dashboard.set_defaults(func=cmd_dashboard)
+
+    p_capture = sub.add_parser("capture", help="Capture the last N lines of an agent\'s tmux pane.")
+    p_capture.add_argument("agent", help="tmux window name (agent)")
+    p_capture.add_argument("--lines", type=int, default=200, help="number of lines to capture")
+    p_capture.add_argument("--to", help="optional recipient to send capture to (pm|customer|agent)")
+    p_capture.set_defaults(func=cmd_capture)
+
+    p_request_agent = sub.add_parser("request-agent", help="Request spawning a new agent (customer must approve via /approve TOKEN).")
+    p_request_agent.add_argument("--role", required=True, choices=AGENT_ROLES, help="agent role")
+    p_request_agent.add_argument("--name", help="optional explicit agent name")
+    p_request_agent.add_argument("--title", help="optional title label")
+    p_request_agent.add_argument("--persona", help="optional persona override")
+    p_request_agent.add_argument("--start-codex", dest="start_codex", action="store_true", default=True, help="start codex immediately upon approval (default)")
+    p_request_agent.add_argument("--no-start-codex", dest="start_codex", action="store_false", help="do NOT start codex automatically")
+    p_request_agent.add_argument("--reason", required=True, help="why you need this new agent")
+    p_request_agent.set_defaults(func=cmd_request_agent)
+
+    p_stage = sub.add_parser("stage", help="Set the coordination stage (discovery|planning|execution).")
+    p_stage.add_argument("stage", choices=["discovery", "planning", "execution"])
+    p_stage.set_defaults(func=cmd_stage)
+
+    p_autod = sub.add_parser("autodispatch", help="Toggle router auto-dispatch (on/off).")
+    p_autod.add_argument("mode", choices=["on", "off"])
+    p_autod.set_defaults(func=cmd_autodispatch)
     p_sync = sub.add_parser("sync", help="Fetch/pull and show git statuses.")
     p_sync.add_argument("--all", action="store_true", help="Also show agent repo statuses.")
     p_sync.add_argument("--agent", help="Limit to specific agent(s) with --all.")
