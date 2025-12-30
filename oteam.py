@@ -1591,6 +1591,13 @@ def render_protocol_md() -> str:
           - `Ticket: Txxx` (whenever applicable)
         - Non-PM agents **must not** start implementation without an assignment.
 
+        **Read `shared/MESSAGING_GUIDE.md` for detailed instructions on:**
+        - How to read your mail
+        - How to send messages (`oteam msg`)
+        - How to send assignments (`oteam assign`)
+        - How to manage tickets (`oteam tickets`)
+        - Common workflow patterns with examples
+
         If you are unassigned:
         - Check `shared/STATUS_BOARD.md`, `shared/BRIEF.md`, and the ticket queue.
         - Propose 1–3 next tickets or improvements to PM (short + actionable).
@@ -1830,7 +1837,6 @@ def render_agent_status_template(agent: Dict[str, Any]) -> str:
 def render_agent_agents_md(
     agent_or_state: Dict[str, Any], agent: Optional[Dict[str, Any]] = None
 ) -> str:
-    # Accepts either (agent) or (state, agent) for convenience/backcompat.
     if agent is None:
         agent = agent_or_state
     header = f"""# Agent: {agent["name"]}
@@ -1844,86 +1850,204 @@ You are part of a multi-agent developer team. The PM coordinates. You execute as
 This repo is structured for **models**:
 - Shared memory is in `shared/`
 - Your private workspace is `agents/{{agent["name"]}}/`
-- Messages arrive in `shared/mail/{{agent["name"]}}/inbox/` and `shared/mail/{{agent["name"]}}/message.md`
+- Messages arrive in `shared/mail/{{agent["name"]}}/message.md` and `shared/mail/{{agent["name"]}}/inbox/`
 
 ## Start here (always)
 1) Read `shared/PROTOCOL.md`
 2) Read `shared/BRIEF.md` (this is the living memory / current truth)
-3) Check your inbox for the latest assignment
+3) Check your inbox for the latest assignment: `less shared/mail/{{agent["name"]}}/message.md`
 
-## Rules of engagement
-- **Do not start implementation** unless you have an assignment (`Type: {{ASSIGNMENT_TYPE}}`) or a clear PM directive.
-- If you think the customer already answered something, **verify**:
-  - search `shared/MESSAGES.log.md` and `shared/mail/customer/message.md`
-  - check `shared/BRIEF.md`
-- When unsure, ask **one compact message** to PM with:
-  - what you tried
-  - what you found
-  - the single question you need answered
+## CRITICAL: Communication is mandatory
+**You MUST communicate through the oteam messaging system, NOT by editing files directly!**
+
+The messaging system is how the team stays coordinated:
+- PM knows what you're working on
+- Customer gets responses
+- Everyone knows ticket status
+- History is preserved
+
+**If you edit shared files directly without messaging, you break team coordination!**
+
+## How to check your mail
+
+```bash
+# View your main mailbox (all messages)
+less shared/mail/{{agent["name"]}}/message.md
+
+# View new inbox items
+ls shared/mail/{{agent["name"]}}/inbox/
+less shared/mail/{{agent["name"]}}/inbox/<file>
+```
+
+When you see a message:
+- Read the **Subject** and **Type**
+- For `ASSIGNMENT`: you MUST work on this ticket
+- For `MESSAGE`: respond as needed
+- Check if a **Ticket** is linked
+
+## How to send a message to PM
+
+Use `oteam msg` to communicate with PM:
+
+```bash
+# Report progress on a ticket
+oteam msg {{agent["name"]}} pm --subject "T001 progress" --body "Completed feature X. Running tests now. Next: implement Y."
+
+# Ask a question (be specific!)
+oteam msg {{agent["name"]}} pm --subject "Question about T002" --body "I found issue Z in file foo.py. Should I: (A) fix it, or (B) create a new ticket?"
+
+# Report a blocker
+oteam msg {{agent["name"]}} pm --subject "T003 blocked" --body "Blocked on: waiting for API response. Proposed solution: add timeout handling."
+
+# Send a short status update
+oteam msg {{agent["name"]}} pm --subject "Status update" --body "Working on T004. Expect completion by next turn."
+```
+
+**Key fields:**
+- `--to` = recipient (pm, customer, or another agent)
+- `--from` = your name (auto-filled as pm)
+- `--subject` = brief summary
+- `--body` = detailed message (use `--file` for long messages)
+- `--ticket` = link to a ticket (optional)
+
+## How to send an ASSIGNMENT (for PM and oteam only)
+
+Assignments are for giving work to agents. Use `oteam assign`:
+
+```bash
+# Assign existing ticket
+oteam assign --ticket T001 --to dev1 "Implement the feature as discussed"
+
+# Auto-create ticket and assign
+oteam assign --to dev1 --title "Fix bug in X" --desc "When user does Y, Z happens. Should be Q." "Implement and test this fix"
+```
+
+Assignments **start** work. You then report back with `oteam msg`.
+
+## How to use tickets (CRITICAL)
+
+**NEVER edit `shared/TICKETS.json` directly!** The file has locking that direct edits will break.
+
+All ticket operations through `oteam tickets`:
+
+```bash
+# List all open tickets
+oteam tickets list
+
+# Show specific ticket
+oteam tickets show T001
+
+# Create a ticket (PM only, or auto-created by assign)
+oteam tickets create --title "Feature request" --desc "Detailed description" --assignee dev1
+
+# Assign/reassign
+oteam tickets assign T001 dev1 --note "Taking from dev2"
+
+# Block a ticket
+oteam tickets block T001 --on "waiting for API" --note "Blocked by external dependency"
+
+# Reopen a ticket
+oteam tickets reopen T001 --note "Work can continue"
+
+# Close a ticket
+oteam tickets close T001 --note "Completed and merged"
+```
+
+### Ticket workflow
+
+```
+PM creates ticket → Assigns to agent → Agent works → Agent reports → PM reviews → PM closes
+```
+
+**When YOU create a ticket (unassigned):**
+1. `oteam tickets create --title "..." --desc "..."` 
+2. Propose to PM: `oteam msg <you> pm --subject "New ticket T005" --body "Can you review and assign?"`
+
+**When YOU are assigned:**
+1. Acknowledge: `oteam msg <you> pm --subject "T001 received" --body "Starting work, expect update by..."`
+2. Work on it
+3. Report progress: `oteam msg <you> pm --subject "T001 progress" --body "..."`
 
 ## CRITICAL: Customer communication priority
-**Customer messages are TOP PRIORITY - they must be replied to immediately!**
-- When you receive a nudge with "CUSTOMER" in the reason, drop everything and reply to the customer FIRST
-- Check `shared/mail/pm/inbox/` for messages from "customer"
-- Reply to customer using: `oteam msg pm customer --subject "..." --body "..."`
-- Do NOT leave customer messages unanswered - this is your primary responsibility
-- Even unclear customer messages should get an acknowledgement like "I see your message, give me a moment to understand what you need"
+**Customer messages are TOP PRIORITY - reply immediately!**
 
-## Ticket management (CRITICAL)
-**NEVER edit `shared/TICKETS.json` directly!** The file has locking and consistency guarantees that direct edits will break.
-
-All ticket operations must go through `oteam tickets` subcommands:
-- `oteam tickets list` — show all open/blocked tickets
-- `oteam tickets show T001` — show ticket details
-- `oteam tickets create --title "..." --desc "..." --assignee dev1` — create a ticket
-- `oteam tickets assign T001 dev1 --note "..."` — assign/reassign
-- `oteam tickets block T001 --on "..." --note "..."` — mark blocked
-- `oteam tickets reopen T001` — reopen a closed ticket
-- `oteam tickets close T001 --note "..."` — close a ticket
-
-For assignments to yourself or others, use `oteam assign --ticket T001 <recipient> "work description"`.
+When you see a customer message:
+1. Check `shared/mail/pm/inbox/` for customer messages
+2. Reply using: `oteam msg <you> pm --subject "Re: ..." --body "..."` (PM forwards to customer)
+3. Do NOT leave customer messages unanswered
 
 ## Work loop (when assigned a ticket)
-1) Acknowledge quickly to PM: what you will do next.
-2) Create a branch in your repo clone: `agents/{{agent["name"]}}/proj`
-3) Implement the change.
-4) Run tests / reproduce bug fix.
-5) Update your `agents/{{agent["name"]}}/STATUS.md`:
-   - ticket id
-   - last action
-   - next step
-   - blockers (if any)
-6) Report back to PM with:
-   - what changed (files/areas)
-   - commands you ran
-   - results (tests, repro, benchmarks)
-   - follow-ups / risks
+
+1) **Acknowledge immediately** - let PM know you received it
+2) **Create branch**: `cd agents/{{agent["name"]}}/proj && git checkout -b agent/{{agent["name"]}}/T001`
+3) **Implement** the change
+4. **Run tests** / verify the fix
+5. **Update STATUS.md**:
+   ```markdown
+   - Ticket: T001
+   - Last action: Implemented feature X
+   - Next step: Write tests
+   - Blockers: None
+   ```
+6. **Report to PM**:
+   - What changed (files/areas)
+   - Commands you ran
+   - Results (tests, repro)
+   - Follow-ups / risks
 
 ## If you are blocked
-- Mark the ticket `blocked` using `oteam tickets block T001 --on "reason"`.
-- Message PM with the exact blocker and at least one proposed option.
+
+1. **Block the ticket**: `oteam tickets block T001 --on "reason"`
+2. **Message PM**: `oteam msg <you> pm --subject "T001 blocked" --body "Blocked on X. Options: A, B, C. Recommend A."`
 
 ## If you are unassigned / idle
-- Check `shared/STATUS_BOARD.md` (or `oteam dashboard`) for what is idle/unassigned.
-- Skim open tickets with `oteam tickets list`.
-- Propose 1–3 concrete next tickets to PM (small, testable units).
-- Do **not** idle silently.
 
-## Useful commands
-- Send a message: `oteam msg <sender> <recipient> --subject "..." --body "..." [--type MESSAGE|ASSIGNMENT] [--ticket T001]`
-- Show live board: `oteam dashboard`
-- Capture tmux output: `oteam capture <agent> --lines 200 --to pm`
-- Ticket summary: `oteam tickets list`
+1. Check `oteam dashboard` for idle/unassigned work
+2. `oteam tickets list` to see open tickets
+3. Propose work to PM: `oteam msg <you> pm --subject "Next steps" --body "I see T002 is open. I can work on it."`
+4. **Do NOT idly modify files - communicate!**
+
+## Useful commands reference
+
+```bash
+# Messaging
+oteam msg --to pm --subject "..." --body "..."              # Send message
+oteam assign --ticket T001 --to dev1 "work description"     # Assign ticket
+oteam broadcast --subject "..." --body "..."                # Message all agents
+
+# Tickets
+oteam tickets list                                          # Show open tickets
+oteam tickets show T001                                     # Show ticket details
+oteam tickets create --title "..." --desc "..." --assignee dev1
+oteam tickets assign T001 dev1 --note "..."
+oteam tickets block T001 --on "reason" --note "..."
+oteam tickets reopen T001 --note "..."
+oteam tickets close T001 --note "..."
+
+# Workspace
+oteam dashboard                                             # Live status board
+oteam capture <agent> --lines 200 --to pm                   # Send tmux output to PM
+oteam update-workdir                                        # Refresh AGENTS.md files
+```
 
 ## Router supervision nudges
+
 The router may nudge you when:
 - you are idle without a ticket
 - you are stalled on an assigned ticket
-- **customer is waiting for a reply** (THIS IS URGENT - reply immediately)
+- **customer is waiting for a reply** (THIS IS URGENT)
 
-When nudged, immediately:
-1) If customer-related: reply to customer FIRST, then continue other work
-2) Otherwise: update `STATUS.md` and continue work or report the blocker to PM
+When nudged:
+1. If customer-related: reply to customer FIRST
+2. Otherwise: update STATUS.md and continue or report blocker
+
+## Remember
+
+- **Communicate through `oteam msg` and `oteam assign`**
+- **Track all work through tickets**
+- **Don't edit shared files directly**
+- **Reply to customer messages immediately**
+- **Keep PM informed of progress and blockers**
 
 """
 
@@ -2024,6 +2148,7 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> bool:
         "TIMELINE.md": render_timeline_template(),
         "MESSAGES.log.md": "# Message log (append-only)\n\n",
         "ASSIGNMENTS.log.md": "# Assignments log (append-only)\n\n",
+        "MESSAGING_GUIDE.md": render_messaging_guide(),
     }
     for name, content in shared_files.items():
         p = root / DIR_SHARED / name
@@ -6011,6 +6136,156 @@ def cmd_seed_sync(args: argparse.Namespace) -> None:
     print("seed synced")
 
 
+def render_messaging_guide() -> str:
+    return textwrap.dedent(
+        """\
+        # oteam Messaging & Ticketing Guide
+
+        This guide explains how to communicate effectively using the oteam messaging system.
+
+        ## Core Principles
+
+        1. **All communication goes through the messaging system**
+        2. **All work is tracked through tickets**
+        3. **PM coordinates; agents execute**
+        4. **Customer messages are top priority**
+
+        ## Quick Reference
+
+        ### Sending Messages
+
+        ```bash
+        # To PM
+        oteam msg --to pm --subject "Subject" --body "Message"
+
+        # To another agent
+        oteam msg --from dev1 --to dev2 --subject "Question" --body "..."
+
+        # Long message from file
+        oteam msg --to pm --subject "Update" --file /path/to/message.txt
+        ```
+
+        ### Sending Assignments (PM only)
+
+        ```bash
+        # Assign existing ticket
+        oteam assign --ticket T001 --to dev1 "Work description"
+
+        # Auto-create ticket and assign
+        oteam assign --to dev1 --title "Title" --desc "Description" "Work description"
+        ```
+
+        ### Ticket Management
+
+        ```bash
+        oteam tickets list              # Show open tickets
+        oteam tickets show T001         # Show ticket details
+        oteam tickets create --title "..." --desc "..." --assignee dev1
+        oteam tickets assign T001 dev1 --note "..."
+        oteam tickets block T001 --on "reason" --note "..."
+        oteam tickets reopen T001
+        oteam tickets close T001 --note "..."
+        ```
+
+        ## Message Types
+
+        ### MESSAGE
+        - General communication
+        - Questions, updates, reports
+        - Does NOT require action
+
+        ### ASSIGNMENT
+        - Work assignment from PM
+        - MUST be acted upon
+        - Links to a ticket
+
+        ## Workflow Patterns
+
+        ### Pattern 1: Receiving an Assignment
+        ```
+        1. You see assignment in message.md
+        2. Reply: oteam msg --to pm --subject "T001 received" --body "Starting now..."
+        3. Work on the ticket
+        4. Update STATUS.md
+        5. Report: oteam msg --to pm --subject "T001 done" --body "Completed X, Y, Z"
+        ```
+
+        ### Pattern 2: Asking a Question
+        ```
+        1. oteam msg --to pm --subject "Question about T002" --body "Issue: X. Options: A, B. Recommend A."
+        2. Wait for PM response
+        3. Act on the answer
+        ```
+
+        ### Pattern 3: Reporting a Blocker
+        ```
+        1. oteam tickets block T001 --on "waiting for API" --note "Details..."
+        2. oteam msg --to pm --subject "T001 blocked" --body "Blocked on X. Proposed solution: Y."
+        ```
+
+        ### Pattern 4: Proposing New Work (when unassigned)
+        ```
+        1. oteam tickets list (see open tickets)
+        2. oteam msg --to pm --subject "Next steps" --body "T003 looks ready. I can work on it."
+        3. Wait for PM assignment
+        ```
+
+        ## Reading Your Mail
+
+        ```bash
+        # Main mailbox (all messages)
+        less shared/mail/<agent>/message.md
+
+        # Inbox (new items)
+        ls shared/mail/<agent>/inbox/
+        less shared/mail/<agent>/inbox/<file>
+        ```
+
+        Look for:
+        - **Type:** ASSIGNMENT (act!) or MESSAGE (respond if needed)
+        - **Ticket:** Linked ticket ID
+        - **Subject:** Summary
+        - **Body:** Details
+
+        ## Customer Communication
+
+        **CRITICAL: Customer messages are top priority!**
+
+        When customer messages PM:
+        1. PM notifies team
+        2. Reply: oteam msg --to pm --subject "Customer reply" --body "Response to customer..."
+        3. PM forwards to customer
+
+        Never leave customer messages unanswered.
+
+        ## Common Mistakes to Avoid
+
+        ❌ **Don't** edit shared files directly without messaging
+        ❌ **Don't** work without a ticket assignment
+        ❌ **Don't** leave customer messages unanswered
+        ❌ **Don't** skip STATUS.md updates
+        ❌ **Don't** make up your own workflow - communicate!
+
+        ## Best Practices
+
+        1. Check mail at the start of every turn
+        2. Update STATUS.md after every significant action
+        3. Report progress even when not finished
+        4. Ask questions early (one compact message)
+        5. Block tickets when waiting on something
+        6. Close tickets when done
+
+        ## For PMs
+
+        - Assign tickets with clear scope
+        - Respond to all agent questions promptly
+        - Keep customer updated
+        - Review and close completed tickets
+
+        """
+    )
+
+
 def cmd_update_workdir(args: argparse.Namespace) -> None:
     root = find_project_root(Path(args.workdir))
     if not root:
@@ -6021,6 +6296,11 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
     install_self_into_root(root)
     ensure_agents_created(root, state)
     sync_oteam_into_agents(root, state)
+
+    if args.guide:
+        guide_path = root / DIR_SHARED / "MESSAGING_GUIDE.md"
+        atomic_write_text(guide_path, render_messaging_guide())
+        print(f"wrote messaging guide to: {guide_path}")
 
     updated: List[str] = []
     for a in state["agents"]:
@@ -7270,6 +7550,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_update = sub.add_parser(
         "update-workdir",
         help="Refresh agent AGENTS.md files from current oteam templates.",
+    )
+    p_update.add_argument(
+        "--guide",
+        action="store_true",
+        help="Also write MESSAGING_GUIDE.md to shared/ folder.",
     )
     p_update.set_defaults(func=cmd_update_workdir)
 
