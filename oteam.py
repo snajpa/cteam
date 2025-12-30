@@ -1501,6 +1501,8 @@ def load_state(root: Path) -> Dict[str, Any]:
     state["root_abs"] = str(root.resolve())
     state = upgrade_state_if_needed(root, state)
     compute_agent_abspaths(state)
+    for a in state.get("agents", []):
+        a["name"] = a.get("name", "").strip()
     return state
 
 
@@ -5310,18 +5312,6 @@ def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_opencode: bool) -> 
     ensure_customer_window(root, state)
     ensure_agent_windows(root, state, launch_opencode=launch_opencode)
 
-    pm_agent = next((a for a in state["agents"] if a["name"] == "pm"), None)
-    pm_running = pm_agent and is_opencode_running(state, "pm")
-    print(
-        f"DEBUG: pm_agent={pm_agent is not None}, pm_running={pm_running}",
-        file=sys.stderr,
-    )
-    if pm_agent and launch_opencode and not pm_running:
-        print(f"DEBUG: Starting pm with start_opencode_in_window", file=sys.stderr)
-        start_opencode_in_window(root, state, pm_agent, boot=True)
-    else:
-        print(f"DEBUG: Skipping pm start (conditions not met)", file=sys.stderr)
-
 
 def ensure_agent_windows(
     root: Path, state: Dict[str, Any], *, launch_opencode: bool
@@ -5333,7 +5323,8 @@ def ensure_agent_windows(
         file=sys.stderr,
     )
 
-    for agent in state["agents"]:
+    agents = sorted(state["agents"], key=lambda a: (a["name"] != "pm", a["name"]))
+    for agent in agents:
         w = agent["name"]
         agent_dir = Path(agent["dir_abs"])
         if launch_opencode and w in auto:
@@ -5570,7 +5561,6 @@ def cmd_resume(args: argparse.Namespace) -> None:
         state["tmux"]["router"] = True
     save_state(root, state)
 
-    new_tickets = create_root_structure(root, state)
     if (
         not (root / DIR_PROJECT_BARE).exists()
         or not (root / DIR_PROJECT_BARE / "HEAD").exists()
@@ -5584,7 +5574,7 @@ def cmd_resume(args: argparse.Namespace) -> None:
     state["tmux"]["paused"] = False
     save_state(root, state)
 
-    if new_tickets and not (root / TICKET_MIGRATION_FLAG).exists():
+    if not (root / TICKET_MIGRATION_FLAG).exists():
         try:
             write_message(
                 root,
@@ -5609,11 +5599,25 @@ def cmd_resume(args: argparse.Namespace) -> None:
         print(f"Workspace ready at {root} (tmux disabled)")
         return
 
-    launch_opencode = not args.no_opencode and not state["tmux"].get("paused", False)
+    session = state["tmux"]["session"]
+    if tmux_has_session(session):
+        print(f"tmux session already running: {session}")
+        if not args.no_attach:
+            tmux_attach(session, window=args.window)
+        return
+
+    launch_opencode = not args.no_opencode
     ensure_tmux(root, state, launch_opencode=launch_opencode)
-    print(f"tmux session: {state['tmux']['session']}")
+    print(f"tmux session: {session}")
     if not args.no_attach:
-        tmux_attach(state["tmux"]["session"], window=args.window)
+        tmux_attach(session, window=args.window)
+        return
+
+    launch_opencode = not args.no_opencode
+    ensure_tmux(root, state, launch_opencode=launch_opencode)
+    print(f"tmux session: {session}")
+    if not args.no_attach:
+        tmux_attach(session, window=args.window)
 
 
 def cmd_open(args: argparse.Namespace) -> None:
