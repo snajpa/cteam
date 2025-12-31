@@ -68,6 +68,7 @@ TICKET_MIGRATION_FLAG = f"{DIR_RUNTIME}/tickets_migration_notified"
 
 _nudge_history: Dict[str, Tuple[float, Set[str]]] = {}
 _router_noise_until: Dict[str, float] = {}
+_nudge_backoff: Dict[str, Tuple[int, float]] = {}
 
 
 class OTeamError(RuntimeError):
@@ -1946,7 +1947,7 @@ When you see a customer message:
 
 1. **Acknowledge** the assignment
 2. **Create branch**: `cd agents/{name}/proj && git checkout -b agent/{name}/T001`
-3. **Implement** the change
+3. **Analyse** the problem, **devise** a solution, **plan** the steps, **implement** the change, **verify** it works
 4. **Run tests**
 5. **Update STATUS.md**:
    ```markdown
@@ -2023,7 +2024,7 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
             "2) Coordinate the team - assign work, unblock agents\n"
             "3) Update documentation - BRIEF, PLAN, tickets\n\n"
             "First: open message.md for any kickoff notes.\n"
-            "Then: infer what this codebase is for, write shared/GOALS.md + shared/PLAN.md.\n"
+            "Then: infer what this codebase is for, analyse, devise, plan, implement, verify solutions, write shared/GOALS.md + shared/PLAN.md.\n"
             "Track all work via `oteam tickets ...`. Assign with `oteam assign --ticket ...`.\n"
             "Start now. "
             f"{path_hint}"
@@ -2035,7 +2036,7 @@ def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
         "2) Coordinate the team - assign work, unblock agents\n"
         "3) Update documentation - BRIEF, PLAN, tickets\n\n"
         "First: open message.md for any kickoff notes.\n"
-        "Then: read seed/ and write shared/GOALS.md + shared/PLAN.md.\n"
+        "Then: read seed/ and analyse, devise, plan, implement, verify solutions, write shared/GOALS.md + shared/PLAN.md.\n"
         "Track work via `oteam tickets ...`. Assign with `oteam assign --ticket ...`.\n"
         "Start now. "
         f"{path_hint}"
@@ -2046,7 +2047,7 @@ def prompt_on_mail(agent_name: str) -> str:
     return (
         f"MAILBOX UPDATED for {agent_name}. Check message.md with: `less shared/mail/{agent_name}/message.md`. "
         'Use `oteam msg --to pm --subject "..." --body "..."` to communicate. '
-        "If it's an assignment, execute it and update STATUS.md. "
+        "If it's an assignment, analyse, devise, plan, implement, verify the solution, and update STATUS.md. "
         "If unclear, ask PM a precise question via oteam msg."
     )
 
@@ -2840,6 +2841,7 @@ def start_opencode_in_window(
                 first_prompt = (
                     f"You are {agent['title']} ({agent['name']}). Imported project; wait for ticketed assignments. "
                     f"Read AGENTS.md first - it explains how to communicate with PM using `oteam msg`. "
+                    f"When assigned, analyse, devise, plan, implement, verify the solution. "
                     f"Do NOT change code without a ticket (Type: {ASSIGNMENT_TYPE}). "
                     f'To ask PM questions or propose work: `oteam msg --to pm --subject "..." --body "..."`. '
                     f"Tickets are managed via `oteam tickets ...`. oteam.py: {state.get('root_abs', '')}/oteam.py"
@@ -2848,6 +2850,7 @@ def start_opencode_in_window(
                 first_prompt = (
                     f"You are {agent['title']} ({agent['name']}). "
                     f"Read AGENTS.md first - it explains how to communicate using `oteam msg`. "
+                    f"When assigned, analyse, devise, plan, implement, verify the solution. "
                     f"If you do not have an assignment (Type: {ASSIGNMENT_TYPE}), do NOT start coding. "
                     f'To communicate with PM: `oteam msg --to pm --subject "..." --body "..."`. '
                     f"oteam.py: {state.get('root_abs', '')}/oteam.py"
@@ -2858,7 +2861,7 @@ def start_opencode_in_window(
     print(f"DEBUG: start_opencode_in_window for {w}, boot={boot}", file=sys.stderr)
 
     wait_for_pane_command(session, w, "opencode", timeout=8.0)
-    wait_for_pane_quiet(session, w, quiet_for=2.0, timeout=8.0)
+    wait_for_pane_quiet(session, w, quiet_for=5.0, timeout=8.0)
     if w not in set(tmux_list_windows(session)):
         raise OTeamError(f"tmux window {w} no longer exists before send-keys")
 
@@ -2934,12 +2937,12 @@ def nudge_agent(
         if agent_name == "pm":
             msg = f"INTERRUPT — {reason}\n\nAction required: check message.md and reply to customer/agents as needed."
         else:
-            msg = f"INTERRUPT — {reason}\n\nAction: check message.md, do the next concrete task, reply to PM if needed, update STATUS.md."
+            msg = f"INTERRUPT — {reason}\n\nAction: check message.md, analyse the problem, devise a solution, plan the steps, implement the change, verify it works, reply to PM if needed, update STATUS.md."
     else:
         if agent_name == "pm":
             msg = f"{reason}\n\nCheck message.md now. Reply to waiting customer, then handle other pending work."
         else:
-            msg = f"{reason}\n\nCheck message.md now. Do the next concrete task, send PM status, update STATUS.md."
+            msg = f"{reason}\n\nCheck message.md now. Analyse, devise, plan, implement, verify the solution, send PM status, update STATUS.md."
     try:
         if interrupt:
             try:
@@ -2951,14 +2954,14 @@ def nudge_agent(
         ok = False
         if is_opencode_running(state, agent_name):
             wait_success = wait_for_pane_quiet(
-                session, agent_name, quiet_for=2.0, timeout=30.0
+                session, agent_name, quiet_for=5.0, timeout=30.0
             )
             if not wait_success:
                 return False
             ok = tmux_send_line(session, agent_name, msg)
         else:
             ok = tmux_send_line_when_quiet(
-                session, agent_name, f"echo {shlex.quote(msg)}"
+                session, agent_name, f"echo {shlex.quote(msg)}", quiet_for=5.0
             )
         if ok:
             _nudge_history[agent_name] = (
@@ -2974,7 +2977,7 @@ class NudgeQueue:
     """Batch and deduplicate nudges before sending to tmux windows; defers until pane idle."""
 
     def __init__(
-        self, root: Path, *, min_interval: float = 2.0, idle_for: float = 1.0
+        self, root: Path, *, min_interval: float = 2.0, idle_for: float = 5.0
     ) -> None:
         self.root = root
         self.min_interval = max(0.0, float(min_interval))
@@ -3015,12 +3018,28 @@ class NudgeQueue:
         # Second pass: process only idle agents
         for agent_name in list(self.pending.keys()):
             if agent_name in busy_agents:
-                # Agent is busy - skip and keep in queue for next cycle
+                # Agent is busy - update backoff state and skip
+                backoff_count, backoff_until = _nudge_backoff.get(agent_name, (0, 0.0))
+                if now < backoff_until:
+                    # Still in backoff period, skip entirely
+                    entry = self.pending.get(agent_name, {})
+                    reasons = entry.get("reasons") or []
+                    reason_text = " / ".join(reasons) if reasons else "NUDGE"
+                    results.append((agent_name, False, reason_text, "busy"))
+                    continue
+                # Increment backoff: exponential increase (30s, 60s, 120s, etc.)
+                new_backoff_count = backoff_count + 1
+                backoff_seconds = min(30 * (2 ** (new_backoff_count - 1)), 300)
+                _nudge_backoff[agent_name] = (new_backoff_count, now + backoff_seconds)
                 entry = self.pending.get(agent_name, {})
                 reasons = entry.get("reasons") or []
                 reason_text = " / ".join(reasons) if reasons else "NUDGE"
                 results.append((agent_name, False, reason_text, "busy"))
                 continue
+
+            # Reset backoff when agent becomes idle
+            if agent_name in _nudge_backoff:
+                del _nudge_backoff[agent_name]
 
             entry = self.pending.pop(agent_name, {})
             reasons = entry.get("reasons") or []
@@ -4864,7 +4883,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         last_agent_stall_nudge[name] = time.time()
                         nudge_queue.request(
                             name,
-                            reason=f"STALLED — tickets {','.join(assigned)}. Deliver the next concrete step now; if blocked, mark ticket blocked and tell PM immediately.",
+                            reason=f"STALLED — tickets {','.join(assigned)}. Analyse the problem, devise a solution, plan the steps, implement the change, verify it works. Deliver the next concrete step now; if blocked, mark ticket blocked and tell PM immediately.",
                             interrupt=True,
                         )
                 else:
@@ -4879,7 +4898,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         last_agent_unassigned_nudge[name] = time.time()
                         nudge_queue.request(
                             name,
-                            reason="NO WORK IN PROGRESS — pick a ready ticket or propose 1–2 concrete tasks to PM now.",
+                            reason="NO WORK IN PROGRESS — analyse ready tickets, devise solutions, propose 1–2 concrete tasks to PM now.",
                             interrupt=True,
                         )
         except Exception:
@@ -4913,7 +4932,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     body = (
                         "You still own these tickets:\n"
                         + "\n".join(f"- {tid}" for tid in sorted(assigned))
-                        + "\n\nPick one now, do the next concrete step, and send PM a brief status (result, next step, ETA). "
+                        + "\n\nPick one now, analyse it, devise a solution, plan the steps, implement the change, verify it works, and send PM a brief status (result, next step, ETA). "
                         "If blocked, mark the ticket blocked with the reason and tell PM immediately."
                     )
                     write_message(
@@ -5023,24 +5042,18 @@ def cmd_watch(args: argparse.Namespace) -> None:
         except Exception:
             pass
 
-        # PM-level idle: if everyone is idle, prompt PM to assign/dispatch.
+        # PM-level idle: nudge PM when PM is idle (regardless of team status)
         try:
             sup = state.get("supervision") or {}
             idle_s = float(sup.get("agent_idle_seconds", 120) or 120)
-            non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
-            if non_pm:
+            if not state["tmux"].get("paused", False):
                 pm_idle = (
                     time.time() - float(last_pane_change.get("pm", time.time()))
                 ) >= idle_s
-                team_idle = all(
-                    (time.time() - float(last_pane_change.get(n, time.time())))
-                    >= idle_s
-                    for n in non_pm
-                )
-                if pm_idle and team_idle and not state["tmux"].get("paused", False):
+                if pm_idle:
                     nudge_queue.request(
                         "pm",
-                        reason="TEAM IDLE — check STATUS_BOARD.md and assign next tickets",
+                        reason="PM IDLE — analyse what's pending, devise priorities, plan the next steps, assign tickets, unblock agents",
                     )
                     pm_idle_pending = True
         except Exception:
