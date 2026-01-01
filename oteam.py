@@ -1841,6 +1841,37 @@ def render_agent_agents_md(
     if agent is None:
         agent = agent_or_state
     name = agent["name"]
+
+    has_seed = False
+    seed_text = ""
+    if isinstance(agent_or_state, dict):
+        root_abs = agent_or_state.get("root_abs", "")
+        if root_abs:
+            seed_path = Path(root_abs) / DIR_SEED / "SEED.md"
+            has_seed = seed_path.exists()
+    if has_seed:
+        seed_text = f"""
+
+## CRITICAL: Do NOT ask questions - SEED.md has answers!
+
+**SEED.md exists** in `seed/SEED.md`. It contains comprehensive instructions, requirements, and constraints for this project.
+
+**DO NOT ask the customer questions until you have:**
+1. Thoroughly read and understood `seed/SEED.md`
+2. Checked `shared/PLAN.md` and `shared/GOALS.md` for context
+3. Reviewed existing tickets and documentation
+4. Made a genuine attempt to resolve the question yourself using available information
+
+**If SEED.md doesn't answer your question:**
+- Re-read SEED.md more carefully
+- Check shared/BRIEF.md for project context
+- Review active tickets for scope
+- Propose an answer yourself rather than asking
+
+Only ask the customer a question if SEED.md explicitly requires customer input or clarification on something outside the defined scope.
+
+"""
+
     header = f"""# Agent: {name}
 Role: {agent["role"]}
 Title: {agent.get("title", "")}
@@ -1852,6 +1883,8 @@ This repo is structured for models:
 - Shared memory: `shared/`
 - Your workspace: `agents/{name}/`
 - Messages: `shared/mail/{name}/message.md`
+
+{seed_text}
 
 ---
 
@@ -4049,6 +4082,27 @@ def cmd_watch(args: argparse.Namespace) -> None:
             "watch: could not find oteam.json in this directory or its parents"
         )
     state = load_state(root)
+
+    router_lock_path = root / DIR_RUNTIME / "router.lock"
+    mkdirp(router_lock_path.parent)
+    router_pid: Optional[int] = None
+    try:
+        existing = router_lock_path.read_text(encoding="utf-8").strip()
+        if existing:
+            router_pid = int(existing)
+    except Exception:
+        pass
+    if router_pid:
+        try:
+            os.kill(router_pid, 0)
+            raise OTeamError(
+                f"router already running (PID {router_pid}). "
+                f"Stop it first with `oteam <workdir> kill` or `kill {router_pid}`."
+            )
+        except (OSError, ProcessLookupError):
+            pass
+    router_lock_path.write_text(str(os.getpid()))
+
     agent_names = {a["name"] for a in state["agents"]}
     ensure_shared_scaffold(root, state)
     ensure_tmux_session(root, state)

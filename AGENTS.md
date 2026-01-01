@@ -78,6 +78,10 @@ Persistence model:
 ## CLI surfaces (python3 cteam.py …)
 ### Workspace lifecycle
 - `init`, `import --src <git|dir>`, `resume`, `open`, `attach`, `kill`, `pause`
+- `persistent` — configure tmux session persistence (systemd scope mode for crash-recovery)
+  - `oteam . persistent --status` — check current persistence status
+  - `oteam . persistent --enable` — enable persistent mode (survives SSH disconnects)
+  - `oteam . persistent --disable` — disable persistent mode
 
 ### Coordination
 - `msg`, `broadcast`, `assign` (Type=`ASSIGNMENT`, ticket-linked), `nudge`, `watch` (router loop)
@@ -104,7 +108,8 @@ Persistence model:
 - Codex posture flags:
   - `--codex-cmd/--model/--sandbox/--ask-for-approval/--full-auto/--yolo/--no-search`
 - Orchestration flags:
-  - `--autostart`, `--no-router`, `--no-codex`, `--no-tmux`
+  - `--autostart`, `--no-router`, `--no-codex`, `--no-tmux`, `--no-persistent`
+- Default: persistent mode is always enabled (tmux runs in systemd scope, survives SSH disconnects). Use `--no-persistent` to disable.
 - Default Codex posture is permissive (sandbox/approval) but capabilities are auto-detected; adjust defaults carefully.
 
 ## Init UX notes (interactive paste-friendly)

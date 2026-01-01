@@ -100,8 +100,10 @@ ROUTER_WINDOW = "router"
 DEFAULT_GIT_BRANCH = "main"
 
 DEFAULT_CODEX_CMD = "codex"
-DEFAULT_CODEX_SANDBOX = "danger-full-access"   # read-only | workspace-write | danger-full-access
-DEFAULT_CODEX_APPROVAL = "never"               # untrusted | on-failure | on-request | never
+DEFAULT_CODEX_SANDBOX = (
+    "danger-full-access"  # read-only | workspace-write | danger-full-access
+)
+DEFAULT_CODEX_APPROVAL = "never"  # untrusted | on-failure | on-request | never
 DEFAULT_CODEX_SEARCH = True
 
 DEFAULT_AUTOSTART = "all"  # pm | pm+architect | all
@@ -133,6 +135,7 @@ _nudge_history: Dict[str, Tuple[float, Set[str]]] = {}
 _router_noise_until: Dict[str, float] = {}
 _router_noise_until: Dict[str, float] = {}
 
+
 class CTeamError(RuntimeError):
     pass
 
@@ -140,6 +143,7 @@ class CTeamError(RuntimeError):
 # -----------------------------
 # Small utilities
 # -----------------------------
+
 
 def now_utc() -> _dt.datetime:
     return _dt.datetime.now(tz=_dt.timezone.utc)
@@ -154,14 +158,17 @@ def ts_for_filename(ts: str) -> str:
     safe = safe.replace("Z", "z").replace("T", "_")
     return safe
 
+
 def iso_to_unix(ts: str) -> float:
     try:
         return _dt.datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0.0
 
+
 def customer_state_path(root: Path) -> Path:
     return root / DIR_RUNTIME / "customer_state.json"
+
 
 def load_customer_state(root: Path) -> Dict[str, Any]:
     p = customer_state_path(root)
@@ -170,14 +177,19 @@ def load_customer_state(root: Path) -> Dict[str, Any]:
     except Exception:
         return {}
 
+
 def save_customer_state(root: Path, state: Dict[str, Any]) -> None:
     try:
-        atomic_write_text(customer_state_path(root), json.dumps(state, indent=2, sort_keys=True))
+        atomic_write_text(
+            customer_state_path(root), json.dumps(state, indent=2, sort_keys=True)
+        )
     except Exception:
         pass
 
 
-def _maybe_trigger_import_kickoff_on_customer_message(root: Path, state: Dict[str, Any]) -> None:
+def _maybe_trigger_import_kickoff_on_customer_message(
+    root: Path, state: Dict[str, Any]
+) -> None:
     """
     For imported workspaces, defer all kickoff/recon assignments and Codex startup
     until the first real customer message arrives.
@@ -219,24 +231,32 @@ def _maybe_trigger_import_kickoff_on_customer_message(root: Path, state: Dict[st
 
     # Send the delayed import kickoff assignment to PM.
     try:
-        write_message(
-            root,
-            state,
-            sender="cteam",
-            recipient="pm",
-            subject="Import kickoff: infer goals + plan",
-            body=(
-                "This is an imported codebase.\n\n"
-                "1) Inspect README/docs/code and fill shared/GOALS.md with inferred goals + open questions.\n"
-                "2) Write shared/PLAN.md (high-level only).\n"
-                "3) Create tickets for discovery tasks and assign them with `cteam tickets` + `cteam assign --ticket ...`.\n"
-                "4) Keep agents coordinated; they will wait for ticketed assignments.\n"
-            ),
-            msg_type=ASSIGNMENT_TYPE,
-            task="PM-IMPORT-KICKOFF",
-            nudge=True,
-            start_if_needed=True,
-        )
+        seed_file = root / DIR_SEED / "SEED.md"
+        has_seed = seed_file.exists() and seed_file.read_text(encoding="utf-8").strip()
+
+        if not has_seed:
+            pass  # No seed provided - PM waits for customer instructions, no assignment sent
+        else:
+            body = (
+                "This is an imported codebase with seed material provided.\n\n"
+                "1) Use seed/SEED.md as the source of truth for customer requirements and constraints.\n"
+                "2) Fill shared/GOALS.md with inferred goals + open questions.\n"
+                "3) Write shared/PLAN.md (high-level only).\n"
+                "4) Create tickets for discovery tasks and assign them with `cteam tickets` + `cteam assign --ticket ...`.\n"
+                "5) Keep agents coordinated; they will wait for ticketed assignments."
+            )
+            write_message(
+                root,
+                state,
+                sender="cteam",
+                recipient="pm",
+                subject="Import kickoff: infer goals + plan",
+                body=body,
+                msg_type=ASSIGNMENT_TYPE,
+                task="PM-IMPORT-KICKOFF",
+                nudge=True,
+                start_if_needed=True,
+            )
     except Exception:
         pass
 
@@ -244,9 +264,24 @@ def _maybe_trigger_import_kickoff_on_customer_message(root: Path, state: Dict[st
     try:
         if cust_state.get("import_recon"):
             for who, subj, task, body in [
-                ("architect", "Recon: architecture map", "RECON-ARCH", "Create a short architecture map and send to PM. Avoid code changes."),
-                ("tester", "Recon: how to run/tests", "RECON-TEST", "Figure out how to run the project and tests; write a short run/test note to PM."),
-                ("researcher", "Recon: dependencies", "RECON-DEPS", "Inventory dependencies/versions; send a short risk/opportunity note to PM."),
+                (
+                    "architect",
+                    "Recon: architecture map",
+                    "RECON-ARCH",
+                    "Create a short architecture map and send to PM. Avoid code changes.",
+                ),
+                (
+                    "tester",
+                    "Recon: how to run/tests",
+                    "RECON-TEST",
+                    "Figure out how to run the project and tests; write a short run/test note to PM.",
+                ),
+                (
+                    "researcher",
+                    "Recon: dependencies",
+                    "RECON-DEPS",
+                    "Inventory dependencies/versions; send a short risk/opportunity note to PM.",
+                ),
             ]:
                 if any(a.get("name") == who for a in state.get("agents", [])):
                     write_message(
@@ -373,7 +408,10 @@ def load_tickets(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def save_tickets(root: Path, state: Dict[str, Any], store: Dict[str, Any]) -> None:
-    atomic_write_text(tickets_json_path(root, state), json.dumps(store, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(
+        tickets_json_path(root, state),
+        json.dumps(store, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def _next_ticket_id(meta: Dict[str, Any]) -> str:
@@ -401,11 +439,15 @@ def _add_history(ticket: Dict[str, Any], event: Dict[str, Any]) -> None:
 
 def _format_ticket_summary(store: Dict[str, Any]) -> str:
     tickets = store.get("tickets") or []
-    active = [t for t in tickets if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+    active = [
+        t
+        for t in tickets
+        if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}
+    ]
     if not active:
         return "No open or blocked tickets."
     lines = []
-    for t in sorted(active, key=lambda x: x.get("id","")):
+    for t in sorted(active, key=lambda x: x.get("id", "")):
         tid = t.get("id", "")
         status = t.get("status", TICKET_STATUS_OPEN)
         assignee = t.get("assignee") or "unassigned"
@@ -429,8 +471,13 @@ def _ticket_summary_block(ticket: Dict[str, Any]) -> str:
     status = ticket.get("status", TICKET_STATUS_OPEN)
     blocked_on = ticket.get("blocked_on") or ""
     lines = [
-        f"Ticket: {ticket.get('id','')} — {ticket.get('title','')}",
-        f"Status: {status}" + (f" (blocked on {blocked_on})" if status == TICKET_STATUS_BLOCKED and blocked_on else ""),
+        f"Ticket: {ticket.get('id', '')} — {ticket.get('title', '')}",
+        f"Status: {status}"
+        + (
+            f" (blocked on {blocked_on})"
+            if status == TICKET_STATUS_BLOCKED and blocked_on
+            else ""
+        ),
         f"Assignee: {assignee}",
     ]
     desc = (ticket.get("description") or "").strip()
@@ -506,7 +553,10 @@ def ticket_create(
             "tags": tags or [],
             "history": [],
         }
-        _add_history(ticket, {"ts": ts, "type": "created", "user": creator, "note": title.strip()})
+        _add_history(
+            ticket,
+            {"ts": ts, "type": "created", "user": creator, "note": title.strip()},
+        )
         if assignee:
             _add_history(
                 ticket,
@@ -541,7 +591,17 @@ def ticket_assign(
         prev = t.get("assignee")
         t["assignee"] = assignee
         t["updated_at"] = now_iso()
-        _add_history(t, {"ts": t["updated_at"], "type": "assigned", "user": user, "from": prev, "to": assignee, "note": (note or "").strip()})
+        _add_history(
+            t,
+            {
+                "ts": t["updated_at"],
+                "type": "assigned",
+                "user": user,
+                "from": prev,
+                "to": assignee,
+                "note": (note or "").strip(),
+            },
+        )
         save_tickets(root, state, store)
         return t
 
@@ -561,7 +621,16 @@ def ticket_block(
         t["status"] = TICKET_STATUS_BLOCKED
         t["blocked_on"] = blocked_on.strip()
         t["updated_at"] = now_iso()
-        _add_history(t, {"ts": t["updated_at"], "type": "blocked", "user": user, "blocked_on": blocked_on, "note": (note or '').strip()})
+        _add_history(
+            t,
+            {
+                "ts": t["updated_at"],
+                "type": "blocked",
+                "user": user,
+                "blocked_on": blocked_on,
+                "note": (note or "").strip(),
+            },
+        )
         save_tickets(root, state, store)
         return t
 
@@ -580,7 +649,15 @@ def ticket_reopen(
         t["status"] = TICKET_STATUS_OPEN
         t["blocked_on"] = ""
         t["updated_at"] = now_iso()
-        _add_history(t, {"ts": t["updated_at"], "type": "reopened", "user": user, "note": (note or "").strip()})
+        _add_history(
+            t,
+            {
+                "ts": t["updated_at"],
+                "type": "reopened",
+                "user": user,
+                "note": (note or "").strip(),
+            },
+        )
         save_tickets(root, state, store)
         return t
 
@@ -599,7 +676,15 @@ def ticket_close(
         t["status"] = TICKET_STATUS_CLOSED
         t["blocked_on"] = ""
         t["updated_at"] = now_iso()
-        _add_history(t, {"ts": t["updated_at"], "type": "closed", "user": user, "note": (note or "").strip()})
+        _add_history(
+            t,
+            {
+                "ts": t["updated_at"],
+                "type": "closed",
+                "user": user,
+                "note": (note or "").strip(),
+            },
+        )
         save_tickets(root, state, store)
         return t
 
@@ -607,6 +692,7 @@ def ticket_close(
 # -----------------------------
 # Readline helpers (interactive UX)
 # -----------------------------
+
 
 def configure_readline(history_path: Optional[Path] = None) -> None:
     """Best-effort readline configuration + persistent history."""
@@ -656,12 +742,15 @@ def prompt_yes_no(prompt: str, *, default: bool = False) -> bool:
         print("Please type 'y' or 'n'.")
 
 
-def prompt_line(prompt: str, *, default: Optional[str] = None, secret: bool = False) -> str:
+def prompt_line(
+    prompt: str, *, default: Optional[str] = None, secret: bool = False
+) -> str:
     show = f" [{default}]" if default else ""
     while True:
         try:
             if secret:
                 import getpass  # type: ignore
+
                 raw = getpass.getpass(prompt + show + ": ")
             else:
                 raw = input(prompt + show + ": ")
@@ -682,7 +771,9 @@ def prompt_multiline(
 ) -> str:
     """Capture multiline input. Finish with a line containing only `terminator` or Ctrl-D."""
     print(header.rstrip())
-    print(f"(paste multiple lines; finish with a line containing only '{terminator}', or press Ctrl-D)")
+    print(
+        f"(paste multiple lines; finish with a line containing only '{terminator}', or press Ctrl-D)"
+    )
     lines: List[str] = []
     while True:
         try:
@@ -792,7 +883,9 @@ def safe_link_file(target: Path, link: Path) -> None:
         pass
 
     try:
-        abs_target = target if target.is_absolute() else (link.parent / target).resolve()
+        abs_target = (
+            target if target.is_absolute() else (link.parent / target).resolve()
+        )
         if abs_target.exists() and abs_target.is_file():
             os.link(str(abs_target), str(link))
             return
@@ -818,7 +911,9 @@ def safe_link_dir(target: Path, link: Path) -> None:
         return
     except OSError:
         link.mkdir(parents=True, exist_ok=True)
-        abs_target = target if target.is_absolute() else (link.parent / target).resolve()
+        abs_target = (
+            target if target.is_absolute() else (link.parent / target).resolve()
+        )
         atomic_write_text(
             link / "README_cteam_pointer.md",
             textwrap.dedent(
@@ -892,6 +987,7 @@ def sync_cteam_into_agents(root: Path, state: Dict[str, Any]) -> None:
 # Git helpers
 # -----------------------------
 
+
 def git_init_bare(path: Path, branch: str = DEFAULT_GIT_BRANCH) -> None:
     mkdirp(path)
     try:
@@ -934,7 +1030,10 @@ def git_status_short(repo: Path) -> str:
 def git_try_pull_ff(repo: Path, branch: str = DEFAULT_GIT_BRANCH) -> str:
     try:
         git_fetch(repo)
-        cp = run_cmd(["git", "-C", str(repo), "pull", "--ff-only", "origin", branch], capture=True)
+        cp = run_cmd(
+            ["git", "-C", str(repo), "pull", "--ff-only", "origin", branch],
+            capture=True,
+        )
         out = (cp.stdout or "").strip()
         return out or f"pulled {branch}"
     except CTeamError as e:
@@ -977,7 +1076,10 @@ def git_append_info_exclude(repo: Path, lines: List[str]) -> None:
 # tmux helpers
 # -----------------------------
 
-def tmux(cmd: List[str], *, capture: bool = True, check: bool = True) -> subprocess.CompletedProcess:
+
+def tmux(
+    cmd: List[str], *, capture: bool = True, check: bool = True
+) -> subprocess.CompletedProcess:
     return run_cmd(["tmux", *cmd], capture=capture, check=check)
 
 
@@ -995,20 +1097,31 @@ def tmux_list_windows(session: str) -> List[str]:
 
 
 def tmux_new_session(session: str, root_dir: Path) -> None:
-    tmux(["new-session", "-d", "-s", session, "-n", "root", "-c", str(root_dir)], capture=True)
+    tmux(
+        ["new-session", "-d", "-s", session, "-n", "root", "-c", str(root_dir)],
+        capture=True,
+    )
     # Keep windows after command exits (esp. when we exec codex)
-    tmux(["set-option", "-t", session, "remain-on-exit", "on"], capture=True, check=False)
-    tmux(["set-option", "-t", session, "allow-rename", "off"], capture=True, check=False)
+    tmux(
+        ["set-option", "-t", session, "remain-on-exit", "on"], capture=True, check=False
+    )
+    tmux(
+        ["set-option", "-t", session, "allow-rename", "off"], capture=True, check=False
+    )
 
 
-def tmux_new_window(session: str, name: str, start_dir: Path, command_args: Optional[List[str]] = None) -> None:
+def tmux_new_window(
+    session: str, name: str, start_dir: Path, command_args: Optional[List[str]] = None
+) -> None:
     cmd = ["new-window", "-t", session, "-n", name, "-c", str(start_dir)]
     if command_args:
         cmd.extend(command_args)
     tmux(cmd, capture=True)
 
 
-def tmux_respawn_window(session: str, window: str, start_dir: Path, command_args: List[str]) -> None:
+def tmux_respawn_window(
+    session: str, window: str, start_dir: Path, command_args: List[str]
+) -> None:
     """
     Replace the command running in a window with a new command.
 
@@ -1061,7 +1174,12 @@ def tmux_send_line_when_quiet(
     deadline = time.time() + max(block_timeout, 0.5)
     while time.time() < deadline:
         remaining = max(0.5, deadline - time.time())
-        if wait_for_pane_quiet(session, window, quiet_for=quiet_for, timeout=min(quiet_for + 1.0, remaining)):
+        if wait_for_pane_quiet(
+            session,
+            window,
+            quiet_for=quiet_for,
+            timeout=min(quiet_for + 1.0, remaining),
+        ):
             tmux(["set-buffer", "--", payload], capture=True)
             tmux_send_keys(session, window, ["C-u"])
             tmux(["paste-buffer", "-d", "-t", target], capture=True)
@@ -1075,14 +1193,25 @@ def tmux_pane_current_command(session: str, window: str) -> str:
     Best-effort detection of what's running in the active pane of a window.
     """
     try:
-        cp = tmux(["list-panes", "-t", f"{session}:{window}", "-F", "#{pane_current_command}"], capture=True)
+        cp = tmux(
+            [
+                "list-panes",
+                "-t",
+                f"{session}:{window}",
+                "-F",
+                "#{pane_current_command}",
+            ],
+            capture=True,
+        )
         out = (cp.stdout or "").strip().splitlines()
         return out[0].strip() if out else ""
     except Exception:
         return ""
 
 
-def wait_for_pane_command(session: str, window: str, target_substring: str, timeout: float = 4.0) -> bool:
+def wait_for_pane_command(
+    session: str, window: str, target_substring: str, timeout: float = 4.0
+) -> bool:
     """
     Wait until the active pane command contains target_substring (case-insensitive) or timeout.
     """
@@ -1101,14 +1230,18 @@ def _pane_sig(session: str, window: str) -> Tuple[int, str]:
     Lightweight signature of the pane contents: length + tail slice.
     """
     try:
-        cp = tmux(["capture-pane", "-p", "-t", f"{session}:{window}", "-J"], capture=True)
-        txt = (cp.stdout or "")
+        cp = tmux(
+            ["capture-pane", "-p", "-t", f"{session}:{window}", "-J"], capture=True
+        )
+        txt = cp.stdout or ""
         return (len(txt), txt[-400:])
     except Exception:
         return (0, "")
 
 
-def wait_for_pane_quiet(session: str, window: str, *, quiet_for: float = 1.0, timeout: float = 6.0) -> bool:
+def wait_for_pane_quiet(
+    session: str, window: str, *, quiet_for: float = 1.0, timeout: float = 6.0
+) -> bool:
     """
     Wait until the pane output is stable (no changes) for quiet_for seconds, or timeout.
     """
@@ -1130,7 +1263,11 @@ def wait_for_pane_quiet(session: str, window: str, *, quiet_for: float = 1.0, ti
 def tmux_attach(session: str, window: Optional[str] = None) -> None:
     if window:
         try:
-            tmux(["select-window", "-t", f"{session}:{window}"], capture=True, check=False)
+            tmux(
+                ["select-window", "-t", f"{session}:{window}"],
+                capture=True,
+                check=False,
+            )
         except Exception:
             pass
     os.execvp("tmux", ["tmux", "attach-session", "-t", session])
@@ -1143,6 +1280,7 @@ def tmux_kill_session(session: str) -> None:
 # -----------------------------
 # Codex CLI capability detection
 # -----------------------------
+
 
 @dataclass
 class CodexCaps:
@@ -1206,9 +1344,15 @@ def build_codex_base_args(state: Dict[str, Any]) -> List[str]:
         if caps.supports("--sandbox"):
             args += ["--sandbox", codex.get("sandbox", DEFAULT_CODEX_SANDBOX)]
         if caps.supports("--ask-for-approval"):
-            args += ["--ask-for-approval", codex.get("ask_for_approval", DEFAULT_CODEX_APPROVAL)]
+            args += [
+                "--ask-for-approval",
+                codex.get("ask_for_approval", DEFAULT_CODEX_APPROVAL),
+            ]
         elif caps.supports("--approval-policy"):
-            args += ["--approval-policy", codex.get("ask_for_approval", DEFAULT_CODEX_APPROVAL)]
+            args += [
+                "--approval-policy",
+                codex.get("ask_for_approval", DEFAULT_CODEX_APPROVAL),
+            ]
         elif caps.supports("--approval-mode"):
             ap = codex.get("ask_for_approval", DEFAULT_CODEX_APPROVAL)
             mode = "full-auto" if ap == "never" else "auto"
@@ -1224,7 +1368,9 @@ def build_codex_base_args(state: Dict[str, Any]) -> List[str]:
     return args
 
 
-def build_codex_args_for_agent(state: Dict[str, Any], agent: Dict[str, Any], start_dir: Path) -> List[str]:
+def build_codex_args_for_agent(
+    state: Dict[str, Any], agent: Dict[str, Any], start_dir: Path
+) -> List[str]:
     """
     Build full argv to run Codex for an agent. We set cwd via tmux -c, and optionally also --cd.
     """
@@ -1250,6 +1396,7 @@ def build_codex_args_for_agent(state: Dict[str, Any], agent: Dict[str, Any], sta
 # -----------------------------
 # State model / defaults
 # -----------------------------
+
 
 def default_agents(devs: int = 1) -> List[Tuple[str, str, str]]:
     agents: List[Tuple[str, str, str]] = [
@@ -1329,29 +1476,32 @@ def build_state(
             "yolo": bool(yolo),
         },
         "coordination": {
-            "autostart": autostart,       # pm | pm+architect | all
+            "autostart": autostart,  # pm | pm+architect | all
             "pm_is_boss": True,
             "start_agents_on_assignment": True,
             "assignment_type": ASSIGNMENT_TYPE,
-            "assignment_from": ["pm", "cteam"],   # who can "start" an agent by messaging them
-    "stage": "discovery",
-    "auto_dispatch": False,
-},
-"supervision": {
-    "customer_burst_seconds": 20,
-    "customer_ack_cooldown_seconds": 25,
-    "agent_idle_seconds": 120,
-    "agent_stalled_nudge_seconds": 300,
-    "agent_unassigned_nudge_seconds": 600,
-    "pm_digest_interval_seconds": 600,
-    "dashboard_write_seconds": 10,
-    "agent_resume_seconds": 180,
-    "agent_resume_cooldown_seconds": 180,
-    "agent_resume_max_prompts": 2,
-    "mailbox_nudge_cooldown_seconds": 90,
-    "assigned_ticket_reminder_seconds": 60,
-},
-"tmux": {
+            "assignment_from": [
+                "pm",
+                "cteam",
+            ],  # who can "start" an agent by messaging them
+            "stage": "discovery",
+            "auto_dispatch": False,
+        },
+        "supervision": {
+            "customer_burst_seconds": 20,
+            "customer_ack_cooldown_seconds": 25,
+            "agent_idle_seconds": 120,
+            "agent_stalled_nudge_seconds": 300,
+            "agent_unassigned_nudge_seconds": 600,
+            "pm_digest_interval_seconds": 600,
+            "dashboard_write_seconds": 10,
+            "agent_resume_seconds": 180,
+            "agent_resume_cooldown_seconds": 180,
+            "agent_resume_max_prompts": 2,
+            "mailbox_nudge_cooldown_seconds": 90,
+            "assigned_ticket_reminder_seconds": 180,
+        },
+        "tmux": {
             "session": session,
             "router": bool(router),
             "paused": False,
@@ -1359,7 +1509,7 @@ def build_state(
         "tickets": {
             "json_rel": TICKETS_JSON_REL,
         },
-                "telegram": {
+        "telegram": {
             "enabled": False,
             "config_rel": TELEGRAM_CONFIG_REL,
         },
@@ -1376,7 +1526,6 @@ def compute_agent_abspaths(state: Dict[str, Any]) -> None:
     for a in state["agents"]:
         a["dir_abs"] = str((root / a["dir_rel"]).resolve())
         a["repo_dir_abs"] = str((root / a["repo_dir_rel"]).resolve())
-
 
 
 def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
@@ -1412,7 +1561,9 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         state["coordination"] = coord
 
         tm = state.get("tmux", {})
-        tm.setdefault("session", f"cteam_{slugify(state.get('project_name', root.name))}")
+        tm.setdefault(
+            "session", f"cteam_{slugify(state.get('project_name', root.name))}"
+        )
         tm.setdefault("router", True)
         tm.setdefault("paused", False)
         state["tmux"] = tm
@@ -1489,7 +1640,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         sup.setdefault("agent_resume_cooldown_seconds", 180)
         sup.setdefault("agent_resume_max_prompts", 2)
         sup.setdefault("mailbox_nudge_cooldown_seconds", 90)
-        sup.setdefault("assigned_ticket_reminder_seconds", 60)
+        sup.setdefault("assigned_ticket_reminder_seconds", 180)
         state["supervision"] = sup
     # --- v < 9 upgrades (agent resume cadence) ---
     if v < 9:
@@ -1506,7 +1657,9 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         sup = state.get("supervision") or {}
         if not isinstance(sup, dict):
             sup = {}
-        sup["assigned_ticket_reminder_seconds"] = float(sup.get("assigned_ticket_reminder_seconds", 60) or 60)
+        sup["assigned_ticket_reminder_seconds"] = float(
+            sup.get("assigned_ticket_reminder_seconds", 60) or 60
+        )
         state["supervision"] = sup
 
     state["version"] = STATE_VERSION
@@ -1516,7 +1669,9 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
 
 
 def save_state(root: Path, state: Dict[str, Any]) -> None:
-    atomic_write_text(root / STATE_FILENAME, json.dumps(state, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(
+        root / STATE_FILENAME, json.dumps(state, indent=2, sort_keys=True) + "\n"
+    )
 
 
 def load_state(root: Path) -> Dict[str, Any]:
@@ -1533,6 +1688,7 @@ def load_state(root: Path) -> Dict[str, Any]:
 # -----------------------------
 # Templates / docs
 # -----------------------------
+
 
 def render_seed_readme() -> str:
     return textwrap.dedent(
@@ -1787,8 +1943,8 @@ def render_shared_readme(state: Dict[str, Any]) -> str:
         f"""\
         # Shared workspace — Clanker Team (cteam)
 
-        Project: **{state['project_name']}**
-        Root: `{state['root_abs']}`
+        Project: **{state["project_name"]}**
+        Root: `{state["root_abs"]}`
 
         This directory is outside the git repo; it's for coordination artifacts.
 
@@ -1815,7 +1971,7 @@ def render_team_roster(state: Dict[str, Any]) -> str:
     lines.append(f"- Project: **{state['project_name']}**")
     lines.append(f"- Root: `{state['root_abs']}`")
     lines.append(f"- Created: {state['created_at']}")
-    lines.append(f"- Mode: `{state.get('mode','new')}`")
+    lines.append(f"- Mode: `{state.get('mode', 'new')}`")
     if state.get("imported_from"):
         lines.append(f"- Imported from: `{state['imported_from']}`")
     lines.append("")
@@ -1833,7 +1989,7 @@ def render_team_roster(state: Dict[str, Any]) -> str:
 def render_agent_status_template(agent: Dict[str, Any]) -> str:
     return textwrap.dedent(
         f"""\
-        # STATUS — {agent['name']} ({agent['title']})
+        # STATUS — {agent["name"]} ({agent["title"]})
 
         Last updated: (edit me)
 
@@ -1855,13 +2011,15 @@ def render_agent_status_template(agent: Dict[str, Any]) -> str:
     )
 
 
-def render_agent_agents_md(agent_or_state: Dict[str, Any], agent: Optional[Dict[str, Any]] = None) -> str:
+def render_agent_agents_md(
+    agent_or_state: Dict[str, Any], agent: Optional[Dict[str, Any]] = None
+) -> str:
     # Accepts either (agent) or (state, agent) for convenience/backcompat.
     if agent is None:
         agent = agent_or_state
-    header = f"""# Agent: {agent['name']}
-Role: {agent['role']}
-Title: {agent.get('title','')}
+    header = f"""# Agent: {agent["name"]}
+Role: {agent["role"]}
+Title: {agent.get("title", "")}
 """
 
     block = f"""## Your mission
@@ -1869,8 +2027,8 @@ You are part of a multi-agent developer team. The PM coordinates. You execute as
 
 This repo is structured for **models**:
 - Shared memory is in `shared/`
-- Your private workspace is `agents/{agent['name']}/`
-- Messages arrive in `shared/mail/{agent['name']}/inbox/` and `shared/mail/{agent['name']}/message.md`
+- Your private workspace is `agents/{agent["name"]}/`
+- Messages arrive in `shared/mail/{agent["name"]}/inbox/` and `shared/mail/{agent["name"]}/message.md`
 
 ## Start here (always)
 1) Read `shared/PROTOCOL.md`
@@ -1889,10 +2047,10 @@ This repo is structured for **models**:
 
 ## Work loop (when assigned a ticket)
 1) Acknowledge quickly to PM: what you will do next.
-2) Create a branch in your repo clone: `agents/{agent['name']}/proj`
+2) Create a branch in your repo clone: `agents/{agent["name"]}/proj`
 3) Implement the change.
 4) Run tests / reproduce bug fix.
-5) Update your `agents/{agent['name']}/STATUS.md`:
+5) Update your `agents/{agent["name"]}/STATUS.md`:
    - ticket id
    - last action
    - next step
@@ -1933,7 +2091,6 @@ When nudged, immediately:
     return header + "\n" + block.strip() + "\n"
 
 
-
 def initial_prompt_for_pm(state: Dict[str, Any]) -> str:
     mode = state.get("mode", "new")
     root_abs = state.get("root_abs", "")
@@ -1971,18 +2128,18 @@ def prompt_on_mail(agent_name: str) -> str:
 def standby_banner(agent: Dict[str, Any], state: Dict[str, Any]) -> str:
     return textwrap.dedent(
         f"""\
-        Clanker Team (cteam) — {state['project_name']}
-        Agent window: {agent['name']} ({agent['title']})
-        Mode: {state.get('mode','new')}
+        Clanker Team (cteam) — {state["project_name"]}
+        Agent window: {agent["name"]} ({agent["title"]})
+        Mode: {state.get("mode", "new")}
 
         Standby mode (PM-led coordination):
         - Waiting for PM/human assignment.
-        - Your inbox: {DIR_MAIL}/{agent['name']}/message.md
+        - Your inbox: {DIR_MAIL}/{agent["name"]}/message.md
         - Tickets: managed via `cteam tickets ...` (work only on tickets assigned to you)
         - If you are assigned work, this window will be repurposed to run Codex automatically.
 
         Tip: If you want to manually check mail:
-          less -R {shlex.quote(str(Path(state['root_abs'])/DIR_MAIL/agent['name']/ 'message.md'))}
+          less -R {shlex.quote(str(Path(state["root_abs"]) / DIR_MAIL / agent["name"] / "message.md"))}
         """
     ).strip()
 
@@ -1990,6 +2147,7 @@ def standby_banner(agent: Dict[str, Any], state: Dict[str, Any]) -> str:
 # -----------------------------
 # Workspace creation
 # -----------------------------
+
 
 def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> bool:
     mkdirp(root / DIR_LOGS)
@@ -2010,7 +2168,9 @@ def ensure_shared_scaffold(root: Path, state: Dict[str, Any]) -> bool:
     if not (root / DIR_SEED / "README.md").exists():
         atomic_write_text(root / DIR_SEED / "README.md", render_seed_readme())
     if not (root / DIR_SEED_EXTRAS / "README.md").exists():
-        atomic_write_text(root / DIR_SEED_EXTRAS / "README.md", render_seed_extras_readme())
+        atomic_write_text(
+            root / DIR_SEED_EXTRAS / "README.md", render_seed_extras_readme()
+        )
 
     shared_files = {
         "README.md": render_shared_readme(state),
@@ -2081,7 +2241,9 @@ def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
 
         readme = checkout / "README.md"
         if not readme.exists():
-            atomic_write_text(readme, f"# {state['project_name']}\n\n(Initialized by cteam)\n")
+            atomic_write_text(
+                readme, f"# {state['project_name']}\n\n(Initialized by cteam)\n"
+            )
         docs = checkout / "docs"
         mkdirp(docs)
         if not (docs / "README.md").exists():
@@ -2089,11 +2251,34 @@ def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
         git_config_local(checkout, "user.name", "cteam")
         git_config_local(checkout, "user.email", "cteam@local")
         run_cmd(["git", "-C", str(checkout), "add", "-A"])
-        run_cmd(["git", "-C", str(checkout), "commit", "-m", "chore: initialize repository"], check=False)
-        run_cmd(["git", "-C", str(checkout), "push", "-u", "origin", state["git"]["default_branch"]], check=False)
+        run_cmd(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "commit",
+                "-m",
+                "chore: initialize repository",
+            ],
+            check=False,
+        )
+        run_cmd(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "push",
+                "-u",
+                "origin",
+                state["git"]["default_branch"],
+            ],
+            check=False,
+        )
 
         try:
-            git_append_info_exclude(checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"])
+            git_append_info_exclude(
+                checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
+            )
         except Exception:
             pass
 
@@ -2103,7 +2288,9 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
     checkout = root / DIR_PROJECT_CHECKOUT
 
     if bare.exists() and any(bare.iterdir()):
-        raise CTeamError(f"{DIR_PROJECT_BARE} already exists and is not empty in {root}")
+        raise CTeamError(
+            f"{DIR_PROJECT_BARE} already exists and is not empty in {root}"
+        )
 
     imported_as_git = False
     try:
@@ -2118,7 +2305,9 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
         if not checkout.exists():
             git_clone(bare, checkout)
         try:
-            git_append_info_exclude(checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"])
+            git_append_info_exclude(
+                checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
+            )
         except Exception:
             pass
         return
@@ -2144,14 +2333,30 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
     git_config_local(checkout, "user.email", "cteam+import@local")
     run_cmd(["git", "-C", str(checkout), "add", "-A"])
     try:
-        run_cmd(["git", "-C", str(checkout), "commit", "-m", "Import existing project"], capture=True)
+        run_cmd(
+            ["git", "-C", str(checkout), "commit", "-m", "Import existing project"],
+            capture=True,
+        )
     except CTeamError:
-        run_cmd(["git", "-C", str(checkout), "commit", "--allow-empty", "-m", "Import existing project"], capture=True)
+        run_cmd(
+            [
+                "git",
+                "-C",
+                str(checkout),
+                "commit",
+                "--allow-empty",
+                "-m",
+                "Import existing project",
+            ],
+            capture=True,
+        )
 
     run_cmd(["git", "-C", str(checkout), "push", "origin", "HEAD"], capture=True)
 
     try:
-        git_append_info_exclude(checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"])
+        git_append_info_exclude(
+            checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
+        )
     except Exception:
         pass
 
@@ -2192,7 +2397,15 @@ def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) 
     try:
         git_append_info_exclude(
             repo_dir,
-            ["AGENTS.md", "STATUS.md", "message.md", "seed/", "seed-extras/", "shared/", "cteam.py"],
+            [
+                "AGENTS.md",
+                "STATUS.md",
+                "message.md",
+                "seed/",
+                "seed-extras/",
+                "shared/",
+                "cteam.py",
+            ],
         )
     except Exception:
         pass
@@ -2201,7 +2414,9 @@ def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) 
     safe_link_file(Path("..") / "STATUS.md", repo_dir / "STATUS.md")
     safe_link_file(Path("..") / "message.md", repo_dir / "message.md")
     safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED, repo_dir / "shared")
-    safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive")
+    safe_link_dir(
+        Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive"
+    )
     safe_link_dir(Path("..") / ".." / DIR_SHARED_DRIVE, agent_dir / "shared-drive")
     if (agent_dir / "seed").exists():
         safe_link_dir(Path("..") / "seed", repo_dir / "seed")
@@ -2235,7 +2450,9 @@ def _kill_agent_window_if_present(state: Dict[str, Any], agent_name: str) -> Non
         pass
 
 
-def _archive_or_remove_agent_dirs(root: Path, agent: Dict[str, Any], *, purge: bool = False) -> None:
+def _archive_or_remove_agent_dirs(
+    root: Path, agent: Dict[str, Any], *, purge: bool = False
+) -> None:
     ts = ts_for_filename(now_iso())
     agent_dir = root / agent["dir_rel"]
     mail_dir = root / DIR_MAIL / agent["name"]
@@ -2257,7 +2474,9 @@ def _archive_or_remove_agent_dirs(root: Path, agent: Dict[str, Any], *, purge: b
     _move_or_remove(mail_dir, root / DIR_MAIL / "_removed")
 
 
-def _unassign_tickets_for_agent(root: Path, state: Dict[str, Any], agent_name: str) -> None:
+def _unassign_tickets_for_agent(
+    root: Path, state: Dict[str, Any], agent_name: str
+) -> None:
     with ticket_lock(root, state):
         store = load_tickets(root, state)
         changed = False
@@ -2285,6 +2504,7 @@ def _unassign_tickets_for_agent(root: Path, state: Dict[str, Any], agent_name: s
 # Coordination logic: autostart selection
 # -----------------------------
 
+
 def autostart_agent_names(state: Dict[str, Any]) -> List[str]:
     mode = state.get("coordination", {}).get("autostart", DEFAULT_AUTOSTART)
     names = [a["name"] for a in state["agents"]]
@@ -2298,6 +2518,7 @@ def autostart_agent_names(state: Dict[str, Any]) -> List[str]:
 # -----------------------------
 # Messaging
 # -----------------------------
+
 
 def mailbox_paths(root: Path, agent_name: str) -> Tuple[Path, Path, Path]:
     base = root / DIR_MAIL / agent_name
@@ -2389,7 +2610,16 @@ def write_message(
     ts = now_iso()
     if ticket_id:
         ticket_id = ticket_id.strip()
-    entry = format_message(ts, sender, recipient, subject, body, msg_type=msg_type, task=task, ticket_id=ticket_id or None)
+    entry = format_message(
+        ts,
+        sender,
+        recipient,
+        subject,
+        body,
+        msg_type=msg_type,
+        task=task,
+        ticket_id=ticket_id or None,
+    )
     if not entry.endswith("\n"):
         entry += "\n"
 
@@ -2527,7 +2757,9 @@ def write_message(
 
     if recipient != "customer":
         if start_if_needed:
-            maybe_start_agent_on_message(root, state, recipient, sender=sender, msg_type=msg_type)
+            maybe_start_agent_on_message(
+                root, state, recipient, sender=sender, msg_type=msg_type
+            )
         nudge_reason = _mailbox_nudge_reason(ticket_id, msg_type)
         nudge_agent(root, state, recipient, reason=nudge_reason)
 
@@ -2535,6 +2767,7 @@ def write_message(
 # -----------------------------
 # Starting / nudging agents in tmux
 # -----------------------------
+
 
 def ensure_tmux_session(root: Path, state: Dict[str, Any]) -> None:
     ensure_executable("tmux", hint="Install tmux (apt/brew).")
@@ -2548,14 +2781,19 @@ def ensure_tmux_session(root: Path, state: Dict[str, Any]) -> None:
             tmux_new_window(session, ROUTER_WINDOW, root, command_args=cmd_args)
         except Exception:
             pass
-    tmux(["set-option", "-t", session, "remain-on-exit", "on"], capture=True, check=False)
-    tmux(["set-option", "-t", session, "allow-rename", "off"], capture=True, check=False)
+    tmux(
+        ["set-option", "-t", session, "remain-on-exit", "on"], capture=True, check=False
+    )
+    tmux(
+        ["set-option", "-t", session, "allow-rename", "off"], capture=True, check=False
+    )
 
 
 def router_window_command(root: Path) -> List[str]:
     shell = pick_shell()
     cmd = f"cd {shlex.quote(str(root))} && exec python3 cteam.py . watch"
     return shell + [cmd]
+
 
 def customer_window_command(root: Path) -> List[str]:
     shell = pick_shell()
@@ -2590,7 +2828,9 @@ def ensure_customer_window(root: Path, state: Dict[str, Any]) -> None:
     tmux_new_window(session, CUSTOMER_WINDOW, root, command_args=cmd_args)
 
 
-def standby_window_command(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> List[str]:
+def standby_window_command(
+    root: Path, state: Dict[str, Any], agent: Dict[str, Any]
+) -> List[str]:
     shell = pick_shell()
     banner = standby_banner(agent, state).replace("'", "'\"'\"'")
     sh = os.environ.get("SHELL", "bash")
@@ -2598,7 +2838,9 @@ def standby_window_command(root: Path, state: Dict[str, Any], agent: Dict[str, A
     return shell + [cmd]
 
 
-def codex_window_command(root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, boot: bool) -> List[str]:
+def codex_window_command(
+    root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, boot: bool
+) -> List[str]:
     shell = pick_shell()
     repo_dir = Path(agent["repo_dir_abs"])
     base_args = build_codex_args_for_agent(state, agent, start_dir=repo_dir)
@@ -2648,7 +2890,7 @@ def start_codex_in_window(
                     f"You are {agent['title']} ({agent['name']}). Imported project; wait for ticketed assignments. "
                     f"Open AGENTS.md and message.md. Do NOT change code without a ticketed assignment (Type: {ASSIGNMENT_TYPE}). "
                     f"Send a short discovery note to PM if needed, then wait for a ticket. "
-                    f"Tickets are managed via `cteam tickets ...`. cteam.py location: {state.get('root_abs','')}/cteam.py"
+                    f"Tickets are managed via `cteam tickets ...`. cteam.py location: {state.get('root_abs', '')}/cteam.py"
                 )
             else:
                 first_prompt = (
@@ -2656,7 +2898,7 @@ def start_codex_in_window(
                     f"Open AGENTS.md and message.md. "
                     f"If you do not have an assignment (Type: {ASSIGNMENT_TYPE}), do NOT start coding; "
                     f"send a short recon note to PM, then wait. "
-                    f"cteam.py location: {state.get('root_abs','')}/cteam.py"
+                    f"cteam.py location: {state.get('root_abs', '')}/cteam.py"
                 )
     else:
         first_prompt = prompt_on_mail(agent["name"])
@@ -2718,9 +2960,14 @@ def nudge_agent(
             wait_for_pane_quiet(session, agent_name, quiet_for=0.8, timeout=4.0)
             ok = tmux_send_line_when_quiet(session, agent_name, msg)
         else:
-            ok = tmux_send_line_when_quiet(session, agent_name, f"echo {shlex.quote(msg)}")
+            ok = tmux_send_line_when_quiet(
+                session, agent_name, f"echo {shlex.quote(msg)}"
+            )
         if ok:
-            _nudge_history[agent_name] = (time.time(), _normalize_reasons(_split_reasons(reason)))
+            _nudge_history[agent_name] = (
+                time.time(),
+                _normalize_reasons(_split_reasons(reason)),
+            )
         return ok
     except Exception:
         return False
@@ -2729,7 +2976,9 @@ def nudge_agent(
 class NudgeQueue:
     """Batch and deduplicate nudges before sending to tmux windows; defers until pane idle."""
 
-    def __init__(self, root: Path, *, min_interval: float = 2.0, idle_for: float = 1.0) -> None:
+    def __init__(
+        self, root: Path, *, min_interval: float = 2.0, idle_for: float = 1.0
+    ) -> None:
         self.root = root
         self.min_interval = max(0.0, float(min_interval))
         self.idle_for = max(0.0, float(idle_for))
@@ -2787,14 +3036,18 @@ class NudgeQueue:
                 except Exception:
                     last_ts, last_reasons = None, set()
 
-            current_reasons_raw = set(reasons) if reasons else _split_reasons(reason_text)
+            current_reasons_raw = (
+                set(reasons) if reasons else _split_reasons(reason_text)
+            )
             current_reasons = _normalize_reasons(current_reasons_raw)
             if last_ts is not None and (now - last_ts) < self.min_interval:
                 if current_reasons.issubset(last_reasons):
                     results.append((agent_name, False, reason_text, "duplicate"))
                     continue
 
-            ok = nudge_agent(self.root, state, agent_name, reason=reason_text, interrupt=interrupt)
+            ok = nudge_agent(
+                self.root, state, agent_name, reason=reason_text, interrupt=interrupt
+            )
             if ok:
                 reason_set = current_reasons or {"NUDGE"}
                 self.last_sent[agent_name] = (now, reason_set)
@@ -2839,6 +3092,7 @@ def maybe_start_agent_on_message(
 # Telegram integration (customer channel bridge)
 # -----------------------------
 
+
 def telegram_config_path(root: Path, state: Optional[Dict[str, Any]] = None) -> Path:
     rel = None
     if state:
@@ -2872,12 +3126,16 @@ def telegram_load_config(root: Path, state: Dict[str, Any]) -> Dict[str, Any]:
     token = (cfg.get("bot_token") or "").strip()
     phone = (cfg.get("authorized_phone") or "").strip()
     if not token or not phone:
-        raise CTeamError(f"telegram config incomplete (need bot_token + authorized_phone): {cfg_path}")
+        raise CTeamError(
+            f"telegram config incomplete (need bot_token + authorized_phone): {cfg_path}"
+        )
     cfg["authorized_phone_norm"] = _normalize_phone(phone)
     return cfg
 
 
-def telegram_save_config(root: Path, state: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+def telegram_save_config(
+    root: Path, state: Dict[str, Any], cfg: Dict[str, Any]
+) -> None:
     cfg_path = telegram_config_path(root, state)
     cfg2 = dict(cfg)
     cfg2.pop("authorized_phone_norm", None)
@@ -2885,10 +3143,14 @@ def telegram_save_config(root: Path, state: Dict[str, Any], cfg: Dict[str, Any])
     _chmod_private(cfg_path)
 
 
-def _telegram_api(token: str, method: str, payload: Dict[str, Any], *, timeout: float = 30.0) -> Any:
+def _telegram_api(
+    token: str, method: str, payload: Dict[str, Any], *, timeout: float = 30.0
+) -> Any:
     url = f"https://api.telegram.org/bot{token}/{method}"
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}
+    )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", errors="replace")
@@ -2898,14 +3160,18 @@ def _telegram_api(token: str, method: str, payload: Dict[str, Any], *, timeout: 
             detail = e.read().decode("utf-8", errors="replace")
         except Exception:
             pass
-        raise CTeamError(f"telegram HTTP error calling {method}: {e.code} {e.reason}\n{detail}".strip()) from e
+        raise CTeamError(
+            f"telegram HTTP error calling {method}: {e.code} {e.reason}\n{detail}".strip()
+        ) from e
     except Exception as e:
         raise CTeamError(f"telegram error calling {method}: {e}") from e
 
     try:
         obj = json.loads(raw)
     except Exception as e:
-        raise CTeamError(f"telegram non-JSON response from {method}: {raw[:400]}") from e
+        raise CTeamError(
+            f"telegram non-JSON response from {method}: {raw[:400]}"
+        ) from e
     if not obj.get("ok"):
         raise CTeamError(f"telegram API returned ok=false for {method}: {raw[:600]}")
     return obj.get("result")
@@ -2926,7 +3192,9 @@ def _telegram_send_text(cfg: Dict[str, Any], text: str) -> None:
     if t:
         chunks.append(t)
     for c in chunks:
-        _telegram_api(token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=20.0)
+        _telegram_api(
+            token, "sendMessage", {"chat_id": chat_id, "text": c}, timeout=20.0
+        )
 
 
 def _telegram_initial_offset(cfg: Dict[str, Any]) -> int:
@@ -2963,7 +3231,11 @@ def _telegram_request_contact(cfg: Dict[str, Any], chat_id: int) -> None:
     )
 
 
-def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str], str, str, Optional[str], Optional[str]]:
+def _parse_entry(
+    entry: str,
+) -> Tuple[
+    Optional[str], Optional[str], Optional[str], str, str, Optional[str], Optional[str]
+]:
     ts = None
     sender = None
     recipient = None
@@ -2972,7 +3244,10 @@ def _parse_entry(entry: str) -> Tuple[Optional[str], Optional[str], Optional[str
     msg_type: Optional[str] = None
     lines = entry.splitlines()
     if lines:
-        m = re.match(r"^##\s+(.+?)\s+—\s+From:\s*([^\s→]+)\s+→\s+To:\s*([^\s]+)\s*$", lines[0].strip())
+        m = re.match(
+            r"^##\s+(.+?)\s+—\s+From:\s*([^\s→]+)\s+→\s+To:\s*([^\s]+)\s*$",
+            lines[0].strip(),
+        )
         if m:
             ts = m.group(1).strip()
             sender = m.group(2).strip()
@@ -3023,7 +3298,10 @@ def _is_image_document(doc: Dict[str, Any]) -> bool:
     if mime.startswith("image/"):
         return True
     name = str(doc.get("file_name") or "").lower()
-    return any(name.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif"))
+    return any(
+        name.endswith(ext)
+        for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif")
+    )
 
 
 class TelegramBridge:
@@ -3063,7 +3341,10 @@ class TelegramBridge:
         offset = _telegram_initial_offset(cfg)
         if offset == 0 and (not cfg.get("chat_id") or not cfg.get("user_id")):
             if not self._logged_offset_reset:
-                log_line(self.root, "[telegram] reset update_offset to 0 (chat not authorized yet; send /start and share contact)")
+                log_line(
+                    self.root,
+                    "[telegram] reset update_offset to 0 (chat not authorized yet; send /start and share contact)",
+                )
                 self._logged_offset_reset = True
         last_saved = time.time()
         log_line(self.root, f"[telegram] bridge started (config={cfg_path})")
@@ -3113,7 +3394,9 @@ class TelegramBridge:
         chat = msg.get("chat") or {}
         frm = msg.get("from") or {}
         if cfg.get("chat_id") and cfg.get("user_id"):
-            return int(chat.get("id", 0)) == int(cfg["chat_id"]) and int(frm.get("id", 0)) == int(cfg["user_id"])
+            return int(chat.get("id", 0)) == int(cfg["chat_id"]) and int(
+                frm.get("id", 0)
+            ) == int(cfg["user_id"])
         return False
 
     def _rel_path(self, p: Path) -> str:
@@ -3122,12 +3405,21 @@ class TelegramBridge:
         except Exception:
             return str(p)
 
-    def _save_telegram_file(self, cfg: Dict[str, Any], file_id: Optional[str], *, prefer_name: Optional[str] = None) -> Optional[Path]:
+    def _save_telegram_file(
+        self,
+        cfg: Dict[str, Any],
+        file_id: Optional[str],
+        *,
+        prefer_name: Optional[str] = None,
+    ) -> Optional[Path]:
         token = cfg.get("bot_token")
         if not token or not file_id:
             return None
         try:
-            info = _telegram_api(token, "getFile", {"file_id": file_id}, timeout=20.0) or {}
+            info = (
+                _telegram_api(token, "getFile", {"file_id": file_id}, timeout=20.0)
+                or {}
+            )
             file_path = info.get("file_path")
             if not file_path:
                 raise CTeamError("missing file_path")
@@ -3166,12 +3458,20 @@ class TelegramBridge:
                 cfg["chat_id"] = int(chat_id)
                 cfg["user_id"] = int(frm.get("id", 0) or 0)
                 telegram_save_config(self.root, self.state, cfg)
-                _telegram_send_text(cfg, "✅ Linked! This chat is now authorized for the cteam customer channel.")
-                log_line(self.root, f"[telegram] authorized chat_id={cfg['chat_id']} user_id={cfg['user_id']}")
+                _telegram_send_text(
+                    cfg,
+                    "✅ Linked! This chat is now authorized for the cteam customer channel.",
+                )
+                log_line(
+                    self.root,
+                    f"[telegram] authorized chat_id={cfg['chat_id']} user_id={cfg['user_id']}",
+                )
             else:
                 tmp = dict(cfg)
                 tmp["chat_id"] = int(chat_id)
-                _telegram_send_text(tmp, "⛔ Not authorized (phone number did not match).")
+                _telegram_send_text(
+                    tmp, "⛔ Not authorized (phone number did not match)."
+                )
             return
 
         if text == "/start" and chat_id:
@@ -3201,7 +3501,11 @@ class TelegramBridge:
         if document:
             doc_is_image = _is_image_document(document)
             if doc_is_image:
-                saved = self._save_telegram_file(cfg, document.get("file_id"), prefer_name=document.get("file_name") or "image")
+                saved = self._save_telegram_file(
+                    cfg,
+                    document.get("file_id"),
+                    prefer_name=document.get("file_name") or "image",
+                )
                 if saved:
                     attachments.append(f"Image saved to {self._rel_path(saved)}")
                 else:
@@ -3249,13 +3553,18 @@ class TelegramBridge:
         # Mirror into customer channel for visibility/logging (customer chat tails this file).
         try:
             ts = now_iso()
-            entry = format_message(ts, "customer", "customer", "Telegram", body, msg_type="MESSAGE")
+            entry = format_message(
+                ts, "customer", "customer", "Telegram", body, msg_type="MESSAGE"
+            )
             cust_msg, cust_inbox, _ = mailbox_paths(self.root, "customer")
             mkdirp(cust_inbox)
             append_text(cust_msg, entry)
             atomic_write_text(cust_inbox / f"{ts_for_filename(ts)}_customer.md", entry)
         except Exception as e:
-            log_line(self.root, f"[telegram] failed to mirror inbound to customer mailbox: {e}")
+            log_line(
+                self.root,
+                f"[telegram] failed to mirror inbound to customer mailbox: {e}",
+            )
 
     def _maybe_forward_outbound(self, cfg: Dict[str, Any], customer_file: Path) -> None:
         if not cfg.get("chat_id"):
@@ -3293,7 +3602,7 @@ class TelegramBridge:
             out = f"[{ts or now_iso()}] {sender or 'cteam'}\n"
             if subject:
                 out += f"Subject: {subject}\n"
-            out += (body or "(no body)")
+            out += body or "(no body)"
             try:
                 _telegram_send_text(cfg, out)
             except Exception as e:
@@ -3303,7 +3612,10 @@ class TelegramBridge:
 # Router / watch loop
 # -----------------------------
 
-def parse_sender_and_type_from_message(text: str) -> Tuple[Optional[str], Optional[str]]:
+
+def parse_sender_and_type_from_message(
+    text: str,
+) -> Tuple[Optional[str], Optional[str]]:
     sender = None
     m = re.search(r"From:\s*([^\s→]+)", text)
     if m:
@@ -3313,9 +3625,9 @@ def parse_sender_and_type_from_message(text: str) -> Tuple[Optional[str], Option
     return sender, msg_type
 
 
-
 # -----------------------------
 # Router helpers (dashboard, spawn approvals, IM commands)
+
 
 @contextmanager
 def file_lock(lock_path: Path):
@@ -3422,9 +3734,11 @@ def create_spawn_request(
         return req
 
 
-def find_spawn_request_by_token(store: Dict[str, Any], token: str) -> Optional[Dict[str, Any]]:
+def find_spawn_request_by_token(
+    store: Dict[str, Any], token: str
+) -> Optional[Dict[str, Any]]:
     token = (token or "").strip().upper()
-    for r in (store.get("requests") or []):
+    for r in store.get("requests") or []:
         if str(r.get("token", "")).strip().upper() == token:
             return r
     return None
@@ -3441,7 +3755,7 @@ def tmux_capture_tail(session: str, window: str, *, lines: int = 200) -> str:
             capture=True,
             check=False,
         )
-        return (cp.stdout or "")
+        return cp.stdout or ""
     except Exception:
         return ""
 
@@ -3507,7 +3821,11 @@ def compute_dashboard_snapshot(
     except Exception:
         store = _ticket_store_default()
     tickets = store.get("tickets") or []
-    active = [t for t in tickets if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+    active = [
+        t
+        for t in tickets
+        if t.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}
+    ]
     unassigned = [t for t in active if not t.get("assignee")]
     blocked = [t for t in active if t.get("status") == TICKET_STATUS_BLOCKED]
     open_tickets = [t for t in active if t.get("status") == TICKET_STATUS_OPEN]
@@ -3521,7 +3839,9 @@ def compute_dashboard_snapshot(
 
     agents_out: List[Dict[str, Any]] = []
 
-    codex_cmd = str((state.get("codex") or {}).get("cmd") or DEFAULT_CODEX_CMD).split()[0]
+    codex_cmd = str((state.get("codex") or {}).get("cmd") or DEFAULT_CODEX_CMD).split()[
+        0
+    ]
     codex_basename = Path(codex_cmd).name
 
     for a in state["agents"]:
@@ -3566,8 +3886,15 @@ def compute_dashboard_snapshot(
             "active": len(active),
             "unassigned": len(unassigned),
             "unassigned_list": [
-                {"id": tt.get("id", ""), "title": tt.get("title", ""), "priority": tt.get("priority")}
-                for tt in sorted(unassigned, key=lambda x: (_ticket_priority_value(x), x.get("id", "")))[:12]
+                {
+                    "id": tt.get("id", ""),
+                    "title": tt.get("title", ""),
+                    "priority": tt.get("priority"),
+                }
+                for tt in sorted(
+                    unassigned,
+                    key=lambda x: (_ticket_priority_value(x), x.get("id", "")),
+                )[:12]
             ],
         },
         "agents": agents_out,
@@ -3584,11 +3911,13 @@ def format_status_board_md(dash: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"# Status board — {ts}")
     lines.append("")
-    lines.append(f"Stage: `{stage}` | Auto-dispatch: `{str(bool(auto_dispatch)).lower()}`")
+    lines.append(
+        f"Stage: `{stage}` | Auto-dispatch: `{str(bool(auto_dispatch)).lower()}`"
+    )
     lines.append("")
     lines.append("## Tickets")
     lines.append(
-        f"Active: {t.get('active',0)}  | Open: {t.get('open',0)}  | Blocked: {t.get('blocked',0)}  | Unassigned: {t.get('unassigned',0)}"
+        f"Active: {t.get('active', 0)}  | Open: {t.get('open', 0)}  | Blocked: {t.get('blocked', 0)}  | Unassigned: {t.get('unassigned', 0)}"
     )
     ul = t.get("unassigned_list") or []
     if ul:
@@ -3602,7 +3931,9 @@ def format_status_board_md(dash: Dict[str, Any]) -> str:
             lines.append(f"- {tid}{pr_txt} — {title}")
     lines.append("")
     lines.append("## Agents")
-    lines.append("| agent | role | tmux | codex | idle | tickets | status_age | mail_age | pane |")
+    lines.append(
+        "| agent | role | tmux | codex | idle | tickets | status_age | mail_age | pane |"
+    )
     lines.append("|---|---|---:|---:|---:|---|---:|---:|---|")
     for a in agents:
         name = a.get("name", "")
@@ -3614,7 +3945,9 @@ def format_status_board_md(dash: Dict[str, Any]) -> str:
         s_age = _human_duration(a.get("status_age_s"))
         m_age = _human_duration(a.get("mail_age_s"))
         pane = (a.get("pane_cmd") or "-")[:40]
-        lines.append(f"| {name} | {role} | {window} | {codex} | {idle} | {tickets} | {s_age} | {m_age} | {pane} |")
+        lines.append(
+            f"| {name} | {role} | {window} | {codex} | {idle} | {tickets} | {s_age} | {m_age} | {pane} |"
+        )
     lines.append("")
     lines.append("_Generated by router. Do not edit by hand._")
     return "\n".join(lines) + "\n"
@@ -3627,13 +3960,13 @@ def format_dashboard_for_customer(dash: Dict[str, Any]) -> str:
     lines: List[str] = []
     lines.append(f"Stage: {stage}")
     lines.append(
-        f"Tickets: active={t.get('active',0)} open={t.get('open',0)} blocked={t.get('blocked',0)} unassigned={t.get('unassigned',0)}"
+        f"Tickets: active={t.get('active', 0)} open={t.get('open', 0)} blocked={t.get('blocked', 0)} unassigned={t.get('unassigned', 0)}"
     )
     ul = t.get("unassigned_list") or []
     if ul:
         lines.append("Unassigned (top):")
         for it in ul[:8]:
-            lines.append(f"- {it.get('id','?')} — {it.get('title','')}")
+            lines.append(f"- {it.get('id', '?')} — {it.get('title', '')}")
     lines.append("Agents:")
     for a in agents:
         idle = a.get("idle_for_s")
@@ -3668,7 +4001,7 @@ def _format_ticket_detail(store: Dict[str, Any], ticket_id: str) -> str:
     for e in tail:
         try:
             hist_lines.append(
-                f"- {e.get('ts','')}: {e.get('type','')} {e.get('by','')} {e.get('note','') or e.get('snippet','')}"
+                f"- {e.get('ts', '')}: {e.get('type', '')} {e.get('by', '')} {e.get('note', '') or e.get('snippet', '')}"
             )
         except Exception:
             pass
@@ -3677,9 +4010,14 @@ def _format_ticket_detail(store: Dict[str, Any], ticket_id: str) -> str:
 
 
 def cmd_watch(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("watch: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "watch: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
     agent_names = {a["name"] for a in state["agents"]}
     ensure_shared_scaffold(root, state)
@@ -3736,7 +4074,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         resume_prompt_count[a["name"]] = 0
         last_resume_escalation[a["name"]] = 0.0
         try:
-            last_status_mtime[a["name"]] = (root / a["dir_rel"] / "STATUS.md").stat().st_mtime
+            last_status_mtime[a["name"]] = (
+                (root / a["dir_rel"] / "STATUS.md").stat().st_mtime
+            )
         except FileNotFoundError:
             last_status_mtime[a["name"]] = now_ts
         try:
@@ -3745,7 +4085,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
             if ts0:
                 last_seen_mail_ts[a["name"]] = ts0
             if entry and entry.strip():
-                last_seen_mail_sig[a["name"]] = hashlib.sha256(entry.strip().encode("utf-8", "ignore")).hexdigest()
+                last_seen_mail_sig[a["name"]] = hashlib.sha256(
+                    entry.strip().encode("utf-8", "ignore")
+                ).hexdigest()
         except Exception:
             pass
         last_mailbox_nudge[a["name"]] = 0.0
@@ -3770,7 +4112,10 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 last_pane_change=last_pane_change,
                 last_mail_activity=last_mail_activity,
             )
-            atomic_write_text(dashboard_json_path(root), json.dumps(dash, indent=2, sort_keys=True) + "\n")
+            atomic_write_text(
+                dashboard_json_path(root),
+                json.dumps(dash, indent=2, sort_keys=True) + "\n",
+            )
             atomic_write_text(status_board_path(root), format_status_board_md(dash))
             return dash
         except Exception as e:
@@ -3789,7 +4134,13 @@ def cmd_watch(args: argparse.Namespace) -> None:
 
         idle_thresh = float(sup.get("agent_idle_seconds", 120) or 120)
         agents = dash.get("agents") or []
-        idle_agents = [a for a in agents if a.get("name") != "pm" and a.get("window") and (a.get("idle_for_s") or 0) >= idle_thresh]
+        idle_agents = [
+            a
+            for a in agents
+            if a.get("name") != "pm"
+            and a.get("window")
+            and (a.get("idle_for_s") or 0) >= idle_thresh
+        ]
         unassigned = int((dash.get("tickets") or {}).get("unassigned", 0) or 0)
         blocked = int((dash.get("tickets") or {}).get("blocked", 0) or 0)
         if not idle_agents and unassigned == 0 and blocked == 0:
@@ -3798,13 +4149,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
         last_pm_digest = now
         lines: List[str] = []
         lines.append("Supervisor digest (router)")
-        lines.append(f"Stage: {dash.get('stage','')}")
-        lines.append(f"Tickets: unassigned={unassigned} blocked={blocked} active={int((dash.get('tickets') or {}).get('active',0) or 0)}")
+        lines.append(f"Stage: {dash.get('stage', '')}")
+        lines.append(
+            f"Tickets: unassigned={unassigned} blocked={blocked} active={int((dash.get('tickets') or {}).get('active', 0) or 0)}"
+        )
         if idle_agents:
             lines.append("Idle agents:")
             for a in idle_agents[:10]:
                 lines.append(
-                    f"- {a.get('name')} ({a.get('role')}): idle { _human_duration(a.get('idle_for_s')) } — tickets: {','.join(a.get('tickets') or []) or '(none)'}"
+                    f"- {a.get('name')} ({a.get('role')}): idle {_human_duration(a.get('idle_for_s'))} — tickets: {','.join(a.get('tickets') or []) or '(none)'}"
                 )
         lines.append("")
         lines.append("Tip: open shared/STATUS_BOARD.md for the live board.")
@@ -3844,7 +4197,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         "- /deny <TOKEN>       (deny a pending 'spawn agent' request)",
                     ]
                 )
-                write_message(root, state, sender="cteam", recipient="customer", subject="Available commands", body=help_txt, nudge=False)
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient="customer",
+                    subject="Available commands",
+                    body=help_txt,
+                    nudge=False,
+                )
                 handled_any = True
             elif cmd == "tickets":
                 write_message(
@@ -3858,8 +4219,20 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 )
                 handled_any = True
             elif cmd == "ticket":
-                body = "Usage: /ticket T001" if not argv else _format_ticket_detail(store, argv[0])
-                write_message(root, state, sender="cteam", recipient="customer", subject="Ticket detail", body=body, nudge=False)
+                body = (
+                    "Usage: /ticket T001"
+                    if not argv
+                    else _format_ticket_detail(store, argv[0])
+                )
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient="customer",
+                    subject="Ticket detail",
+                    body=body,
+                    nudge=False,
+                )
                 handled_any = True
             elif cmd in {"status", "dashboard"}:
                 try:
@@ -3873,7 +4246,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     body = format_dashboard_for_customer(dash)
                 except Exception:
                     body = "Dashboard unavailable."
-                write_message(root, state, sender="cteam", recipient="customer", subject="Status", body=body, nudge=False)
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient="customer",
+                    subject="Status",
+                    body=body,
+                    nudge=False,
+                )
                 handled_any = True
             elif cmd in {"tail", "pane"}:
                 if not argv:
@@ -3889,12 +4270,28 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         body = f"(no pane output captured for {agent})"
                     else:
                         body = f"Last {n} lines from tmux:{agent}\n\n```\n{txt.rstrip()}\n```"
-                write_message(root, state, sender="cteam", recipient="customer", subject="tmux capture", body=body, nudge=False)
+                write_message(
+                    root,
+                    state,
+                    sender="cteam",
+                    recipient="customer",
+                    subject="tmux capture",
+                    body=body,
+                    nudge=False,
+                )
                 handled_any = True
             elif cmd in {"approve", "deny"}:
                 if not argv:
                     body = f"Usage: /{cmd} <TOKEN>"
-                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn approval", body=body, nudge=False)
+                    write_message(
+                        root,
+                        state,
+                        sender="cteam",
+                        recipient="customer",
+                        subject="Spawn approval",
+                        body=body,
+                        nudge=False,
+                    )
                     handled_any = True
                 else:
                     token = argv[0].strip().upper()
@@ -3930,8 +4327,24 @@ def cmd_watch(args: argparse.Namespace) -> None:
                                 req["decided_by"] = "customer"
                                 save_spawn_requests(root, store_sr)
                                 note = f"Denied request {req.get('id')} (role={req.get('role')})."
-                                write_message(root, state, sender="cteam", recipient="customer", subject="Spawn denied", body=note, nudge=False)
-                                write_message(root, state, sender="cteam", recipient="pm", subject="Spawn denied by customer", body=note, nudge=True)
+                                write_message(
+                                    root,
+                                    state,
+                                    sender="cteam",
+                                    recipient="customer",
+                                    subject="Spawn denied",
+                                    body=note,
+                                    nudge=False,
+                                )
+                                write_message(
+                                    root,
+                                    state,
+                                    sender="cteam",
+                                    recipient="pm",
+                                    subject="Spawn denied by customer",
+                                    body=note,
+                                    nudge=True,
+                                )
                                 handled_any = True
                             else:
                                 req["status"] = "approved"
@@ -3953,13 +4366,45 @@ def cmd_watch(args: argparse.Namespace) -> None:
                                     req["fulfilled_agent"] = agent.get("name")
                                     save_spawn_requests(root, store_sr)
                                     note = f"Approved {req.get('id')} — spawned agent {agent.get('name')} ({agent.get('role')})."
-                                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn approved", body=note, nudge=False)
-                                    write_message(root, state, sender="cteam", recipient="pm", subject="Spawn approved — agent created", body=note, nudge=True)
+                                    write_message(
+                                        root,
+                                        state,
+                                        sender="cteam",
+                                        recipient="customer",
+                                        subject="Spawn approved",
+                                        body=note,
+                                        nudge=False,
+                                    )
+                                    write_message(
+                                        root,
+                                        state,
+                                        sender="cteam",
+                                        recipient="pm",
+                                        subject="Spawn approved — agent created",
+                                        body=note,
+                                        nudge=True,
+                                    )
                                     handled_any = True
                                 except Exception as e:
                                     note = f"Spawn failed after approval: {e}"
-                                    write_message(root, state, sender="cteam", recipient="customer", subject="Spawn failed", body=note, nudge=False)
-                                    write_message(root, state, sender="cteam", recipient="pm", subject="Spawn failed", body=note, nudge=True)
+                                    write_message(
+                                        root,
+                                        state,
+                                        sender="cteam",
+                                        recipient="customer",
+                                        subject="Spawn failed",
+                                        body=note,
+                                        nudge=False,
+                                    )
+                                    write_message(
+                                        root,
+                                        state,
+                                        sender="cteam",
+                                        recipient="pm",
+                                        subject="Spawn failed",
+                                        body=note,
+                                        nudge=True,
+                                    )
                                     handled_any = True
 
         if handled_any:
@@ -4010,7 +4455,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
             # Filter out pure slash-command messages from the digest; those are handled immediately.
             if (body or "").lstrip().startswith("/"):
                 continue
-            blocks.append(f"---\n{ts0 or ''} | {subj or '(no subject)'}\n{(body or '').strip()}")
+            blocks.append(
+                f"---\n{ts0 or ''} | {subj or '(no subject)'}\n{(body or '').strip()}"
+            )
 
         digest = "\n\n".join(blocks).strip()
         if not digest:
@@ -4024,7 +4471,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
             sender="cteam",
             recipient="pm",
             subject=f"Customer burst digest ({len(entries)} msgs)",
-            body=digest + "\n\nAction: reply in the customer channel and update shared/BRIEF.md.",
+            body=digest
+            + "\n\nAction: reply in the customer channel and update shared/BRIEF.md.",
             msg_type="MESSAGE",
             nudge=True,
             start_if_needed=True,
@@ -4046,7 +4494,8 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     sender="cteam",
                     recipient=helper,
                     subject="Assist PM: draft response + propose tickets",
-                    body=digest + "\n\nTask: draft a customer reply and propose concrete tickets; send your draft to PM.",
+                    body=digest
+                    + "\n\nTask: draft a customer reply and propose concrete tickets; send your draft to PM.",
                     msg_type="MESSAGE",
                     nudge=True,
                     start_if_needed=True,
@@ -4069,19 +4518,28 @@ def cmd_watch(args: argparse.Namespace) -> None:
         coord = state.get("coordination") or {}
         if not bool(coord.get("auto_dispatch", False)):
             return
-        if str(coord.get("stage", "discovery")).lower() not in {"execution", "implement", "implementation"}:
+        if str(coord.get("stage", "discovery")).lower() not in {
+            "execution",
+            "implement",
+            "implementation",
+        }:
             return
         try:
             store = load_tickets(root, state)
         except Exception:
             return
-        ready = [tt for tt in (store.get("tickets") or []) if ticket_is_ready(store, tt)]
+        ready = [
+            tt for tt in (store.get("tickets") or []) if ticket_is_ready(store, tt)
+        ]
         if not ready:
             return
 
         active_by_assignee: Dict[str, int] = {}
-        for tt in (store.get("tickets") or []):
-            if tt.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED} and tt.get("assignee"):
+        for tt in store.get("tickets") or []:
+            if tt.get("status") in {
+                TICKET_STATUS_OPEN,
+                TICKET_STATUS_BLOCKED,
+            } and tt.get("assignee"):
                 a = str(tt.get("assignee"))
                 active_by_assignee[a] = active_by_assignee.get(a, 0) + 1
 
@@ -4101,7 +4559,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
         if not candidates:
             return
 
-        ready_sorted = sorted(ready, key=lambda x: (_ticket_priority_value(x), x.get("id", "")))
+        ready_sorted = sorted(
+            ready, key=lambda x: (_ticket_priority_value(x), x.get("id", ""))
+        )
         assignee = candidates[0]
         tt = ready_sorted[0]
         tid = tt.get("id", "")
@@ -4238,9 +4698,13 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     last_txt = read_last_entry(fp)
                 except Exception:
                     last_txt = ""
-                last_ts, last_sender, _, _, last_body, last_ticket, last_type = _parse_entry(last_txt)
+                last_ts, last_sender, _, _, last_body, last_ticket, last_type = (
+                    _parse_entry(last_txt)
+                )
                 if last_txt and last_txt.strip():
-                    last_sig = hashlib.sha256(last_txt.strip().encode("utf-8", "ignore")).hexdigest()
+                    last_sig = hashlib.sha256(
+                        last_txt.strip().encode("utf-8", "ignore")
+                    ).hexdigest()
 
             # Deduplicate mailbox nudges: only react when the newest entry changes.
             if last_sig and last_seen_mail_sig.get(name) == last_sig:
@@ -4258,10 +4722,21 @@ def cmd_watch(args: argparse.Namespace) -> None:
             # Start agent only on assignment.
             if last_sender and last_type:
                 if last_type == ASSIGNMENT_TYPE or (
-                    bool((state.get("coordination") or {}).get("start_agents_on_assignment", True))
-                    and str(last_sender) in set((state.get("coordination") or {}).get("assignment_from", ["pm", "cteam"]))
+                    bool(
+                        (state.get("coordination") or {}).get(
+                            "start_agents_on_assignment", True
+                        )
+                    )
+                    and str(last_sender)
+                    in set(
+                        (state.get("coordination") or {}).get(
+                            "assignment_from", ["pm", "cteam"]
+                        )
+                    )
                 ):
-                    maybe_start_agent_on_message(root, state, name, sender=last_sender, msg_type=last_type)
+                    maybe_start_agent_on_message(
+                        root, state, name, sender=last_sender, msg_type=last_type
+                    )
 
             # Customer-to-PM: handle commands immediately, but avoid interrupting PM on every burst message.
             if name == "pm" and (last_sender or "").lower() == "customer":
@@ -4325,7 +4800,11 @@ def cmd_watch(args: argparse.Namespace) -> None:
         try:
             store = load_tickets(root, state)
             tickets = store.get("tickets") or []
-            active = [tt for tt in tickets if tt.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}]
+            active = [
+                tt
+                for tt in tickets
+                if tt.get("status") in {TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED}
+            ]
             for tt in active:
                 ass = tt.get("assignee") or ""
                 if not ass:
@@ -4353,15 +4832,26 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 idle_for = time.time() - float(last_pane_change.get(name, time.time()))
                 assigned = [x for x in by_assignee.get(name, []) if x]
                 if assigned:
-                    if idle_for >= stalled_s and (time.time() - float(last_agent_stall_nudge.get(name, 0.0))) >= stalled_s:
+                    if (
+                        idle_for >= stalled_s
+                        and (time.time() - float(last_agent_stall_nudge.get(name, 0.0)))
+                        >= stalled_s
+                    ):
                         last_agent_stall_nudge[name] = time.time()
                         nudge_queue.request(
                             name,
-                            reason=f"STALLED — tickets {','.join(assigned)}. Deliver the next concrete step now; if blocked, mark ticket blocked and tell PM immediately.",
+                            reason=f"STALLED — tickets {','.join(assigned)}. Analyse the problem, devise a solution, plan the steps, implement the change, verify it works. Deliver the next concrete step now; if blocked, mark ticket blocked and tell PM immediately.",
                             interrupt=True,
                         )
                 else:
-                    if idle_for >= unassigned_s and (time.time() - float(last_agent_unassigned_nudge.get(name, 0.0))) >= unassigned_s:
+                    if (
+                        idle_for >= unassigned_s
+                        and (
+                            time.time()
+                            - float(last_agent_unassigned_nudge.get(name, 0.0))
+                        )
+                        >= unassigned_s
+                    ):
                         last_agent_unassigned_nudge[name] = time.time()
                         nudge_queue.request(
                             name,
@@ -4375,16 +4865,26 @@ def cmd_watch(args: argparse.Namespace) -> None:
         try:
             sup = state.get("supervision") or {}
             resume_s = float(sup.get("agent_resume_seconds", 180) or 180)
-            resume_cooldown = float(sup.get("agent_resume_cooldown_seconds", resume_s) or resume_s)
+            resume_cooldown = float(
+                sup.get("agent_resume_cooldown_seconds", resume_s) or resume_s
+            )
             resume_max = int(sup.get("agent_resume_max_prompts", 2) or 2)
-            remind_s = float(sup.get("assigned_ticket_reminder_seconds", 60) or 60)
+            remind_s = float(sup.get("assigned_ticket_reminder_seconds", 180) or 180)
             now_resume = time.time()
             for agent_name, assigned in by_assignee.items():
                 if not assigned or agent_name == "pm":
                     continue
                 # Idle reminder listing assigned tickets.
-                idle_for = now_resume - float(last_pane_change.get(agent_name, now_resume))
-                if idle_for >= remind_s and (now_resume - float(last_assigned_reminder.get(agent_name, 0.0))) >= remind_s:
+                idle_for = now_resume - float(
+                    last_pane_change.get(agent_name, now_resume)
+                )
+                if (
+                    idle_for >= remind_s
+                    and (
+                        now_resume - float(last_assigned_reminder.get(agent_name, 0.0))
+                    )
+                    >= remind_s
+                ):
                     assigned_list = ", ".join(sorted(assigned))
                     body = (
                         "You still own these tickets:\n"
@@ -4408,7 +4908,9 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     continue
                 # If already escalated beyond threshold and no new progress, pause re-prompts until STATUS or message.
                 if resume_prompt_count.get(agent_name, 0) >= resume_max:
-                    if (now_resume - float(last_resume_escalation.get(agent_name, 0.0))) >= resume_cooldown:
+                    if (
+                        now_resume - float(last_resume_escalation.get(agent_name, 0.0))
+                    ) >= resume_cooldown:
                         pm_body = (
                             f"Agent @{agent_name} has exceeded resume prompts ({resume_prompt_count.get(agent_name, 0)}x) "
                             f"on tickets {', '.join(sorted(assigned))} with no STATUS.md update. "
@@ -4427,14 +4929,22 @@ def cmd_watch(args: argparse.Namespace) -> None:
                         )
                         last_resume_escalation[agent_name] = now_resume
                     continue
-                idle_since_pane = now_resume - float(last_pane_change.get(agent_name, now_resume))
+                idle_since_pane = now_resume - float(
+                    last_pane_change.get(agent_name, now_resume)
+                )
                 if idle_since_pane < resume_s:
                     continue
-                if (now_resume - float(last_agent_reply.get(agent_name, 0.0))) < resume_s:
+                if (
+                    now_resume - float(last_agent_reply.get(agent_name, 0.0))
+                ) < resume_s:
                     continue
-                if (now_resume - float(last_resume_prompt.get(agent_name, 0.0))) < resume_cooldown:
+                if (
+                    now_resume - float(last_resume_prompt.get(agent_name, 0.0))
+                ) < resume_cooldown:
                     continue
-                status_age = now_resume - float(last_status_mtime.get(agent_name, now_resume))
+                status_age = now_resume - float(
+                    last_status_mtime.get(agent_name, now_resume)
+                )
 
                 assigned_list = ", ".join(sorted(assigned))
                 body = (
@@ -4455,13 +4965,18 @@ def cmd_watch(args: argparse.Namespace) -> None:
                     start_if_needed=True,
                 )
                 last_resume_prompt[agent_name] = now_resume
-                resume_prompt_count[agent_name] = resume_prompt_count.get(agent_name, 0) + 1
+                resume_prompt_count[agent_name] = (
+                    resume_prompt_count.get(agent_name, 0) + 1
+                )
 
                 # Escalate to PM if an agent keeps looping without visible progress (stale STATUS).
                 if (
                     resume_prompt_count[agent_name] >= max(resume_max, 2)
                     and status_age >= resume_s
-                    and (now_resume - float(last_resume_escalation.get(agent_name, 0.0))) >= resume_cooldown
+                    and (
+                        now_resume - float(last_resume_escalation.get(agent_name, 0.0))
+                    )
+                    >= resume_cooldown
                 ):
                     pm_body = (
                         f"Agent @{agent_name} has been re-prompted {resume_prompt_count[agent_name]} times "
@@ -4490,10 +5005,19 @@ def cmd_watch(args: argparse.Namespace) -> None:
             idle_s = float(sup.get("agent_idle_seconds", 120) or 120)
             non_pm = [a["name"] for a in state["agents"] if a["name"] != "pm"]
             if non_pm:
-                pm_idle = (time.time() - float(last_pane_change.get("pm", time.time()))) >= idle_s
-                team_idle = all((time.time() - float(last_pane_change.get(n, time.time()))) >= idle_s for n in non_pm)
+                pm_idle = (
+                    time.time() - float(last_pane_change.get("pm", time.time()))
+                ) >= idle_s
+                team_idle = all(
+                    (time.time() - float(last_pane_change.get(n, time.time())))
+                    >= idle_s
+                    for n in non_pm
+                )
                 if pm_idle and team_idle and not state["tmux"].get("paused", False):
-                    nudge_queue.request("pm", reason="TEAM IDLE — check STATUS_BOARD.md and assign next tickets")
+                    nudge_queue.request(
+                        "pm",
+                        reason="TEAM IDLE — check STATUS_BOARD.md and assign next tickets",
+                    )
                     pm_idle_pending = True
         except Exception:
             pass
@@ -4504,15 +5028,27 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 if skip_reason in {"duplicate", "busy"}:
                     continue
 
-                if ok and customer_nag_pending and agent_name == "pm" and "CUSTOMER WAITING" in reason_text:
+                if (
+                    ok
+                    and customer_nag_pending
+                    and agent_name == "pm"
+                    and "CUSTOMER WAITING" in reason_text
+                ):
                     try:
                         cust_state = customer_state_for_nag or load_customer_state(root)
                         cust_state["last_pm_nag_ts"] = now_iso()
-                        cust_state["pm_nag_count"] = int(cust_state.get("pm_nag_count", 0) or 0) + 1
+                        cust_state["pm_nag_count"] = (
+                            int(cust_state.get("pm_nag_count", 0) or 0) + 1
+                        )
                         save_customer_state(root, cust_state)
                     except Exception:
                         pass
-                if ok and pm_idle_pending and agent_name == "pm" and "TEAM IDLE" in reason_text:
+                if (
+                    ok
+                    and pm_idle_pending
+                    and agent_name == "pm"
+                    and "TEAM IDLE" in reason_text
+                ):
                     # Acknowledge for logging
                     pass
         except Exception:
@@ -4521,12 +5057,15 @@ def cmd_watch(args: argparse.Namespace) -> None:
         time.sleep(interval)
 
 
-
-
 def cmd_customer_chat(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("customer-chat: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "customer-chat: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     history_path = root / DIR_RUNTIME / "customer_chat.history"
@@ -4539,7 +5078,10 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
     mkdirp(chat_dir / "sent")
     chat_file = chat_dir / "message.md"
     if not chat_file.exists():
-        atomic_write_text(chat_file, "# Customer channel\n\nUse this window to chat with the PM/team.\n\n")
+        atomic_write_text(
+            chat_file,
+            "# Customer channel\n\nUse this window to chat with the PM/team.\n\n",
+        )
 
     print("=== Customer chat ===")
     print("Type a message and press Enter to send to PM. Ctrl+C to exit.\n")
@@ -4550,7 +5092,6 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
             print(existing.rstrip())
     except Exception:
         pass
-
 
     stop = threading.Event()
 
@@ -4624,9 +5165,14 @@ def cmd_customer_chat(args: argparse.Namespace) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("chat: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "chat: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     history_path = root / DIR_RUNTIME / f"chat_{slugify(args.to)}.history"
@@ -4652,7 +5198,6 @@ def cmd_chat(args: argparse.Namespace) -> None:
             print(existing.rstrip())
     except Exception:
         pass
-
 
     stop = threading.Event()
 
@@ -4705,9 +5250,14 @@ def cmd_chat(args: argparse.Namespace) -> None:
 
 
 def cmd_upload(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("upload: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "upload: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     dest_root = root / DIR_SHARED_DRIVE
@@ -4764,24 +5314,34 @@ def cmd_pause(args: argparse.Namespace) -> None:
         for agent in state["agents"]:
             try:
                 try:
-                    tmux_send_keys(session, agent["name"], ["Escape", "Escape", "Escape", "C-c"])
+                    tmux_send_keys(
+                        session, agent["name"], ["Escape", "Escape", "Escape", "C-c"]
+                    )
                 except Exception:
                     pass
                 cmd_args = standby_window_command(root, state, agent)
-                tmux_respawn_window(session, agent["name"], Path(agent["dir_abs"]), command_args=cmd_args)
+                tmux_respawn_window(
+                    session,
+                    agent["name"],
+                    Path(agent["dir_abs"]),
+                    command_args=cmd_args,
+                )
             except Exception:
                 pass
         # Quiet router window.
         try:
             try:
-                tmux_send_keys(session, ROUTER_WINDOW, ["Escape", "Escape", "Escape", "C-c"])
+                tmux_send_keys(
+                    session, ROUTER_WINDOW, ["Escape", "Escape", "Escape", "C-c"]
+                )
             except Exception:
                 pass
             tmux_respawn_window(
                 session,
                 ROUTER_WINDOW,
                 root,
-                command_args=pick_shell() + ["printf 'cteam paused; router idle\\n'; exec $SHELL"],
+                command_args=pick_shell()
+                + ["printf 'cteam paused; router idle\\n'; exec $SHELL"],
             )
         except Exception:
             pass
@@ -4791,6 +5351,7 @@ def cmd_pause(args: argparse.Namespace) -> None:
 # -----------------------------
 # High-level operations: init/import/resume/open
 # -----------------------------
+
 
 def create_root_structure(root: Path, state: Dict[str, Any]) -> bool:
     mkdirp(root)
@@ -4812,7 +5373,9 @@ def ensure_tmux(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> Non
         start_codex_in_window(root, state, pm_agent, boot=True)
 
 
-def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: bool) -> None:
+def ensure_agent_windows(
+    root: Path, state: Dict[str, Any], *, launch_codex: bool
+) -> None:
     session = state["tmux"]["session"]
     auto = set(autostart_agent_names(state))
 
@@ -4833,26 +5396,47 @@ def ensure_agent_windows(root: Path, state: Dict[str, Any], *, launch_codex: boo
 # Commands
 # -----------------------------
 
-def _init_wizard(root: Path, state: Dict[str, Any], *, ask_telegram: bool = True) -> Dict[str, Any]:
+
+def _init_wizard(
+    root: Path, state: Dict[str, Any], *, ask_telegram: bool = True
+) -> Dict[str, Any]:
     """Interactive init wizard: capture seed text and optionally configure Telegram."""
     history_path = root / DIR_RUNTIME / "init_wizard.history"
     configure_readline(history_path)
 
     seed_file = root / DIR_SEED / "SEED.md"
-    if not seed_file.exists() or not seed_file.read_text(encoding="utf-8", errors="replace").strip():
-        seed_txt = prompt_multiline("Paste customer/seed requirements (optional).", history_path=history_path)
+    if (
+        not seed_file.exists()
+        or not seed_file.read_text(encoding="utf-8", errors="replace").strip()
+    ):
+        seed_txt = prompt_multiline(
+            "Paste customer/seed requirements (optional).", history_path=history_path
+        )
         if seed_txt.strip():
             atomic_write_text(seed_file, "# Seed input\n\n" + seed_txt.strip() + "\n")
 
     extras_file = root / DIR_SEED_EXTRAS / "EXTRAS.md"
-    if not extras_file.exists() or not extras_file.read_text(encoding="utf-8", errors="replace").strip():
-        extras_txt = prompt_multiline("Paste seed-extras (links, research notes) (optional).", history_path=history_path)
+    if (
+        not extras_file.exists()
+        or not extras_file.read_text(encoding="utf-8", errors="replace").strip()
+    ):
+        extras_txt = prompt_multiline(
+            "Paste seed-extras (links, research notes) (optional).",
+            history_path=history_path,
+        )
         if extras_txt.strip():
-            atomic_write_text(extras_file, "# Seed extras\n\n" + extras_txt.strip() + "\n")
+            atomic_write_text(
+                extras_file, "# Seed extras\n\n" + extras_txt.strip() + "\n"
+            )
 
-    if ask_telegram and prompt_yes_no("Configure Telegram customer chat now?", default=False):
+    if ask_telegram and prompt_yes_no(
+        "Configure Telegram customer chat now?", default=False
+    ):
         token = prompt_line("Telegram bot token (from @BotFather)", default="")
-        phone = prompt_line("Authorized phone number (digits; E.164 preferred, e.g. +15551234567)", default="")
+        phone = prompt_line(
+            "Authorized phone number (digits; E.164 preferred, e.g. +15551234567)",
+            default="",
+        )
         cfg = {
             "configured_at": now_iso(),
             "bot_token": token.strip(),
@@ -4867,11 +5451,12 @@ def _init_wizard(root: Path, state: Dict[str, Any], *, ask_telegram: bool = True
             state.setdefault("telegram", {})
             state["telegram"]["enabled"] = True
             save_state(root, state)
-            print("Telegram enabled. After startup, open your bot in Telegram and send /start, then share contact.")
+            print(
+                "Telegram enabled. After startup, open your bot in Telegram and send /start, then share contact."
+            )
 
     _readline_save_history(history_path)
     return state
-
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -4885,7 +5470,10 @@ def cmd_init(args: argparse.Namespace) -> None:
         ensure_executable("tmux", hint="Install tmux")
     if not args.no_codex:
         if shutil.which(args.codex_cmd) is None:
-            print(f"warning: codex executable not found: {args.codex_cmd} (windows will be shells)", file=sys.stderr)
+            print(
+                f"warning: codex executable not found: {args.codex_cmd} (windows will be shells)",
+                file=sys.stderr,
+            )
 
     project_name = args.name or root.name
     state = build_state(
@@ -4954,7 +5542,10 @@ def cmd_import(args: argparse.Namespace) -> None:
         ensure_executable("tmux", hint="Install tmux")
     if not args.no_codex:
         if shutil.which(args.codex_cmd) is None:
-            print(f"warning: codex executable not found: {args.codex_cmd} (windows will be shells)", file=sys.stderr)
+            print(
+                f"warning: codex executable not found: {args.codex_cmd} (windows will be shells)",
+                file=sys.stderr,
+            )
 
     project_name = args.name or (Path(src).name if src else root.name)
     state = build_state(
@@ -4982,6 +5573,27 @@ def cmd_import(args: argparse.Namespace) -> None:
     create_git_scaffold_import(root, state, src)
     ensure_agents_created(root, state)
     update_roster(root, state)
+
+    if getattr(args, "seed", None):
+        seed_path = Path(args.seed)
+        if seed_path.exists():
+            seed_content = seed_path.read_text(encoding="utf-8")
+            seed_file = root / DIR_SEED / "SEED.md"
+            mkdirp(seed_file.parent)
+            atomic_write_text(seed_file, seed_content)
+        else:
+            raise CTeamError(f"seed file not found: {seed_path}")
+
+    if getattr(args, "seed_extras", None):
+        extras_path = Path(args.seed_extras)
+        if extras_path.exists():
+            extras_content = extras_path.read_text(encoding="utf-8")
+            extras_file = root / DIR_SEED_EXTRAS / "EXTRAS.md"
+            mkdirp(extras_file.parent)
+            atomic_write_text(extras_file, extras_content)
+        else:
+            raise CTeamError(f"seed-extras file not found: {extras_path}")
+
     save_state(root, state)
 
     # Record that this imported workspace should stay idle until the
@@ -5024,7 +5636,10 @@ def cmd_resume(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     new_tickets = create_root_structure(root, state)
-    if not (root / DIR_PROJECT_BARE).exists() or not (root / DIR_PROJECT_BARE / "HEAD").exists():
+    if (
+        not (root / DIR_PROJECT_BARE).exists()
+        or not (root / DIR_PROJECT_BARE / "HEAD").exists()
+    ):
         git_init_bare(root / DIR_PROJECT_BARE, branch=state["git"]["default_branch"])
     if not (root / DIR_PROJECT_CHECKOUT).exists():
         git_clone(root / DIR_PROJECT_BARE, root / DIR_PROJECT_CHECKOUT)
@@ -5073,7 +5688,10 @@ def cmd_open(args: argparse.Namespace) -> None:
     state = load_state(root)
 
     new_tickets = create_root_structure(root, state)
-    if not (root / DIR_PROJECT_BARE).exists() or not (root / DIR_PROJECT_BARE / "HEAD").exists():
+    if (
+        not (root / DIR_PROJECT_BARE).exists()
+        or not (root / DIR_PROJECT_BARE / "HEAD").exists()
+    ):
         git_init_bare(root / DIR_PROJECT_BARE, branch=state["git"]["default_branch"])
     if not (root / DIR_PROJECT_CHECKOUT).exists():
         git_clone(root / DIR_PROJECT_BARE, root / DIR_PROJECT_CHECKOUT)
@@ -5121,7 +5739,9 @@ def cmd_attach(args: argparse.Namespace) -> None:
     ensure_executable("tmux")
     session = state["tmux"]["session"]
     if not tmux_has_session(session):
-        raise CTeamError(f"tmux session not running: {session} (run: python3 cteam.py {root} open)")
+        raise CTeamError(
+            f"tmux session not running: {session} (run: python3 cteam.py {root} open)"
+        )
     tmux_attach(session, window=args.window)
 
 
@@ -5136,7 +5756,10 @@ def cmd_kill(args: argparse.Namespace) -> None:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     state = load_state(root)
 
     dash: Optional[Dict[str, Any]] = None
@@ -5150,7 +5773,9 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
     if dash is None:
         session = state["tmux"]["session"]
         if not tmux_has_session(session):
-            raise CTeamError(f"tmux session not running: {session} (start router with: cteam watch)")
+            raise CTeamError(
+                f"tmux session not running: {session} (start router with: cteam watch)"
+            )
         now_ts = time.time()
         dummy = {a["name"]: now_ts for a in state["agents"]}
         dash = compute_dashboard_snapshot(
@@ -5168,7 +5793,10 @@ def cmd_dashboard(args: argparse.Namespace) -> None:
 
 
 def cmd_capture(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     state = load_state(root)
 
     session = state["tmux"]["session"]
@@ -5198,7 +5826,10 @@ def cmd_capture(args: argparse.Namespace) -> None:
 
 
 def cmd_request_agent(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     state = load_state(root)
 
     requested_by = os.environ.get("CTEAM_AGENT") or "pm"
@@ -5221,16 +5852,16 @@ def cmd_request_agent(args: argparse.Namespace) -> None:
         f"""\
         PM requests spawning a new agent.
 
-        Request: {req.get('id')}
-        Role: {req.get('role')}
-        Name: {req.get('name') or '(auto)'}
-        Start codex immediately: {str(bool(req.get('start_codex'))).lower()}
+        Request: {req.get("id")}
+        Role: {req.get("role")}
+        Name: {req.get("name") or "(auto)"}
+        Start codex immediately: {str(bool(req.get("start_codex"))).lower()}
 
         Reason:
         {reason}
 
-        To approve:  /approve {req.get('token')}
-        To deny:     /deny {req.get('token')}
+        To approve:  /approve {req.get("token")}
+        To deny:     /deny {req.get("token")}
         """
     ).strip()
 
@@ -5259,7 +5890,10 @@ def cmd_request_agent(args: argparse.Namespace) -> None:
 
 
 def cmd_stage(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     state = load_state(root)
     stage = (args.stage or "").strip().lower()
     if stage not in {"discovery", "planning", "execution"}:
@@ -5274,7 +5908,10 @@ def cmd_stage(args: argparse.Namespace) -> None:
 
 
 def cmd_autodispatch(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     state = load_state(root)
     mode = (args.mode or "").strip().lower()
     if mode in {"on", "true", "1", "yes"}:
@@ -5300,24 +5937,38 @@ def cmd_status(args: argparse.Namespace) -> None:
 
     print(f"Project: {state['project_name']}")
     print(f"Root: {root}")
-    print(f"Mode: {state.get('mode','new')}")
+    print(f"Mode: {state.get('mode', 'new')}")
     print(f"tmux session: {state['tmux']['session']}")
-    print(f"autostart: {state.get('coordination',{}).get('autostart')}")
+    print(f"autostart: {state.get('coordination', {}).get('autostart')}")
     tg = state.get("telegram") or {}
-    print(f"telegram: enabled={bool(tg.get('enabled', False))} config={tg.get('config_rel', TELEGRAM_CONFIG_REL)}")
+    print(
+        f"telegram: enabled={bool(tg.get('enabled', False))} config={tg.get('config_rel', TELEGRAM_CONFIG_REL)}"
+    )
     print("")
 
     for a in state["agents"]:
         a_dir = root / a["dir_rel"]
         status = a_dir / "STATUS.md"
         msg = a_dir / "message.md"
-        s_mtime = _dt.datetime.fromtimestamp(status.stat().st_mtime) if status.exists() else None
-        m_mtime = _dt.datetime.fromtimestamp(msg.stat().st_mtime) if msg.exists() else None
+        s_mtime = (
+            _dt.datetime.fromtimestamp(status.stat().st_mtime)
+            if status.exists()
+            else None
+        )
+        m_mtime = (
+            _dt.datetime.fromtimestamp(msg.stat().st_mtime) if msg.exists() else None
+        )
         print(f"== {a['name']} — {a['title']} ==")
-        print(f"  status: {s_mtime.isoformat(timespec='seconds') if s_mtime else 'missing'}")
-        print(f"  inbox : {m_mtime.isoformat(timespec='seconds') if m_mtime else 'missing'}")
+        print(
+            f"  status: {s_mtime.isoformat(timespec='seconds') if s_mtime else 'missing'}"
+        )
+        print(
+            f"  inbox : {m_mtime.isoformat(timespec='seconds') if m_mtime else 'missing'}"
+        )
         if status.exists():
-            snippet = "\n".join(status.read_text(encoding="utf-8", errors="replace").splitlines()[:10])
+            snippet = "\n".join(
+                status.read_text(encoding="utf-8", errors="replace").splitlines()[:10]
+            )
             print("  --- STATUS snippet ---")
             print(textwrap.indent(snippet, "  "))
         print("")
@@ -5358,10 +6009,16 @@ def cmd_sync(args: argparse.Namespace) -> None:
             try:
                 git_fetch(checkout)
             except Exception as e:
-                print(f"warning: fetch failed in integration checkout: {e}", file=sys.stderr)
+                print(
+                    f"warning: fetch failed in integration checkout: {e}",
+                    file=sys.stderr,
+                )
         print("== Integration checkout (project/) ==")
         if args.pull:
-            print("  pull:", git_try_pull_ff(checkout, branch=state["git"]["default_branch"]))
+            print(
+                "  pull:",
+                git_try_pull_ff(checkout, branch=state["git"]["default_branch"]),
+            )
         print(textwrap.indent(git_status_short(checkout), "  "))
         print("")
     else:
@@ -5369,7 +6026,11 @@ def cmd_sync(args: argparse.Namespace) -> None:
 
     if args.all:
         agent_map = {a["name"]: a for a in state["agents"]}
-        targets = [p.strip() for p in args.agent.split(",")] if args.agent else list(agent_map.keys())
+        targets = (
+            [p.strip() for p in args.agent.split(",")]
+            if args.agent
+            else list(agent_map.keys())
+        )
         print("== Agent repos ==")
         for name in targets:
             a = agent_map.get(name)
@@ -5436,7 +6097,9 @@ def cmd_update_workdir(args: argparse.Namespace) -> None:
             safe_link_file(Path("..") / "STATUS.md", repo_dir / "STATUS.md")
             safe_link_file(Path("..") / "message.md", repo_dir / "message.md")
             safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED, repo_dir / "shared")
-            safe_link_dir(Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive")
+            safe_link_dir(
+                Path("..") / ".." / ".." / DIR_SHARED_DRIVE, repo_dir / "shared-drive"
+            )
         except Exception:
             pass
         updated.append(a["name"])
@@ -5470,7 +6133,11 @@ def cmd_tickets(args: argparse.Namespace) -> None:
         if args.status:
             tickets = [t for t in tickets if t.get("status") == args.status]
         if args.assignee:
-            tickets = [t for t in tickets if (t.get("assignee") or "").lower() == args.assignee.lower()]
+            tickets = [
+                t
+                for t in tickets
+                if (t.get("assignee") or "").lower() == args.assignee.lower()
+            ]
         if args.json:
             print(json.dumps(tickets, indent=2, sort_keys=True))
             return
@@ -5493,7 +6160,9 @@ def cmd_tickets(args: argparse.Namespace) -> None:
             tags=tags,
             assign_note=args.assign_note,
         )
-        print(f"created ticket {ticket['id']} (assignee: {ticket.get('assignee') or 'unassigned'})")
+        print(
+            f"created ticket {ticket['id']} (assignee: {ticket.get('assignee') or 'unassigned'})"
+        )
         return
 
     if cmd == "assign":
@@ -5601,8 +6270,10 @@ def cmd_tickets(args: argparse.Namespace) -> None:
                 from_to = ""
                 if "from" in h or "to" in h:
                     from_to = f" (from {h.get('from')} to {h.get('to')})"
-                extra = f" blocked_on={h.get('blocked_on')}" if h_type == "blocked" else ""
-                print(f"- {h_ts} {h_type}{from_to}{extra} — {h.get('user','')} {note}")
+                extra = (
+                    f" blocked_on={h.get('blocked_on')}" if h_type == "blocked" else ""
+                )
+                print(f"- {h_ts} {h_type}{from_to}{extra} — {h.get('user', '')} {note}")
         return
 
     raise CTeamError(f"unknown tickets subcommand: {cmd}")
@@ -5704,7 +6375,9 @@ def cmd_assign(args: argparse.Namespace) -> None:
             raise CTeamError(f"ticket not found: {ticket_id}")
     else:
         if not args.title or not args.desc:
-            raise CTeamError("assignment requires --ticket or --title/--desc to auto-create a ticket")
+            raise CTeamError(
+                "assignment requires --ticket or --title/--desc to auto-create a ticket"
+            )
         ticket = ticket_create(
             root,
             state,
@@ -5731,7 +6404,7 @@ def cmd_assign(args: argparse.Namespace) -> None:
     ticket_id = ticket["id"]
     summary = _ticket_summary_block(ticket)
     full_body = f"{summary}\n\n{body.strip()}"
-    subject = args.subject or f"{ticket_id} — {ticket.get('title','')}"
+    subject = args.subject or f"{ticket_id} — {ticket.get('title', '')}"
 
     write_message(
         root,
@@ -5761,7 +6434,9 @@ def cmd_nudge(args: argparse.Namespace) -> None:
     else:
         targets = [p.strip() for p in args.to.split(",") if p.strip()]
     for t in targets:
-        ok = nudge_agent(root, state, t, reason=args.reason or "NUDGE", interrupt=args.interrupt)
+        ok = nudge_agent(
+            root, state, t, reason=args.reason or "NUDGE", interrupt=args.interrupt
+        )
         print(f"{t}: {'nudged' if ok else 'could not nudge'}")
 
 
@@ -5796,16 +6471,20 @@ def cmd_restart(args: argparse.Namespace) -> None:
         print(f"restarted codex in window: {name}")
 
 
-def notify_pm_new_agent(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> None:
+def notify_pm_new_agent(
+    root: Path, state: Dict[str, Any], agent: Dict[str, Any]
+) -> None:
     """
     Inform the PM that a new agent was added and remind them to balance workloads.
     """
     if not any(a["name"] == "pm" for a in state["agents"]):
         return
     role = agent.get("role", "agent").replace("_", " ")
-    subject = f"New agent added: {agent.get('name','(unknown)')} ({agent.get('title','')})"
+    subject = (
+        f"New agent added: {agent.get('name', '(unknown)')} ({agent.get('title', '')})"
+    )
     lines = [
-        f"A new {role} joined: **{agent.get('name','')}** — {agent.get('title','')}.",
+        f"A new {role} joined: **{agent.get('name', '')}** — {agent.get('title', '')}.",
         "Please balance work across the team: onboard them, delegate tasks, and adjust the plan if needed.",
         "Keep assignments explicit (`Type: ASSIGNMENT`) and update PLAN/tickets to reflect the new capacity.",
     ]
@@ -5827,16 +6506,22 @@ def notify_pm_new_agent(root: Path, state: Dict[str, Any], agent: Dict[str, Any]
         pass
 
 
-def notify_pm_agent_removed(root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, purged: bool) -> None:
+def notify_pm_agent_removed(
+    root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, purged: bool
+) -> None:
     """
     Inform the PM that an agent was removed so roster/tickets stay aligned.
     """
     if not any(a["name"] == "pm" for a in state["agents"]):
         return
-    subject = f"Agent removed: {agent.get('name','(unknown)')}"
-    note = "purged from disk" if purged else "archived under agents/_removed and mail/_removed"
+    subject = f"Agent removed: {agent.get('name', '(unknown)')}"
+    note = (
+        "purged from disk"
+        if purged
+        else "archived under agents/_removed and mail/_removed"
+    )
     lines = [
-        f"Agent **{agent.get('name','')}** ({agent.get('title','') or agent.get('role','agent')}) was removed ({note}).",
+        f"Agent **{agent.get('name', '')}** ({agent.get('title', '') or agent.get('role', 'agent')}) was removed ({note}).",
         "Tickets assigned to this agent were unassigned; reassign or close as needed.",
     ]
     body = "\n".join(lines)
@@ -5870,7 +6555,9 @@ def add_agent_to_workspace(
 ) -> Dict[str, Any]:
     """Internal helper to add an agent (used by CLI and router approvals)."""
     if role == "project_manager" or (name and name.strip().lower() == "pm"):
-        raise CTeamError("cannot add another project manager; workspace already has a PM")
+        raise CTeamError(
+            "cannot add another project manager; workspace already has a PM"
+        )
 
     existing = {a["name"] for a in state["agents"]}
     if not name:
@@ -5925,7 +6612,12 @@ def add_agent_to_workspace(
     if not no_tmux:
         ensure_tmux_session(root, state)
         cmd_args = standby_window_command(root, state, agent)
-        tmux_new_window(state["tmux"]["session"], name, Path(agent["dir_abs"]), command_args=cmd_args)
+        tmux_new_window(
+            state["tmux"]["session"],
+            name,
+            Path(agent["dir_abs"]),
+            command_args=cmd_args,
+        )
         if start_codex:
             start_codex_in_window(root, state, agent, boot=False)
 
@@ -5946,7 +6638,7 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
             return ""
         for i, opt in enumerate(options, 1):
             print(f"{i}) {opt}")
-        raw = input(f"{prompt} [{default_idx+1}]: ").strip()
+        raw = input(f"{prompt} [{default_idx + 1}]: ").strip()
         if not raw:
             return options[default_idx]
         try:
@@ -5970,7 +6662,9 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
 
     role = args.role
     if role == "project_manager" or (args.name and args.name.strip().lower() == "pm"):
-        raise CTeamError("cannot add another project manager; workspace already has a PM")
+        raise CTeamError(
+            "cannot add another project manager; workspace already has a PM"
+        )
     existing = {a["name"] for a in state["agents"]}
 
     # Interactive Q/A when running in a TTY.
@@ -6004,7 +6698,9 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
         tmux_running = tmux_has_session(state["tmux"]["session"])
         create_window_default = (not args.no_tmux) and tmux_running
         if not tmux_running:
-            print("(tmux session not running; will skip window creation regardless of choice)")
+            print(
+                "(tmux session not running; will skip window creation regardless of choice)"
+            )
             create_window_default = False
         no_tmux = not _prompt_yes_no("Create tmux window now?", create_window_default)
         start_codex = _prompt_yes_no("Start codex immediately?", args.start_codex)
@@ -6055,7 +6751,12 @@ def cmd_add_agent(args: argparse.Namespace) -> None:
     if not no_tmux:
         if tmux_has_session(state["tmux"]["session"]):
             cmd_args = standby_window_command(root, state, agent)
-            tmux_new_window(state["tmux"]["session"], name, Path(agent["dir_abs"]), command_args=cmd_args)
+            tmux_new_window(
+                state["tmux"]["session"],
+                name,
+                Path(agent["dir_abs"]),
+                command_args=cmd_args,
+            )
             if start_codex:
                 start_codex_in_window(root, state, agent, boot=False)
 
@@ -6133,9 +6834,24 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
 
     if args.auto:
         for who, subj, task, body in [
-            ("architect", "Doc-walk: architecture doc", "DOC-ARCH", "Create docs/architecture.md and a decisions summary. Coordinate with PM."),
-            ("tester", "Doc-walk: run/test guide", "DOC-TEST", "Create docs/runbook.md with how to run and test. Coordinate with PM."),
-            ("researcher", "Doc-walk: dependencies inventory", "DOC-DEPS", "Create shared/research/deps.md with dependencies and risks. Coordinate with PM."),
+            (
+                "architect",
+                "Doc-walk: architecture doc",
+                "DOC-ARCH",
+                "Create docs/architecture.md and a decisions summary. Coordinate with PM.",
+            ),
+            (
+                "tester",
+                "Doc-walk: run/test guide",
+                "DOC-TEST",
+                "Create docs/runbook.md with how to run and test. Coordinate with PM.",
+            ),
+            (
+                "researcher",
+                "Doc-walk: dependencies inventory",
+                "DOC-DEPS",
+                "Create shared/research/deps.md with dependencies and risks. Coordinate with PM.",
+            ),
         ]:
             if any(a["name"] == who for a in state["agents"]):
                 write_message(
@@ -6154,15 +6870,20 @@ def cmd_doc_walk(args: argparse.Namespace) -> None:
     print("doc-walk kickoff sent (PM-led)")
 
 
-
 # -----------------------------
 # Telegram commands
 # -----------------------------
 
+
 def cmd_telegram_configure(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("telegram-configure: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "telegram-configure: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     history_path = root / DIR_RUNTIME / "telegram_configure.history"
@@ -6176,12 +6897,17 @@ def cmd_telegram_configure(args: argparse.Namespace) -> None:
         if not token:
             token = prompt_line("Telegram bot token (from @BotFather)", default="")
         if not phone:
-            phone = prompt_line("Authorized phone number (digits; E.164 preferred, e.g. +15551234567)", default="")
+            phone = prompt_line(
+                "Authorized phone number (digits; E.164 preferred, e.g. +15551234567)",
+                default="",
+            )
 
     token = token.strip()
     phone = phone.strip()
     if not token or not phone:
-        raise CTeamError("telegram-configure: need --token and --phone (or run interactively)")
+        raise CTeamError(
+            "telegram-configure: need --token and --phone (or run interactively)"
+        )
 
     cfg = {
         "configured_at": now_iso(),
@@ -6203,9 +6929,14 @@ def cmd_telegram_configure(args: argparse.Namespace) -> None:
 
 
 def cmd_telegram_enable(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("telegram-enable: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "telegram-enable: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     _ = telegram_load_config(root, state)  # validate
@@ -6219,15 +6950,22 @@ def cmd_telegram_enable(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     print("Telegram integration enabled.")
-    print("If the router is running (`cteam <workdir> watch`), it will start bridging immediately.")
+    print(
+        "If the router is running (`cteam <workdir> watch`), it will start bridging immediately."
+    )
     print("If not, open/start the workspace (tmux router runs the watcher):")
     print(f"  python3 cteam.py {shlex.quote(str(root))} open")
 
 
 def cmd_telegram_disable(args: argparse.Namespace) -> None:
-    root = find_project_root(Path(args.workdir)) or Path(args.workdir).expanduser().resolve()
+    root = (
+        find_project_root(Path(args.workdir))
+        or Path(args.workdir).expanduser().resolve()
+    )
     if not (root / STATE_FILENAME).exists():
-        raise CTeamError("telegram-disable: could not find cteam.json in this directory or its parents")
+        raise CTeamError(
+            "telegram-disable: could not find cteam.json in this directory or its parents"
+        )
     state = load_state(root)
 
     state.setdefault("telegram", {})
@@ -6290,11 +7028,13 @@ def rewrite_argv_with_default_workdir(argv: List[str]) -> List[str]:
         # Only rewrite when the next token looks like a flag (or nothing) to avoid
         # breaking `<workdir> <cmd>` when the workdir happens to match a command name.
         if not rest or rest[0].startswith("-"):
-            return ["." , *argv]
+            return [".", *argv]
     return argv
 
 
-class CTeamHelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+class CTeamHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
+):
     """Readable help with defaults and preserved newlines."""
 
 
@@ -6327,56 +7067,128 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     def add_common_workspace(pp: argparse.ArgumentParser) -> None:
-        pp.add_argument("--no-tmux", action="store_true", help="Do not start/manage tmux.")
-        pp.add_argument("--no-codex", action="store_true", help="Do not launch Codex in windows.")
-        pp.add_argument("--no-attach", action="store_true", help="Do not attach to tmux after starting.")
-        pp.add_argument("--attach-late", action="store_true", help="Attach after tmux/windows/Codex are ready.")
+        pp.add_argument(
+            "--no-tmux", action="store_true", help="Do not start/manage tmux."
+        )
+        pp.add_argument(
+            "--no-codex", action="store_true", help="Do not launch Codex in windows."
+        )
+        pp.add_argument(
+            "--no-attach",
+            action="store_true",
+            help="Do not attach to tmux after starting.",
+        )
+        pp.add_argument(
+            "--attach-late",
+            action="store_true",
+            help="Attach after tmux/windows/Codex are ready.",
+        )
         pp.add_argument("--window", help="Window name to attach/select (e.g., pm).")
 
     def add_codex_flags(pp: argparse.ArgumentParser) -> None:
-        pp.add_argument("--codex-cmd", default=DEFAULT_CODEX_CMD, help="Codex executable name/path.")
+        pp.add_argument(
+            "--codex-cmd", default=DEFAULT_CODEX_CMD, help="Codex executable name/path."
+        )
         pp.add_argument("--model", default=None, help="Codex model (if supported).")
-        pp.add_argument("--sandbox", default=DEFAULT_CODEX_SANDBOX, choices=["read-only","workspace-write","danger-full-access"])
-        pp.add_argument("--ask-for-approval", default=DEFAULT_CODEX_APPROVAL, choices=["untrusted","on-failure","on-request","never"])
-        pp.add_argument("--no-search", action="store_true", help="Disable Codex --search (if supported).")
-        pp.add_argument("--full-auto", action="store_true", help="Use Codex --full-auto (if supported).")
-        pp.add_argument("--yolo", action="store_true", help="Use Codex --yolo (if supported). DANGEROUS.")
+        pp.add_argument(
+            "--sandbox",
+            default=DEFAULT_CODEX_SANDBOX,
+            choices=["read-only", "workspace-write", "danger-full-access"],
+        )
+        pp.add_argument(
+            "--ask-for-approval",
+            default=DEFAULT_CODEX_APPROVAL,
+            choices=["untrusted", "on-failure", "on-request", "never"],
+        )
+        pp.add_argument(
+            "--no-search",
+            action="store_true",
+            help="Disable Codex --search (if supported).",
+        )
+        pp.add_argument(
+            "--full-auto",
+            action="store_true",
+            help="Use Codex --full-auto (if supported).",
+        )
+        pp.add_argument(
+            "--yolo",
+            action="store_true",
+            help="Use Codex --yolo (if supported). DANGEROUS.",
+        )
 
     def add_coord_flags(pp: argparse.ArgumentParser) -> None:
-        pp.add_argument("--autostart", default=DEFAULT_AUTOSTART, choices=["pm","pm+architect","all"],
-                        help="Which agents start Codex immediately (PM-led coordination).")
-        pp.add_argument("--no-router", action="store_true", help="Disable router/watch window.")
+        pp.add_argument(
+            "--autostart",
+            default=DEFAULT_AUTOSTART,
+            choices=["pm", "pm+architect", "all"],
+            help="Which agents start Codex immediately (PM-led coordination).",
+        )
+        pp.add_argument(
+            "--no-router", action="store_true", help="Disable router/watch window."
+        )
 
-    p_init = sub.add_parser("init", help="Initialize a new cteam workspace (empty repo).")
+    p_init = sub.add_parser(
+        "init", help="Initialize a new cteam workspace (empty repo)."
+    )
     add_common_workspace(p_init)
-    p_init.add_argument("--no-interactive", action="store_true", help="Disable interactive init wizard.")
+    p_init.add_argument(
+        "--no-interactive", action="store_true", help="Disable interactive init wizard."
+    )
     p_init.add_argument("--name", help="Project name (default: folder name).")
-    p_init.add_argument("--devs", type=int, default=1, help="Number of developer agents.")
-    p_init.add_argument("--force", action="store_true", help="Reuse non-empty directory.")
+    p_init.add_argument(
+        "--devs", type=int, default=1, help="Number of developer agents."
+    )
+    p_init.add_argument(
+        "--force", action="store_true", help="Reuse non-empty directory."
+    )
     add_codex_flags(p_init)
     add_coord_flags(p_init)
     p_init.set_defaults(func=cmd_init)
 
-    p_imp = sub.add_parser("import", help="Import an existing git repo or directory into a new workspace.")
+    p_imp = sub.add_parser(
+        "import", help="Import an existing git repo or directory into a new workspace."
+    )
     add_common_workspace(p_imp)
-    p_imp.add_argument("--src", required=True, help="Git repo URL/path OR local directory to import.")
+    p_imp.add_argument(
+        "--src", required=True, help="Git repo URL/path OR local directory to import."
+    )
     p_imp.add_argument("--name", help="Project name override.")
     p_imp.add_argument("--devs", type=int, default=1)
     p_imp.add_argument("--force", action="store_true")
-    p_imp.add_argument("--recon", action="store_true",
-                       help="Also send safe coordinated recon assignments (no code changes) to non-PM agents.")
+    p_imp.add_argument(
+        "--recon",
+        action="store_true",
+        help="Also send safe coordinated recon assignments (no code changes) to non-PM agents.",
+    )
+    p_imp.add_argument(
+        "--seed",
+        help="Path to a markdown file with seed requirements (instead of interactive prompt).",
+    )
+    p_imp.add_argument(
+        "--seed-extras",
+        help="Path to a markdown file with seed extras (research notes, links).",
+    )
     add_codex_flags(p_imp)
     add_coord_flags(p_imp)
     p_imp.set_defaults(func=cmd_import)
 
-    p_resume = sub.add_parser("resume", help="Resume/manage an existing workspace (ensure dirs/windows exist).")
+    p_resume = sub.add_parser(
+        "resume",
+        help="Resume/manage an existing workspace (ensure dirs/windows exist).",
+    )
     add_common_workspace(p_resume)
-    p_resume.add_argument("--autostart", choices=["pm","pm+architect","all"], help="Override autostart in state.")
+    p_resume.add_argument(
+        "--autostart",
+        choices=["pm", "pm+architect", "all"],
+        help="Override autostart in state.",
+    )
     p_resume.add_argument("--router", action="store_true", help="Force-enable router.")
     p_resume.add_argument("--no-router", action="store_true", help="Disable router.")
     p_resume.set_defaults(func=cmd_resume)
 
-    p_open = sub.add_parser("open", help="Resume and attach (open tmux in your terminal).")
+    p_open = sub.add_parser(
+        "open", help="Resume and attach (open tmux in your terminal)."
+    )
     add_common_workspace(p_open)
     p_open.add_argument("--no-router", action="store_true")
     p_open.set_defaults(func=cmd_open)
@@ -6389,83 +7201,150 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_workspace(p_kill)
     p_kill.set_defaults(func=cmd_kill)
 
-    p_watch = sub.add_parser("watch", help="Router: watch mailboxes and nudge/start agents in tmux.")
+    p_watch = sub.add_parser(
+        "watch", help="Router: watch mailboxes and nudge/start agents in tmux."
+    )
     p_watch.add_argument("--interval", type=float, default=1.5)
     p_watch.set_defaults(func=cmd_watch)
 
-    p_pause = sub.add_parser("pause", help="Pause tmux: park agent windows and mark workspace paused.")
+    p_pause = sub.add_parser(
+        "pause", help="Pause tmux: park agent windows and mark workspace paused."
+    )
     p_pause.set_defaults(func=cmd_pause)
 
     p_chat = sub.add_parser("chat", help="Interactive chat with an agent or customer.")
-    p_chat.add_argument("--to", required=True, help="Recipient agent name or 'customer'.")
+    p_chat.add_argument(
+        "--to", required=True, help="Recipient agent name or 'customer'."
+    )
     p_chat.add_argument("--sender", help="Override sender name (default: human).")
     p_chat.add_argument("--subject", help="Optional subject.")
     p_chat.add_argument("--no-nudge", action="store_true")
     p_chat.add_argument("--start-if-needed", action="store_true")
     p_chat.set_defaults(func=cmd_chat)
 
-    p_upload = sub.add_parser("upload", help="Copy files/dirs into shared/drive for sharing with the team.")
-    p_upload.add_argument("paths", nargs="+", help="Files or directories to copy into shared/drive.")
-    p_upload.add_argument("--dest", help="Optional destination name/path under shared/drive (default: use source name).")
-    p_upload.add_argument("--from", dest="sender", help="Sender name for PM notification (default: human).")
+    p_upload = sub.add_parser(
+        "upload", help="Copy files/dirs into shared/drive for sharing with the team."
+    )
+    p_upload.add_argument(
+        "paths", nargs="+", help="Files or directories to copy into shared/drive."
+    )
+    p_upload.add_argument(
+        "--dest",
+        help="Optional destination name/path under shared/drive (default: use source name).",
+    )
+    p_upload.add_argument(
+        "--from",
+        dest="sender",
+        help="Sender name for PM notification (default: human).",
+    )
     p_upload.set_defaults(func=cmd_upload)
 
-    p_cust = sub.add_parser("customer-chat", help="Run an interactive customer chat window (tmux-friendly).")
+    p_cust = sub.add_parser(
+        "customer-chat", help="Run an interactive customer chat window (tmux-friendly)."
+    )
     p_cust.set_defaults(func=cmd_customer_chat)
 
     p_status = sub.add_parser("status", help="Show workspace + agent status.")
     p_status.set_defaults(func=cmd_status)
 
-
-    p_dashboard = sub.add_parser("dashboard", help="Show the live status board (written by the router).")
+    p_dashboard = sub.add_parser(
+        "dashboard", help="Show the live status board (written by the router)."
+    )
     p_dashboard.add_argument("--json", action="store_true", help="print JSON")
-    p_dashboard.add_argument("--fresh", action="store_true", help="compute a best-effort snapshot (ignores router cache)")
+    p_dashboard.add_argument(
+        "--fresh",
+        action="store_true",
+        help="compute a best-effort snapshot (ignores router cache)",
+    )
     p_dashboard.set_defaults(func=cmd_dashboard)
 
-    p_capture = sub.add_parser("capture", help="Capture the last N lines of an agent\'s tmux pane.")
+    p_capture = sub.add_parser(
+        "capture", help="Capture the last N lines of an agent's tmux pane."
+    )
     p_capture.add_argument("agent", help="tmux window name (agent)")
-    p_capture.add_argument("--lines", type=int, default=200, help="number of lines to capture")
-    p_capture.add_argument("--to", help="optional recipient to send capture to (pm|customer|agent)")
+    p_capture.add_argument(
+        "--lines", type=int, default=200, help="number of lines to capture"
+    )
+    p_capture.add_argument(
+        "--to", help="optional recipient to send capture to (pm|customer|agent)"
+    )
     p_capture.set_defaults(func=cmd_capture)
 
-    p_request_agent = sub.add_parser("request-agent", help="Request spawning a new agent (customer must approve via /approve TOKEN).")
-    p_request_agent.add_argument("--role", required=True, choices=AGENT_ROLES, help="agent role")
+    p_request_agent = sub.add_parser(
+        "request-agent",
+        help="Request spawning a new agent (customer must approve via /approve TOKEN).",
+    )
+    p_request_agent.add_argument(
+        "--role", required=True, choices=AGENT_ROLES, help="agent role"
+    )
     p_request_agent.add_argument("--name", help="optional explicit agent name")
     p_request_agent.add_argument("--title", help="optional title label")
     p_request_agent.add_argument("--persona", help="optional persona override")
-    p_request_agent.add_argument("--start-codex", dest="start_codex", action="store_true", default=True, help="start codex immediately upon approval (default)")
-    p_request_agent.add_argument("--no-start-codex", dest="start_codex", action="store_false", help="do NOT start codex automatically")
-    p_request_agent.add_argument("--reason", required=True, help="why you need this new agent")
+    p_request_agent.add_argument(
+        "--start-codex",
+        dest="start_codex",
+        action="store_true",
+        default=True,
+        help="start codex immediately upon approval (default)",
+    )
+    p_request_agent.add_argument(
+        "--no-start-codex",
+        dest="start_codex",
+        action="store_false",
+        help="do NOT start codex automatically",
+    )
+    p_request_agent.add_argument(
+        "--reason", required=True, help="why you need this new agent"
+    )
     p_request_agent.set_defaults(func=cmd_request_agent)
 
-    p_stage = sub.add_parser("stage", help="Set the coordination stage (discovery|planning|execution).")
+    p_stage = sub.add_parser(
+        "stage", help="Set the coordination stage (discovery|planning|execution)."
+    )
     p_stage.add_argument("stage", choices=["discovery", "planning", "execution"])
     p_stage.set_defaults(func=cmd_stage)
 
-    p_autod = sub.add_parser("autodispatch", help="Toggle router auto-dispatch (on/off).")
+    p_autod = sub.add_parser(
+        "autodispatch", help="Toggle router auto-dispatch (on/off)."
+    )
     p_autod.add_argument("mode", choices=["on", "off"])
     p_autod.set_defaults(func=cmd_autodispatch)
     p_sync = sub.add_parser("sync", help="Fetch/pull and show git statuses.")
-    p_sync.add_argument("--all", action="store_true", help="Also show agent repo statuses.")
+    p_sync.add_argument(
+        "--all", action="store_true", help="Also show agent repo statuses."
+    )
     p_sync.add_argument("--agent", help="Limit to specific agent(s) with --all.")
     p_sync.add_argument("--fetch", action="store_true")
     p_sync.add_argument("--pull", action="store_true")
-    p_sync.add_argument("--no-show-branches", action="store_false", dest="show_branches")
+    p_sync.add_argument(
+        "--no-show-branches", action="store_false", dest="show_branches"
+    )
     p_sync.set_defaults(show_branches=True)
     p_sync.set_defaults(func=cmd_sync)
 
-    p_seed = sub.add_parser("seed-sync", help="Copy seed/ and seed-extras/ into agent workdirs.")
+    p_seed = sub.add_parser(
+        "seed-sync", help="Copy seed/ and seed-extras/ into agent workdirs."
+    )
     p_seed.add_argument("--clean", action="store_true")
     p_seed.set_defaults(func=cmd_seed_sync)
 
-    p_update = sub.add_parser("update-workdir", help="Refresh agent AGENTS.md files from current cteam templates.")
+    p_update = sub.add_parser(
+        "update-workdir",
+        help="Refresh agent AGENTS.md files from current cteam templates.",
+    )
     p_update.set_defaults(func=cmd_update_workdir)
 
-    p_tickets = sub.add_parser("tickets", help="Ticket management (list/create/assign/block/reopen/close/show).")
+    p_tickets = sub.add_parser(
+        "tickets",
+        help="Ticket management (list/create/assign/block/reopen/close/show).",
+    )
     tickets_sub = p_tickets.add_subparsers(dest="ticket_cmd")
 
     p_t_list = tickets_sub.add_parser("list", help="List tickets.")
-    p_t_list.add_argument("--status", choices=[TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED])
+    p_t_list.add_argument(
+        "--status",
+        choices=[TICKET_STATUS_OPEN, TICKET_STATUS_BLOCKED, TICKET_STATUS_CLOSED],
+    )
     p_t_list.add_argument("--assignee")
     p_t_list.add_argument("--json", action="store_true")
     p_t_list.set_defaults(func=cmd_tickets)
@@ -6480,20 +7359,28 @@ def build_parser() -> argparse.ArgumentParser:
     p_t_create.add_argument("--assignee")
     p_t_create.add_argument("--creator", help="Ticket creator (default: pm)")
     p_t_create.add_argument("--tags", help="Comma-separated tags")
-    p_t_create.add_argument("--assign-note", help="Optional note for initial assignment")
+    p_t_create.add_argument(
+        "--assign-note", help="Optional note for initial assignment"
+    )
     p_t_create.set_defaults(func=cmd_tickets)
 
     p_t_assign = tickets_sub.add_parser("assign", help="Assign an existing ticket.")
     p_t_assign.add_argument("--id", required=True)
     p_t_assign.add_argument("--assignee", required=True)
-    p_t_assign.add_argument("--user", help="User performing the assignment (default: pm)")
+    p_t_assign.add_argument(
+        "--user", help="User performing the assignment (default: pm)"
+    )
     p_t_assign.add_argument("--note")
-    p_t_assign.add_argument("--notify", action="store_true", help="Also notify the assignee.")
+    p_t_assign.add_argument(
+        "--notify", action="store_true", help="Also notify the assignee."
+    )
     p_t_assign.set_defaults(func=cmd_tickets)
 
     p_t_block = tickets_sub.add_parser("block", help="Mark a ticket as blocked.")
     p_t_block.add_argument("--id", required=True)
-    p_t_block.add_argument("--on", required=True, help="Ticket ID or external issue causing the block.")
+    p_t_block.add_argument(
+        "--on", required=True, help="Ticket ID or external issue causing the block."
+    )
     p_t_block.add_argument("--user", help="User performing the change (default: pm)")
     p_t_block.add_argument("--note")
     p_t_block.set_defaults(func=cmd_tickets)
@@ -6516,9 +7403,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg.add_argument("--subject")
     p_msg.add_argument("--file")
     p_msg.add_argument("--no-nudge", action="store_true")
-    p_msg.add_argument("--start-if-needed", action="store_true",
-                       help="If recipient is not running Codex, start it in their tmux window.")
-    p_msg.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
+    p_msg.add_argument(
+        "--start-if-needed",
+        action="store_true",
+        help="If recipient is not running Codex, start it in their tmux window.",
+    )
+    p_msg.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="Do not select recipient window after sending.",
+    )
     p_msg.add_argument("--ticket", help="Ticket ID to link this message.")
     p_msg.add_argument("text", nargs="?", default="")
     p_msg.set_defaults(func=cmd_msg)
@@ -6528,74 +7422,129 @@ def build_parser() -> argparse.ArgumentParser:
     p_b.add_argument("--subject")
     p_b.add_argument("--file")
     p_b.add_argument("--no-nudge", action="store_true")
-    p_b.add_argument("--start-if-needed", action="store_true", help="Start Codex in agent windows if needed.")
+    p_b.add_argument(
+        "--start-if-needed",
+        action="store_true",
+        help="Start Codex in agent windows if needed.",
+    )
     p_b.add_argument("text", nargs="?", default="")
     p_b.set_defaults(func=cmd_broadcast)
 
-    p_assign = sub.add_parser("assign", help="Send an ASSIGNMENT to an agent (starts them if needed).")
+    p_assign = sub.add_parser(
+        "assign", help="Send an ASSIGNMENT to an agent (starts them if needed)."
+    )
     p_assign.add_argument("--to", required=True)
     p_assign.add_argument("--task", help="Task ID (e.g., T001).")
     p_assign.add_argument("--from", dest="sender")
     p_assign.add_argument("--subject")
     p_assign.add_argument("--file")
     p_assign.add_argument("--no-nudge", action="store_true")
-    p_assign.add_argument("--ticket", help="Existing ticket ID; if omitted, requires --title and --desc.")
+    p_assign.add_argument(
+        "--ticket", help="Existing ticket ID; if omitted, requires --title and --desc."
+    )
     p_assign.add_argument("--title", help="Title when auto-creating a ticket.")
     p_assign.add_argument("--desc", help="Description when auto-creating a ticket.")
     p_assign.add_argument("--assign-note", help="Note to record on assignment.")
-    p_assign.add_argument("--tags", help="Comma-separated tags when auto-creating a ticket.")
+    p_assign.add_argument(
+        "--tags", help="Comma-separated tags when auto-creating a ticket."
+    )
     p_assign.add_argument("text", nargs="?", default="")
-    p_assign.add_argument("--no-follow", action="store_true", help="Do not select recipient window after sending.")
+    p_assign.add_argument(
+        "--no-follow",
+        action="store_true",
+        help="Do not select recipient window after sending.",
+    )
     p_assign.set_defaults(func=cmd_assign)
 
     p_nudge = sub.add_parser("nudge", help="Send a manual nudge to an agent window.")
     p_nudge.add_argument("--to", default="pm", help="agent(s) comma-separated or 'all'")
     p_nudge.add_argument("--reason", default="NUDGE")
-    p_nudge.add_argument("--no-follow", action="store_true", help="Do not select the target window.")
-    p_nudge.add_argument("--interrupt", action="store_true", help="Send an interrupting nudge (sends Escape before the message).")
+    p_nudge.add_argument(
+        "--no-follow", action="store_true", help="Do not select the target window."
+    )
+    p_nudge.add_argument(
+        "--interrupt",
+        action="store_true",
+        help="Send an interrupting nudge (sends Escape before the message).",
+    )
     p_nudge.set_defaults(func=cmd_nudge)
 
-    p_restart = sub.add_parser("restart", help="Restart Codex in agent tmux windows (respawn).")
-    p_restart.add_argument("--window", help="agent window name(s) comma-separated or 'all'")
-    p_restart.add_argument("--hard", action="store_true", help="send Ctrl-C before respawn (best-effort)")
+    p_restart = sub.add_parser(
+        "restart", help="Restart Codex in agent tmux windows (respawn)."
+    )
+    p_restart.add_argument(
+        "--window", help="agent window name(s) comma-separated or 'all'"
+    )
+    p_restart.add_argument(
+        "--hard", action="store_true", help="send Ctrl-C before respawn (best-effort)"
+    )
     p_restart.set_defaults(func=cmd_restart)
 
-    p_add = sub.add_parser("add-agent", help="Add a new agent to an existing workspace (one PM only).")
+    p_add = sub.add_parser(
+        "add-agent", help="Add a new agent to an existing workspace (one PM only)."
+    )
     p_add.add_argument(
         "--role",
         default="developer",
-        choices=["developer","tester","researcher","architect"],
+        choices=["developer", "tester", "researcher", "architect"],
     )
     p_add.add_argument("--name")
     p_add.add_argument("--title")
     p_add.add_argument("--persona")
     p_add.add_argument("--no-tmux", action="store_true")
-    p_add.add_argument("--start-codex", action="store_true", help="Start codex immediately for the new agent.")
+    p_add.add_argument(
+        "--start-codex",
+        action="store_true",
+        help="Start codex immediately for the new agent.",
+    )
     p_add.set_defaults(func=cmd_add_agent)
 
-    p_rm = sub.add_parser("remove-agent", help="Remove an agent from the workspace (non-PM only).")
+    p_rm = sub.add_parser(
+        "remove-agent", help="Remove an agent from the workspace (non-PM only)."
+    )
     p_rm.add_argument("--name", required=True, help="Agent name to remove (not pm).")
-    p_rm.add_argument("--purge", action="store_true", help="Delete agent dirs/mail instead of archiving under _removed/.")
+    p_rm.add_argument(
+        "--purge",
+        action="store_true",
+        help="Delete agent dirs/mail instead of archiving under _removed/.",
+    )
     p_rm.set_defaults(func=cmd_remove_agent)
 
-    p_doc = sub.add_parser("doc-walk", help="Kick off a documentation sprint over the repo (PM-led).")
+    p_doc = sub.add_parser(
+        "doc-walk", help="Kick off a documentation sprint over the repo (PM-led)."
+    )
     p_doc.add_argument("--from", dest="sender")
     p_doc.add_argument("--subject")
     p_doc.add_argument("--task")
-    p_doc.add_argument("--auto", action="store_true", help="Also assign initial doc tasks to architect/tester/researcher.")
+    p_doc.add_argument(
+        "--auto",
+        action="store_true",
+        help="Also assign initial doc tasks to architect/tester/researcher.",
+    )
     p_doc.set_defaults(func=cmd_doc_walk)
 
-
-    p_tg_cfg = sub.add_parser("telegram-configure", help="Configure Telegram bot credentials for customer chat.")
+    p_tg_cfg = sub.add_parser(
+        "telegram-configure",
+        help="Configure Telegram bot credentials for customer chat.",
+    )
     p_tg_cfg.add_argument("--token", help="Bot token from @BotFather (stored locally).")
-    p_tg_cfg.add_argument("--phone", help="Authorized phone number (digits; E.164 preferred).")
-    p_tg_cfg.add_argument("--no-interactive", action="store_true", help="Do not prompt (require flags).")
+    p_tg_cfg.add_argument(
+        "--phone", help="Authorized phone number (digits; E.164 preferred)."
+    )
+    p_tg_cfg.add_argument(
+        "--no-interactive", action="store_true", help="Do not prompt (require flags)."
+    )
     p_tg_cfg.set_defaults(func=cmd_telegram_configure)
 
-    p_tg_en = sub.add_parser("telegram-enable", help="Enable Telegram customer chat bridge (requires prior configure).")
+    p_tg_en = sub.add_parser(
+        "telegram-enable",
+        help="Enable Telegram customer chat bridge (requires prior configure).",
+    )
     p_tg_en.set_defaults(func=cmd_telegram_enable)
 
-    p_tg_dis = sub.add_parser("telegram-disable", help="Disable Telegram customer chat bridge.")
+    p_tg_dis = sub.add_parser(
+        "telegram-disable", help="Disable Telegram customer chat bridge."
+    )
     p_tg_dis.set_defaults(func=cmd_telegram_disable)
 
     return p
