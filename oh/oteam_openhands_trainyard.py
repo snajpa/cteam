@@ -54,6 +54,7 @@ import signal
 import socketserver
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -292,6 +293,9 @@ class Config:
             prompts_dir=os.path.join(workdir, "prompts"),
         )
 
+        if os.path.abspath(cfg.repo_root) == os.path.abspath(cfg.workdir):
+            cfg.trunk_workdir = cfg.repo_root
+
         cfg.trunk_branch = get("trunk_branch", cfg.trunk_branch)
         cfg.http_host = get("http_host", cfg.http_host)
         cfg.http_port = int(get("http_port", cfg.http_port))
@@ -329,7 +333,6 @@ class Config:
             self.workdir,
             self.log_dir,
             self.conversations_dir,
-            self.workdir_root,
             self.trunk_workdir,
             self.lanes_root,
             self.prompts_dir,
@@ -1147,11 +1150,30 @@ class GitWorkdirManager:
             ["rev-parse", "--is-inside-work-tree"], cwd=self.cfg.repo_root
         )
         if rc != 0 or out.strip() != "true":
-            raise GitWorkdirError(
-                f"Project root is not a git repo (or git not available).\nrc={rc}\nout={out}\nerr={err}"
-            )
-        # Ensure local identity (so automated commits work).
+            self._auto_init_repo()
         self._ensure_git_identity()
+
+    def _auto_init_repo(self) -> None:
+        if os.path.isdir(os.path.join(self.cfg.repo_root, ".git")):
+            return
+        if not os.path.isdir(self.cfg.repo_root):
+            os.makedirs(self.cfg.repo_root, exist_ok=True)
+        rc, out, err = self._git(["init", self.cfg.repo_root], cwd=None, timeout_s=30)
+        if rc != 0:
+            raise GitWorkdirError(f"Failed to init git repo: {err}\n{out}")
+        self._git(
+            ["symbolic-ref", "HEAD", f"refs/heads/{self.cfg.trunk_branch}"],
+            cwd=self.cfg.repo_root,
+            timeout_s=10,
+        )
+        self._ensure_git_identity()
+        rc, out, err = self._git(
+            ["commit", "--allow-empty", "-m", "Initial commit (oteam trainyard)"],
+            cwd=self.cfg.repo_root,
+            timeout_s=30,
+        )
+        if rc != 0:
+            raise GitWorkdirError(f"Failed to create initial commit: {err}\n{out}")
 
     def _ensure_git_identity(self) -> None:
         # Only set local repo config if missing.
@@ -1182,25 +1204,31 @@ class GitWorkdirManager:
         with self._git_lock:
             self.ensure_usable_repo()
 
-            # If trunk already looks like a worktree, keep it.
+            if os.path.abspath(self.cfg.trunk_workdir) == os.path.abspath(
+                self.cfg.repo_root
+            ):
+                self._git(
+                    ["checkout", self.cfg.trunk_branch],
+                    cwd=self.cfg.trunk_workdir,
+                    timeout_s=30,
+                )
+                self._bootstrap_shared()
+                return
+
             if os.path.isdir(self.cfg.trunk_workdir) and os.path.exists(
                 os.path.join(self.cfg.trunk_workdir, ".git")
             ):
-                # Ensure it is on trunk branch.
                 self._git(
                     ["checkout", self.cfg.trunk_branch], cwd=self.cfg.trunk_workdir
                 )
                 self._bootstrap_shared()
                 return
 
-            # Remove if partially created.
             if os.path.isdir(self.cfg.trunk_workdir):
                 shutil.rmtree(self.cfg.trunk_workdir, ignore_errors=True)
 
             ensure_dir(os.path.dirname(self.cfg.trunk_workdir))
 
-            # Create branch if needed & add worktree.
-            # -B ensures branch exists/reset to HEAD the first time; if it exists, keeps as branch.
             rc, out, err = self._git(
                 [
                     "worktree",
