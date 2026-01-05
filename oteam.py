@@ -321,14 +321,23 @@ def save_tickets(root: Path, state: Dict[str, Any], store: Dict[str, Any]) -> No
     )
 
 
-def _next_ticket_id(meta: Dict[str, Any]) -> str:
+def _next_ticket_id(meta: Dict[str, Any], store: Dict[str, Any]) -> str:
+    existing_ids: Set[str] = set()
+    for t in store.get("tickets", []):
+        if t.get("id"):
+            existing_ids.add(str(t.get("id")).upper())
     try:
         n = int(meta.get("next_id", 1))
     except Exception:
         n = 1
-    tid = f"T{n:03d}"
-    meta["next_id"] = n + 1
-    return tid
+    max_attempts = 10000
+    for _ in range(max_attempts):
+        tid = f"T{n:03d}"
+        if tid.upper() not in existing_ids:
+            meta["next_id"] = n + 1
+            return tid
+        n += 1
+    raise OTeamError("could not generate unique ticket ID after many attempts")
 
 
 def _find_ticket(store: Dict[str, Any], ticket_id: str) -> Optional[Dict[str, Any]]:
@@ -446,7 +455,7 @@ def ticket_create(
     with ticket_lock(root, state):
         store = load_tickets(root, state)
         ts = now_iso()
-        tid = _next_ticket_id(store["meta"])
+        tid = _next_ticket_id(store["meta"], store)
         ticket = {
             "id": tid,
             "title": title.strip(),
@@ -1304,7 +1313,7 @@ def build_state(
             "agent_idle_seconds": 120,
             "agent_stalled_nudge_seconds": 300,
             "agent_unassigned_nudge_seconds": 600,
-            "pm_digest_interval_seconds": 600,
+            "pm_digest_interval_seconds": 15,
             "dashboard_write_seconds": 10,
             "agent_resume_seconds": 180,
             "agent_resume_cooldown_seconds": 180,
@@ -1429,7 +1438,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         sup.setdefault("agent_idle_seconds", 120)
         sup.setdefault("agent_stalled_nudge_seconds", 300)
         sup.setdefault("agent_unassigned_nudge_seconds", 600)
-        sup.setdefault("pm_digest_interval_seconds", 600)
+        sup.setdefault("pm_digest_interval_seconds", 15)
         sup.setdefault("dashboard_write_seconds", 10)
         sup.setdefault("agent_resume_seconds", 180)
         sup.setdefault("agent_resume_cooldown_seconds", 180)
@@ -2643,11 +2652,19 @@ def write_message(
     if sender == "pm" and recipient == "customer":
         cust_state = load_customer_state(root)
         cust_state["last_pm_reply_ts"] = ts
+        cust_state["pending_messages"] = []
         save_customer_state(root, cust_state)
 
     if sender == "customer" and recipient == "pm":
         cust_state = load_customer_state(root)
         cust_state["last_customer_msg_ts"] = ts
+        msg_id = ts_for_filename(ts)
+        pending = cust_state.get("pending_messages") or []
+        existing_ids = [p.get("id") for p in pending]
+        if msg_id not in existing_ids:
+            pending.append({"id": msg_id, "subject": subject, "added_at": ts})
+            cust_state["pending_messages"] = pending
+        save_customer_state(root, cust_state)
 
         # Burst buffering: customers often send message-per-thought. Buffer entries so the router can
         # send one digest after a short quiet window, instead of spamming the PM.
@@ -6334,7 +6351,7 @@ def cmd_tickets(args: argparse.Namespace) -> None:
             note=args.note,
         )
         print(f"closed {ticket['id']}")
-        recipients = [ticket.get("assignee"), "pm"]
+        recipients = list(dict.fromkeys([ticket.get("assignee"), "pm"]))
         _notify_ticket_change(
             root,
             state,
