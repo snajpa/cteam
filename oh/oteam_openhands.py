@@ -265,6 +265,10 @@ class Config:
     condenser_max_events: int = 40
     condenser_keep_first: int = 4
 
+    # Stationmaster actor-critic control
+    stationmaster_actor_critic: bool = True
+    stationmaster_ac_max_retries: int = 1
+
     # Safety/ops
     git_user_name: str = "oteam-bot"
     git_user_email: str = "oteam-bot@localhost"
@@ -328,6 +332,11 @@ class Config:
 
         cfg.condenser_max_events = int(os.getenv("OTEAM_CONDENSER_MAX_EVENTS", str(cfg.condenser_max_events)))
         cfg.condenser_keep_first = int(os.getenv("OTEAM_CONDENSER_KEEP_FIRST", str(cfg.condenser_keep_first)))
+
+        ac = os.getenv("OTEAM_STATIONMASTER_ACTOR_CRITIC", "")
+        if ac.strip() != "":
+            cfg.stationmaster_actor_critic = ac.strip().lower() in ("1", "true", "yes", "y", "on")
+        cfg.stationmaster_ac_max_retries = int(os.getenv("OTEAM_STATIONMASTER_AC_MAX_RETRIES", str(cfg.stationmaster_ac_max_retries)))
 
         cfg.git_user_name = os.getenv("OTEAM_GIT_USER_NAME", cfg.git_user_name)
         cfg.git_user_email = os.getenv("OTEAM_GIT_USER_EMAIL", cfg.git_user_email)
@@ -1334,6 +1343,49 @@ Rules:
 """
 
 
+
+STATIONMASTER_CRITIC_PROMPT_J2 = r"""
+You are **OTeam Stationmaster Critic**.
+
+You review the Stationmaster Actor's proposal and output a corrected proposal.
+This system runs for weeks; your job is to prevent drift, dead-ends, and runaway DAG growth.
+
+You will receive a message containing:
+- CONTEXT_PACKET: the same packet the actor saw
+- ACTOR_PROPOSAL_JSON: the actor's raw output (may be invalid or schema-incomplete)
+
+You MUST output **JSON ONLY**. No markdown.
+
+Return a JSON object in the same base schema as Stationmaster:
+
+{
+  "mode": "SEEDING|PLANNING|EXECUTING|VERIFYING|MIGRATING|IDLE",
+  "notes": "short critic note for logs",
+  "actions": [...],
+
+  "critic_verdict": "accept|revise|reject",
+  "critic_issues": ["optional list of issues found"],
+  "lessons": ["optional: guardrails/lessons to record"]
+}
+
+Guidance / invariants you must enforce:
+- If pending seed draft items exist while an epoch is active (not DONE/IDLE), the correct mode is MIGRATING
+  and actions should prioritize a safe transition (questions, seed ledger items, requesting seed compile, migration nodes).
+- Prefer small incremental expansions: <= 8 new nodes per tick (and <= 12 deps).
+- Parallelism is for independent deliverables; avoid role-pipelines.
+- Ensure fan-in exists: when fanning out, create (or plan) join nodes to reconverge and reduce the graph.
+- Require verification: do not allow DONE without verify nodes and explicit evidence.
+- Keep vocabulary generic (deliverable/evidence/work packet). Avoid software-dev terms unless SEED demands them.
+- If the actor proposal is unsalvageable, set critic_verdict="reject" and output a minimal safe plan:
+  - ask_customer for missing info and/or create 1-2 reflect nodes to replan/diagnose.
+
+Your output should be either:
+- The actor proposal unchanged (critic_verdict="accept"),
+- A minimally edited/corrected proposal (critic_verdict="revise"),
+- A safe fallback (critic_verdict="reject").
+
+"""
+
 WORKER_PROMPT_J2 = r"""
 You are **OTeam Lane Worker**.
 
@@ -1416,6 +1468,7 @@ def write_prompt_templates(cfg: Config) -> dict[str, str]:
     paths: dict[str, str] = {}
     mapping = {
         "stationmaster.j2": STATIONMASTER_PROMPT_J2,
+        "stationmaster_critic.j2": STATIONMASTER_CRITIC_PROMPT_J2,
         "worker.j2": WORKER_PROMPT_J2,
         "verifier.j2": VERIFIER_PROMPT_J2,
     }
@@ -1768,8 +1821,8 @@ class OpenHandsRuntime:
             assistant_tail=clamp(last_assistant[-1] if last_assistant else "", 800),
         )
         return last_assistant[-1] if last_assistant else ""
-
-    def stationmaster_step(self, context_packet: str) -> str:
+    def _stationmaster_actor(self, user_message: str, conversation_id: str = "stationmaster_actor") -> str:
+        """Stationmaster Actor: proposes actions (DAG edits, seed actions, etc.)."""
         condenser = self._make_condenser()
         tools = self._tools(allow_edit=False)  # planning; no file edits
         agent = Agent(
@@ -1781,12 +1834,100 @@ class OpenHandsRuntime:
             agent_context=AgentContext(skills=[Skill(name="Always respond with JSON only.")]),
         )
         return self.run_conversation(
-            conversation_id="stationmaster",
+            conversation_id=conversation_id,
             agent=agent,
             workspace=self.cfg.trunk_workdir,
-            user_message=context_packet,
+            user_message=user_message,
             persistence_dir=self.cfg.conversations_dir,
         )
+
+    def _stationmaster_critic(
+        self,
+        context_packet: str,
+        actor_output_text: str,
+        conversation_id: str = "stationmaster_critic",
+    ) -> str:
+        """Stationmaster Critic: audits the actor proposal and returns a corrected proposal."""
+        condenser = self._make_condenser()
+        tools = self._tools(allow_edit=False)  # critique; no file edits
+        agent = Agent(
+            llm=self.llm,
+            tools=tools,
+            condenser=condenser,
+            system_prompt_filename=self.prompt_paths["stationmaster_critic.j2"],
+            system_prompt_kwargs={},
+            agent_context=AgentContext(skills=[Skill(name="Always respond with JSON only.")]),
+        )
+
+        critic_packet = (
+            "CRITIC_INPUT\n"
+            "CONTEXT_PACKET:\n"
+            + context_packet
+            + "\n\nACTOR_PROPOSAL_JSON:\n"
+            + actor_output_text
+            + "\n"
+        )
+        return self.run_conversation(
+            conversation_id=conversation_id,
+            agent=agent,
+            workspace=self.cfg.trunk_workdir,
+            user_message=critic_packet,
+            persistence_dir=self.cfg.conversations_dir,
+        )
+
+    def stationmaster_step(self, context_packet: str) -> str:
+        """Actor-critic Stationmaster.
+
+        Flow:
+        - Actor proposes a Stationmaster output JSON.
+        - Critic validates/edits it (and may reject).
+        - If rejected, a revision loop may be triggered (configurable).
+
+        Returns the final Stationmaster JSON (critic output preferred).
+        """
+        if not getattr(self.cfg, "stationmaster_actor_critic", True):
+            return self._stationmaster_actor(context_packet, conversation_id="stationmaster")
+
+        max_retries = max(0, int(getattr(self.cfg, "stationmaster_ac_max_retries", 1)))
+
+        last_actor = self._stationmaster_actor(context_packet, conversation_id="stationmaster_actor")
+
+        for attempt in range(max_retries + 1):
+            critic_out = self._stationmaster_critic(context_packet, last_actor, conversation_id="stationmaster_critic")
+            cobj = extract_first_json_object(critic_out) or {}
+            verdict = str(cobj.get("critic_verdict") or "").strip().lower()
+
+            # Default to accept if verdict missing.
+            if verdict in ("", "accept", "revise"):
+                self.jlog.emit(
+                    "stationmaster_actor_critic",
+                    verdict=verdict or "accept",
+                    attempt=attempt,
+                    actor_tail=clamp(last_actor, 900),
+                    critic_tail=clamp(critic_out, 900),
+                )
+                return critic_out if extract_first_json_object(critic_out) else last_actor
+
+            issues = cobj.get("critic_issues")
+            issues_list = [str(x) for x in issues] if isinstance(issues, list) else []
+            self.jlog.emit(
+                "stationmaster_actor_critic_reject",
+                attempt=attempt,
+                issues=issues_list[:25],
+                actor_tail=clamp(last_actor, 900),
+                critic_tail=clamp(critic_out, 900),
+            )
+
+            if attempt >= max_retries:
+                # If critic gave a valid stationmaster JSON despite rejection, use it; otherwise keep actor.
+                return critic_out if extract_first_json_object(critic_out) else last_actor
+
+            revision_req = {"attempt": attempt + 1, "critic_issues": issues_list[:25]}
+            revision_msg = context_packet + "\n\nREVISION_REQUEST:\n" + json.dumps(revision_req, ensure_ascii=False)
+            last_actor = self._stationmaster_actor(revision_msg, conversation_id="stationmaster_actor")
+
+        return last_actor
+
 
     def worker_step(self, node_id: str, node_title: str, objective: str, deliverables: list[str], workspace: str, conversation_id: str, context_packet: str | None = None) -> str:
         condenser = self._make_condenser()
@@ -2346,6 +2487,10 @@ class Orchestrator:
         actions = obj.get("actions") or []
         mode = obj.get("mode") or ""
         self.jlog.emit("stationmaster_actions", mode=mode, actions=actions)
+
+        lessons = obj.get("lessons")
+        if isinstance(lessons, list) and lessons:
+            self._append_lessons([str(x) for x in lessons if str(x).strip()])
 
         for act in actions:
             if not isinstance(act, dict):

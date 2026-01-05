@@ -105,9 +105,29 @@ Telegram commands:
 ## Prompts
 
 Prompt templates are written at runtime into:
-- `.oteam/prompts/stationmaster.j2`
+- `.oteam/prompts/stationmaster.j2` (Stationmaster **Actor**)
+- `.oteam/prompts/stationmaster_critic.j2` (Stationmaster **Critic**)
 - `.oteam/prompts/worker.j2`
 - `.oteam/prompts/verifier.j2`
+
+### Stationmaster actor-critic
+
+The Stationmaster runs as an **actor-critic controller**:
+
+- **Actor** (`stationmaster.j2`) proposes a small set of actions (seed questions/items, DAG node creation, epoch status changes).
+- **Critic** (`stationmaster_critic.j2`) audits the proposal for:
+  - schema correctness (parseable JSON),
+  - SEED alignment and correct mode (especially during MIGRATING),
+  - DAG health (branch width, fan-in via joins, verification coverage),
+  - avoidance of irreversible one-way choices.
+
+The critic returns the final Stationmaster JSON (it may copy the actor output unchanged, revise it, or reject and emit a safe fallback).
+The orchestrator also accepts optional `lessons` from the critic output and appends them to `shared/lessons/LESSONS.md`.
+
+Runtime controls (env vars):
+- `OTEAM_STATIONMASTER_ACTOR_CRITIC=0` disables the critic and runs the actor only.
+- `OTEAM_STATIONMASTER_AC_MAX_RETRIES=0` disables the revision loop (still one critic pass if enabled).
+  Default is `1` retry if the critic rejects.
 
 They enforce:
 - **generic vocabulary** (deliverables / evidence / work packets)
