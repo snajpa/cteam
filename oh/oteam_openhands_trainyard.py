@@ -287,9 +287,8 @@ class Config:
             log_dir=os.path.join(workdir, "logs"),
             jsonl_log_path=os.path.join(workdir, "logs", "events.jsonl"),
             conversations_dir=os.path.join(workdir, "conversations"),
-            workdir_root=os.path.join(workdir, "workdir"),
-            trunk_workdir=os.path.join(workdir, "workdir", "trunk"),
-            lanes_root=os.path.join(workdir, "workdir", "lanes"),
+            trunk_workdir=os.path.join(workdir, "trunk"),
+            lanes_root=os.path.join(workdir, "lanes"),
             prompts_dir=os.path.join(workdir, "prompts"),
         )
 
