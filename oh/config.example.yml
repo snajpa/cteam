@@ -1,0 +1,42 @@
+# OTeam Trainyard Configuration
+# Copy this file to config.yml in your workdir
+
+# Path to the git repository root (can be different from workdir)
+repo_root: /path/to/your/project
+
+# LLM Configuration
+llm_api_key: your-api-key-here
+llm_model: anthropic/claude-sonnet-4-5-20250929
+llm_base_url: null  # Optional: for LiteLLM-compatible gateways
+
+# HTTP Server (customer channel)
+http_host: "0.0.0.0"
+http_port: 8088
+
+# Git Configuration
+trunk_branch: "oteam/trunk"
+git_user_name: "oteam-bot"
+git_user_email: "oteam-bot@localhost"
+
+# Telegram Configuration (optional)
+telegram_bot_token: null
+telegram_admin_chat_id: null
+
+# Scheduler Configuration
+node_workers: 3
+max_parallel_lanes: 6
+scheduler_tick_s: 2.0
+conductor_tick_s: 10.0
+repo_index_tick_s: 60.0
+
+# Repo Index Configuration
+repo_index_max_file_bytes: 200000
+repo_index_max_files_per_tick: 200
+
+# Condenser Configuration
+condenser_max_events: 40
+condenser_keep_first: 4
+
+# Stationmaster Actor-Critic Configuration
+stationmaster_actor_critic: true
+stationmaster_ac_max_retries: 1
