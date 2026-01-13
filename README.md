@@ -16,10 +16,12 @@ arrives, and can bridge a customer chat (local or Telegram).
 ## Requirements
 - Python 3.9+
 - `git` and `tmux` in `PATH`
-- Codex CLI (`codex` in `PATH`)
-- Recommended Codex posture for low-friction work:
-  - `--sandbox danger-full-access`
-  - `--ask-for-approval never` (or `--approval-policy never` on newer CLIs)
+- Codex/OpenCode CLI (`opencode` in `PATH`)
+  - Recommended Codex posture for low-friction work:
+    - `--sandbox danger-full-access`
+    - `--ask-for-approval never` (or `--approval-policy never` on newer CLIs)
+
+**oteam note:** oteam is the OpenCode flavour of this orchestrator. It expects the `opencode` binary name. If only `codex` is installed, create an `opencode` symlink to `codex` instead of changing `--opencode-cmd`; pane health checks look for the configured command name.
 
 ## Quick start (new project)
 1) Initialize a workspace (example with two devs):

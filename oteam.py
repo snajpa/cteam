@@ -18,6 +18,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import readline
 import textwrap
@@ -126,6 +128,112 @@ def slugify(s: str) -> str:
 def _looks_like_git_url(src: str) -> bool:
     s = src.strip()
     return bool(re.match(r"^(https?://|ssh://|git@|file://|.+\.git$)", s))
+
+
+TARBALL_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz")
+
+
+def _looks_like_tarball(src: str) -> bool:
+    s = src.strip().lower()
+    return any(s.endswith(ext) for ext in TARBALL_SUFFIXES)
+
+
+def _safe_extract_tarball(tf: tarfile.TarFile, dest: Path) -> None:
+    dest_abs = dest.resolve()
+    for member in tf.getmembers():
+        member_path = dest_abs / member.name
+        try:
+            member_abs = member_path.resolve()
+        except Exception:
+            member_abs = member_path
+        if not str(member_abs).startswith(str(dest_abs)):
+            raise OTeamError(
+                f"tarball contains unsafe path outside extract dir: {member.name}"
+            )
+        if member.islnk() or member.issym():
+            target = Path(member.linkname or "")
+            if target.is_absolute():
+                raise OTeamError(
+                    f"tarball contains symlink with absolute target: {member.name}"
+                )
+            target_path = (member_path.parent / target).resolve()
+            if not str(target_path).startswith(str(dest_abs)):
+                raise OTeamError(
+                    f"tarball contains symlink outside extract dir: {member.name}"
+                )
+    tf.extractall(dest_abs)
+
+
+def _collapse_single_dir(base: Path) -> Path:
+    entries = [p for p in base.iterdir() if p.name != "__MACOSX"]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return base
+
+
+def _read_seed_from_dir(src_root: Path) -> Optional[str]:
+    for candidate in [src_root / "SEED.md", src_root / "seed" / "SEED.md"]:
+        try:
+            if candidate.exists() and candidate.is_file():
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    return text
+        except Exception:
+            continue
+    return None
+
+
+def _maybe_extract_tarball_src(
+    src: str,
+) -> Tuple[Optional[tempfile.TemporaryDirectory], Optional[Path], Optional[str]]:
+    src_path = Path(src).expanduser()
+    tar_like = _looks_like_tarball(src)
+    tar_path: Optional[Path] = None
+    tmpdir: Optional[tempfile.TemporaryDirectory] = None
+
+    if tar_like and src_path.exists() and src_path.is_file():
+        if not tarfile.is_tarfile(src_path):
+            raise OTeamError(f"--src tarball is not readable: {src}")
+        tmpdir = tempfile.TemporaryDirectory(prefix="oteam_import_")
+        tar_path = src_path
+    elif tar_like and src.strip().lower().startswith(("http://", "https://")):
+        tmpdir = tempfile.TemporaryDirectory(prefix="oteam_import_")
+        tar_path = Path(tmpdir.name) / "src.tar"
+        try:
+            with urllib.request.urlopen(src, timeout=60.0) as resp:
+                tar_path.write_bytes(resp.read())
+        except Exception as e:
+            tmpdir.cleanup()
+            raise OTeamError(f"failed to download tarball from {src}: {e}") from e
+    elif tar_like:
+        raise OTeamError(f"--src tarball not found or unreadable: {src}")
+    else:
+        return None, None, None
+
+    if not tarfile.is_tarfile(tar_path):
+        tmpdir.cleanup()
+        raise OTeamError(f"--src tarball is not readable: {src}")
+
+    extract_root = Path(tmpdir.name) / "extract"
+    mkdirp(extract_root)
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            _safe_extract_tarball(tf, extract_root)
+    except Exception:
+        tmpdir.cleanup()
+        raise
+
+    src_root = _collapse_single_dir(extract_root)
+    try:
+        has_any = any(src_root.iterdir())
+    except Exception:
+        has_any = False
+    if not has_any:
+        tmpdir.cleanup()
+        raise OTeamError(f"--src tarball appears to be empty: {src}")
+
+    seed_text = _read_seed_from_dir(src_root)
+    return tmpdir, src_root, seed_text
 
 
 def _maybe_trigger_import_kickoff_on_customer_message(
@@ -1165,7 +1273,7 @@ def opencode_caps(opencode_cmd: str) -> OpenCodeCaps:
 
 def build_opencode_base_args(state: Dict[str, Any]) -> List[str]:
     opencode = state["opencode"]
-    cmd = opencode.get("cmd", DEFAULT_OPENCODE_CMD)
+    cmd = DEFAULT_OPENCODE_CMD
     caps = opencode_caps(cmd)
     args: List[str] = [cmd]
     if opencode.get("yolo", False):
@@ -1209,7 +1317,7 @@ def build_opencode_args_for_agent(
     state: Dict[str, Any], agent: Dict[str, Any], start_dir: Path
 ) -> List[str]:
     base = build_opencode_base_args(state)
-    cmd = state["opencode"].get("cmd", DEFAULT_OPENCODE_CMD)
+    cmd = DEFAULT_OPENCODE_CMD
     caps = opencode_caps(cmd)
     args = list(base)
     if caps.supports("--cd"):
@@ -1311,7 +1419,7 @@ def build_state(
             "customer_burst_seconds": 20,
             "customer_ack_cooldown_seconds": 25,
             "agent_idle_seconds": 120,
-            "agent_stalled_nudge_seconds": 300,
+            "agent_stalled_nudge_seconds": 10,
             "agent_unassigned_nudge_seconds": 600,
             "pm_digest_interval_seconds": 15,
             "dashboard_write_seconds": 10,
@@ -1436,7 +1544,7 @@ def upgrade_state_if_needed(root: Path, state: Dict[str, Any]) -> Dict[str, Any]
         sup.setdefault("customer_burst_seconds", 20)
         sup.setdefault("customer_ack_cooldown_seconds", 25)
         sup.setdefault("agent_idle_seconds", 120)
-        sup.setdefault("agent_stalled_nudge_seconds", 300)
+        sup.setdefault("agent_stalled_nudge_seconds", 10)
         sup.setdefault("agent_unassigned_nudge_seconds", 600)
         sup.setdefault("pm_digest_interval_seconds", 15)
         sup.setdefault("dashboard_write_seconds", 10)
@@ -1478,25 +1586,76 @@ def save_state(root: Path, state: Dict[str, Any]) -> None:
 def migrate_cteam_state_if_needed(root: Path) -> bool:
     cteam_path = root / "cteam.json"
     oteam_path = root / STATE_FILENAME
-    if oteam_path.exists():
-        return False
     if not cteam_path.exists():
         return False
     try:
-        state = json.loads(cteam_path.read_text(encoding="utf-8"))
-        state["root_abs"] = str(root.resolve())
-        coord = state.get("coordination", {})
-        assignment_from = coord.get("assignment_from", ["pm", "oteam"])
-        if "cteam" in assignment_from:
-            assignment_from = ["oteam" if x == "cteam" else x for x in assignment_from]
-            coord["assignment_from"] = assignment_from
-            state["coordination"] = coord
-        save_state(root, state)
+        cteam_state = json.loads(cteam_path.read_text(encoding="utf-8"))
+        if oteam_path.exists():
+            oteam_state = json.loads(oteam_path.read_text(encoding="utf-8"))
+            if oteam_state.get("version", 0) >= STATE_VERSION:
+                cteam_path.rename(cteam_path.with_suffix(".json.bak"))
+                log_line(
+                    root, f"archived legacy cteam.json (oteam.json already current)"
+                )
+                return True
+            oteam_state["root_abs"] = str(root.resolve())
+            coord = oteam_state.get("coordination", {})
+            assignment_from = coord.get("assignment_from", ["pm", "oteam"])
+            if "cteam" in assignment_from:
+                assignment_from = [
+                    "oteam" if x == "cteam" else x for x in assignment_from
+                ]
+                coord["assignment_from"] = assignment_from
+                oteam_state["coordination"] = coord
+            save_state(root, oteam_state)
+        else:
+            cteam_state["root_abs"] = str(root.resolve())
+            coord = cteam_state.get("coordination", {})
+            assignment_from = coord.get("assignment_from", ["pm", "oteam"])
+            if "cteam" in assignment_from:
+                assignment_from = [
+                    "oteam" if x == "cteam" else x for x in assignment_from
+                ]
+                coord["assignment_from"] = assignment_from
+                cteam_state["coordination"] = coord
+            save_state(root, cteam_state)
         cteam_path.rename(cteam_path.with_suffix(".json.bak"))
         log_line(root, f"migrated cteam.json to {STATE_FILENAME}")
         return True
     except Exception as e:
         log_line(root, f"failed to migrate cteam.json: {e}")
+        return False
+    try:
+        state = json.loads(cteam_path.read_text(encoding="utf-8"))
+        if oteam_path.exists() and not _needs_cteam_migration(oteam_path, state):
+            cteam_path.rename(cteam_path.with_suffix(".json.bak"))
+            return True
+        if not oteam_path.exists():
+            state["root_abs"] = str(root.resolve())
+            coord = state.get("coordination", {})
+            assignment_from = coord.get("assignment_from", ["pm", "oteam"])
+            if "cteam" in assignment_from:
+                assignment_from = [
+                    "oteam" if x == "cteam" else x for x in assignment_from
+                ]
+                coord["assignment_from"] = assignment_from
+                state["coordination"] = coord
+            save_state(root, state)
+        cteam_path.rename(cteam_path.with_suffix(".json.bak"))
+        log_line(root, f"migrated cteam.json to {STATE_FILENAME}")
+        return True
+    except Exception as e:
+        log_line(root, f"failed to migrate cteam.json: {e}")
+        return False
+
+
+def _needs_cteam_migration(oteam_path: Path, cteam_state: Dict[str, Any]) -> bool:
+    try:
+        oteam_state = json.loads(oteam_path.read_text(encoding="utf-8"))
+        if oteam_state.get("version", 0) >= STATE_VERSION:
+            return True
+        return False
+    except Exception:
         return False
 
 
@@ -2252,7 +2411,9 @@ def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
             pass
 
 
-def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> None:
+def create_git_scaffold_import(
+    root: Path, state: Dict[str, Any], src: str
+) -> Optional[str]:
     bare = root / DIR_PROJECT_BARE
     checkout = root / DIR_PROJECT_CHECKOUT
 
@@ -2261,73 +2422,88 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
             f"{DIR_PROJECT_BARE} already exists and is not empty in {root}"
         )
 
-    imported_as_git = False
-    try:
-        git_clone_bare(src, bare)
-        imported_as_git = True
-    except OTeamError:
-        imported_as_git = False
-        if _looks_like_git_url(src):
-            raise
+    tar_tmp: Optional[tempfile.TemporaryDirectory] = None
+    src_seed_text: Optional[str] = None
 
-    if imported_as_git:
-        if not checkout.exists():
-            git_clone(bare, checkout)
+    try:
+        tar_tmp, tar_src_root, src_seed_text = _maybe_extract_tarball_src(src)
+        if tar_src_root is not None:
+            src_path = tar_src_root
+        else:
+            imported_as_git = False
+            try:
+                git_clone_bare(src, bare)
+                imported_as_git = True
+            except OTeamError:
+                imported_as_git = False
+                if _looks_like_git_url(src):
+                    raise
+
+            if imported_as_git:
+                if not checkout.exists():
+                    git_clone(bare, checkout)
+                try:
+                    git_append_info_exclude(
+                        checkout,
+                        [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"],
+                    )
+                except Exception:
+                    pass
+                return src_seed_text
+
+            src_path = Path(src).expanduser().resolve()
+            if not src_path.exists() or not src_path.is_dir():
+                raise OTeamError(
+                    f"--src is neither a git repo, tarball, nor a readable directory: {src}"
+                )
+
+        git_init_bare(bare, branch=state["git"]["default_branch"])
+        git_clone(bare, checkout)
+
+        for item in src_path.iterdir():
+            if item.name == ".git":
+                continue
+            dest = checkout / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, dest)
+
+        git_config_local(checkout, "user.name", "oteam-import")
+        git_config_local(checkout, "user.email", "cteam+import@local")
+        run_cmd(["git", "-C", str(checkout), "add", "-A"])
+        try:
+            run_cmd(
+                ["git", "-C", str(checkout), "commit", "-m", "Import existing project"],
+                capture=True,
+            )
+        except OTeamError:
+            run_cmd(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "Import existing project",
+                ],
+                capture=True,
+            )
+
+        run_cmd(["git", "-C", str(checkout), "push", "origin", "HEAD"], capture=True)
+
         try:
             git_append_info_exclude(
                 checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
             )
         except Exception:
             pass
-        return
-
-    src_path = Path(src).expanduser().resolve()
-    if not src_path.exists() or not src_path.is_dir():
-        raise OTeamError(f"--src is neither a git repo nor a readable directory: {src}")
-
-    git_init_bare(bare, branch=state["git"]["default_branch"])
-    git_clone(bare, checkout)
-
-    for item in src_path.iterdir():
-        if item.name == ".git":
-            continue
-        dest = checkout / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest, dirs_exist_ok=True)
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, dest)
-
-    git_config_local(checkout, "user.name", "oteam-import")
-    git_config_local(checkout, "user.email", "cteam+import@local")
-    run_cmd(["git", "-C", str(checkout), "add", "-A"])
-    try:
-        run_cmd(
-            ["git", "-C", str(checkout), "commit", "-m", "Import existing project"],
-            capture=True,
-        )
-    except OTeamError:
-        run_cmd(
-            [
-                "git",
-                "-C",
-                str(checkout),
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Import existing project",
-            ],
-            capture=True,
-        )
-
-    run_cmd(["git", "-C", str(checkout), "push", "origin", "HEAD"], capture=True)
-
-    try:
-        git_append_info_exclude(
-            checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
-        )
-    except Exception:
-        pass
+        return src_seed_text
+    finally:
+        if tar_tmp:
+            tar_tmp.cleanup()
 
 
 def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> None:
@@ -2558,7 +2734,7 @@ def _normalize_reasons(reasons: Set[str]) -> Set[str]:
         if not r_clean:
             continue
         upper_r = r_clean.upper()
-        if "MAILBOX UPDATED" in upper_r:
+        if "MAILBOX UPDATED" in upper_r or "MAILBOX MAY BE UPDATED" in upper_r:
             normalized.add("MAILBOX UPDATED")
             continue
         normalized.add(r_clean)
@@ -2566,7 +2742,7 @@ def _normalize_reasons(reasons: Set[str]) -> Set[str]:
 
 
 def _mailbox_nudge_reason(ticket_id: Optional[str], msg_type: Optional[str]) -> str:
-    reason = "ACT NOW — MAILBOX UPDATED"
+    reason = "ACT NOW, DO YOUR JOB. mailbox may be updated:"
     if ticket_id:
         reason = f"{ticket_id} {reason}"
     if msg_type:
@@ -2587,6 +2763,7 @@ def write_message(
     nudge: bool = True,
     start_if_needed: bool = False,
     ticket_id: Optional[str] = None,
+    skip_inbox: bool = False,
 ) -> None:
     ts = now_iso()
     if ticket_id:
@@ -2640,7 +2817,8 @@ def write_message(
     msg_path, inbox_dir, _ = mailbox_paths(root, recipient)
     mkdirp(inbox_dir)
 
-    atomic_write_text(inbox_dir / f"{ts_for_filename(ts)}_{sender}.md", entry)
+    if not skip_inbox:
+        atomic_write_text(inbox_dir / f"{ts_for_filename(ts)}_{sender}.md", entry)
 
     append_text(msg_path, entry)
 
@@ -2664,7 +2842,6 @@ def write_message(
         if msg_id not in existing_ids:
             pending.append({"id": msg_id, "subject": subject, "added_at": ts})
             cust_state["pending_messages"] = pending
-        save_customer_state(root, cust_state)
 
         # Burst buffering: customers often send message-per-thought. Buffer entries so the router can
         # send one digest after a short quiet window, instead of spamming the PM.
@@ -2686,25 +2863,29 @@ def write_message(
                 sup = state.get("supervision") or {}
                 cooldown = int(sup.get("customer_ack_cooldown_seconds", 25) or 25)
                 last_ack = iso_to_unix(str(cust_state.get("last_customer_ack_ts", "")))
+                last_pm_reply = iso_to_unix(str(cust_state.get("last_pm_reply_ts", "")))
+                # Only send acknowledgement if enough time since last AND PM hasn't replied yet
                 if not last_ack or (time.time() - last_ack) >= cooldown:
-                    ack_body = (
-                        "Automated acknowledgement: received. "
-                        "You can keep sending details; rapid messages will be batched. "
-                        "The PM will reply here when available."
-                    )
-                    write_message(
-                        root,
-                        state,
-                        sender="oteam",
-                        recipient="customer",
-                        subject="Received — PM notified",
-                        body=ack_body,
-                        msg_type="MESSAGE",
-                        task=None,
-                        nudge=False,
-                        start_if_needed=False,
-                    )
-                    cust_state["last_customer_ack_ts"] = ts
+                    if not (last_pm_reply and last_pm_reply >= last_ack):
+                        ack_body = (
+                            "Automated acknowledgement: received. "
+                            "You can keep sending details; rapid messages will be batched. "
+                            "The PM will reply here when available."
+                        )
+                        write_message(
+                            root,
+                            state,
+                            sender="oteam",
+                            recipient="customer",
+                            subject="Received — PM notified",
+                            body=ack_body,
+                            msg_type="MESSAGE",
+                            task=None,
+                            nudge=False,
+                            start_if_needed=False,
+                            skip_inbox=True,
+                        )
+                        cust_state["last_customer_ack_ts"] = ts
             except Exception:
                 pass
 
@@ -2751,6 +2932,194 @@ def write_message(
             )
         nudge_reason = _mailbox_nudge_reason(ticket_id, msg_type)
         nudge_agent(root, state, recipient, reason=nudge_reason)
+
+
+def write_broadcast_message(
+    root: Path,
+    state: Dict[str, Any],
+    *,
+    sender: str,
+    recipients: List[str],
+    subject: str,
+    body: str,
+    msg_type: str = "MESSAGE",
+    task: Optional[str] = None,
+    nudge: bool = True,
+    start_if_needed: bool = False,
+    ticket_id: Optional[str] = None,
+) -> None:
+    ts = now_iso()
+    if ticket_id:
+        ticket_id = ticket_id.strip()
+    entry = format_message(
+        ts,
+        sender,
+        ", ".join(recipients),
+        subject,
+        body,
+        msg_type=msg_type,
+        task=task,
+        ticket_id=ticket_id or None,
+    )
+    if not entry.endswith("\n"):
+        entry += "\n"
+
+    agent_names = {a["name"] for a in state["agents"]}
+    allowed = set(agent_names) | {"customer"}
+    allowed_senders = allowed | {"oteam"}
+    for r in recipients:
+        if r not in allowed:
+            raise OTeamError(f"unknown recipient: {r}")
+    if sender not in allowed_senders:
+        raise OTeamError(f"unknown sender: {sender}")
+    if sender == "customer":
+        raise OTeamError("customer cannot broadcast")
+    for r in recipients:
+        if r == "customer" and sender not in {"pm", "oteam"}:
+            raise OTeamError("only pm can broadcast to customer")
+
+    if msg_type == ASSIGNMENT_TYPE and sender not in {"pm", "oteam"}:
+        raise OTeamError("assignments must come from pm")
+
+    if ticket_id:
+        with ticket_lock(root, state):
+            store = load_tickets(root, state)
+            t = _find_ticket(store, ticket_id)
+            if not t:
+                raise OTeamError(f"unknown ticket: {ticket_id}")
+            snippet = (body or "").strip().splitlines()[0] if body else ""
+            _add_history(
+                t,
+                {
+                    "ts": ts,
+                    "type": "message",
+                    "user": sender,
+                    "note": f"{subject}".strip(),
+                    "snippet": snippet[:200],
+                },
+            )
+            t["updated_at"] = ts
+            save_tickets(root, state, store)
+
+    for r in recipients:
+        msg_path, inbox_dir, _ = mailbox_paths(root, r)
+        mkdirp(inbox_dir)
+        atomic_write_text(inbox_dir / f"{ts_for_filename(ts)}_{sender}.md", entry)
+
+    main_msg_path = mailbox_paths(root, recipients[0])[0]
+    append_text(main_msg_path, entry)
+
+    broadcast_log_entry = (
+        f"BROADCAST from {sender} to {', '.join(recipients)}:\n{entry}\n"
+    )
+    append_text(root / DIR_SHARED / "MESSAGES.log.md", broadcast_log_entry)
+
+    if msg_type == ASSIGNMENT_TYPE:
+        append_text(root / DIR_SHARED / "ASSIGNMENTS.log.md", broadcast_log_entry)
+
+    if not nudge:
+        return
+
+    for r in recipients:
+        if r != "customer":
+            if start_if_needed:
+                maybe_start_agent_on_message(
+                    root, state, r, sender=sender, msg_type=msg_type
+                )
+
+    nudge_agents_parallel(
+        root, state, recipients, reason=_mailbox_nudge_reason(ticket_id, msg_type)
+    )
+
+
+def nudge_agents_parallel(
+    root: Path,
+    state: Dict[str, Any],
+    agent_names: List[str],
+    *,
+    reason: str = "MAILBOX UPDATED",
+    interrupt: bool = False,
+) -> Dict[str, bool]:
+    session = state["tmux"]["session"]
+    if not tmux_has_session(session):
+        return {n: False for n in agent_names}
+
+    results: Dict[str, bool] = {}
+    lock = threading.Lock()
+    active_threads: List[threading.Thread] = []
+
+    def nudge_one(agent_name: str) -> None:
+        _router_noise_until[agent_name] = time.time() + 2.0
+        try:
+            if agent_name not in set(tmux_list_windows(session)):
+                ensure_agent_windows(root, state, launch_opencode=True)
+        except Exception:
+            pass
+
+        extra = ""
+        if agent_name == "pm":
+            if "CUSTOMER" in reason.upper():
+                extra = "\n\nIMMEDIATE ACTION: Reply to the customer FIRST."
+            else:
+                extra = "\n\nPM PRIORITIES:\n1) Reply to customer if waiting\n2) Check agent status updates\n3) Triage tickets"
+        if "CUSTOMER" in reason.upper():
+            extra += "\n\n**CUSTOMER IS WAITING - REPLY NOW**"
+
+        if interrupt:
+            msg = f"INTERRUPT — {reason}\n\nAction required: check message.md and reply as needed."
+        else:
+            if agent_name == "pm":
+                msg = f"{reason}\n\nCheck message.md now."
+            else:
+                msg = f"{reason}\n\nCheck message.md now."
+
+        try:
+            if interrupt:
+                try:
+                    tmux_send_keys(session, agent_name, ["Escape"])
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+            tmux_send_keys(session, agent_name, ["C-u"])
+            ok = False
+            if is_opencode_running(state, agent_name):
+                wait_success = wait_for_pane_quiet(
+                    session, agent_name, quiet_for=0.5, timeout=10.0
+                )
+                if not wait_success:
+                    with lock:
+                        results[agent_name] = False
+                    return
+                ok = tmux_send_line(session, agent_name, msg)
+            else:
+                ok = tmux_send_line_when_quiet(
+                    session, agent_name, f"echo {shlex.quote(msg)}", quiet_for=0.5
+                )
+            if ok:
+                _nudge_history[agent_name] = (
+                    time.time(),
+                    _normalize_reasons(_split_reasons(reason)),
+                )
+            with lock:
+                results[agent_name] = ok
+        except Exception:
+            with lock:
+                results[agent_name] = False
+
+    for name in agent_names:
+        if name != "customer":
+            t = threading.Thread(target=nudge_one, args=(name,))
+            t.start()
+            active_threads.append(t)
+
+    for t in active_threads:
+        t.join()
+
+    for name in agent_names:
+        if name not in results:
+            results[name] = False
+
+    return results
 
 
 # -----------------------------
@@ -2852,17 +3221,27 @@ def opencode_window_command(
 
 def is_opencode_running(state: Dict[str, Any], window: str) -> bool:
     session = state["tmux"]["session"]
-    cmd = tmux_pane_current_command(session, window)
-    return "opencode" in cmd.lower()
+    cmd = tmux_pane_current_command(session, window).lower()
+    return "opencode" in cmd
 
 
 def start_opencode_in_window(
-    root: Path,
-    state: Dict[str, Any],
-    agent: Dict[str, Any],
-    *,
-    boot: bool,
+    root: Path, state: Dict[str, Any], agent: Dict[str, Any], *, boot: bool
 ) -> None:
+    def _cmd_candidates() -> Set[str]:
+        return {"opencode"}
+
+    def _wait_for_opencode(session: str, window: str, timeout: float = 8.0) -> str:
+        deadline = time.time() + max(timeout, 0.1)
+        cands = _cmd_candidates()
+        last_cmd = ""
+        while time.time() < deadline:
+            last_cmd = tmux_pane_current_command(session, window).lower()
+            if any(c in last_cmd for c in cands):
+                return last_cmd
+            time.sleep(0.1)
+        return last_cmd
+
     session = state["tmux"]["session"]
     w = agent["name"]
     repo_dir = Path(agent["repo_dir_abs"])
@@ -2910,13 +3289,12 @@ def start_opencode_in_window(
 
     print(f"DEBUG: start_opencode_in_window for {w}, boot={boot}", file=sys.stderr)
 
-    wait_for_pane_command(session, w, "opencode", timeout=8.0)
+    pane_cmd = _wait_for_opencode(session, w, timeout=8.0)
     wait_for_pane_quiet(session, w, quiet_for=5.0, timeout=8.0)
     if w not in set(tmux_list_windows(session)):
         raise OTeamError(f"tmux window {w} no longer exists before send-keys")
 
-    pane_cmd = tmux_pane_current_command(session, w)
-    if not pane_cmd or "opencode" not in pane_cmd.lower():
+    if not pane_cmd or not any(c in pane_cmd for c in _cmd_candidates()):
         raise OTeamError(
             f"opencode is not running in window {w}: pane command is '{pane_cmd}'"
         )
@@ -2990,7 +3368,7 @@ def nudge_agent(
             msg = f"INTERRUPT — {reason}\n\nAction: check message.md, analyse the problem, devise a solution, plan the steps, implement the change, verify it works, reply to PM if needed, update STATUS.md."
     else:
         if agent_name == "pm":
-            msg = f"{reason}\n\nCheck message.md now. Reply to waiting customer, then handle other pending work."
+            msg = f"{reason}\n\nCheck message.md now. Possibly reply to waiting customer, then handle other pending PM work."
         else:
             msg = f"{reason}\n\nCheck message.md now. Analyse, devise, plan, implement, verify the solution, send PM status, update STATUS.md."
     try:
@@ -3917,10 +4295,7 @@ def compute_dashboard_snapshot(
 
     agents_out: List[Dict[str, Any]] = []
 
-    opencode_cmd = str(
-        (state.get("opencode") or {}).get("cmd") or DEFAULT_OPENCODE_CMD
-    ).split()[0]
-    opencode_basename = Path(opencode_cmd).name
+    opencode_basename = "opencode"
 
     for a in state["agents"]:
         name = a["name"]
@@ -4803,16 +5178,28 @@ def cmd_watch(args: argparse.Namespace) -> None:
             last_type: Optional[str] = None
             last_ticket: Optional[str] = None
             last_body: str = ""
-            last_ts: Optional[str] = None
+            latest_ts: Optional[str] = None
+            latest_entry: str = ""
             last_sig: Optional[str] = None
-            for fp in new_files[-1:]:
+            last_ts: Optional[str] = None
+            for fp in sorted(new_files, reverse=True):
                 try:
-                    last_txt = read_last_entry(fp)
+                    txt = read_last_entry(fp)
                 except Exception:
-                    last_txt = ""
-                last_ts, last_sender, _, _, last_body, last_ticket, last_type = (
-                    _parse_entry(last_txt)
-                )
+                    txt = ""
+                if not txt or not txt.strip():
+                    continue
+                ts, sender, _, _, body, ticket, msg_type = _parse_entry(txt)
+                if ts and (not latest_ts or ts > latest_ts):
+                    latest_ts = ts
+                    latest_entry = txt
+                    last_sender = sender
+                    last_body = body
+                    last_ticket = ticket
+                    last_type = msg_type
+            if latest_entry and latest_entry.strip():
+                last_txt = latest_entry
+                last_ts = latest_ts
                 if last_txt and last_txt.strip():
                     last_sig = hashlib.sha256(
                         last_txt.strip().encode("utf-8", "ignore")
@@ -4926,7 +5313,7 @@ def cmd_watch(args: argparse.Namespace) -> None:
                 by_assignee.setdefault(ass, []).append(tt.get("id", ""))
 
             sup = state.get("supervision") or {}
-            stalled_s = float(sup.get("agent_stalled_nudge_seconds", 300) or 300)
+            stalled_s = float(sup.get("agent_stalled_nudge_seconds", 10) or 10)
             unassigned_s = float(sup.get("agent_unassigned_nudge_seconds", 600) or 600)
             # Track STATUS.md freshness for progress signals.
             for a in state["agents"]:
@@ -5584,9 +5971,9 @@ def cmd_init(args: argparse.Namespace) -> None:
     if not args.no_tmux:
         ensure_executable("tmux", hint="Install tmux")
     if not args.no_opencode:
-        if shutil.which(args.opencode_cmd) is None:
+        if shutil.which(DEFAULT_OPENCODE_CMD) is None:
             print(
-                f"warning: opencode executable not found: {args.opencode_cmd} (windows will be shells)",
+                f"warning: opencode executable not found: {DEFAULT_OPENCODE_CMD} (windows will be shells)",
                 file=sys.stderr,
             )
 
@@ -5597,7 +5984,7 @@ def cmd_init(args: argparse.Namespace) -> None:
         devs=args.devs,
         mode="new",
         imported_from=None,
-        opencode_cmd=args.opencode_cmd,
+        opencode_cmd=DEFAULT_OPENCODE_CMD,
         opencode_model=args.model,
         sandbox=args.sandbox,
         approval=args.ask_for_approval,
@@ -5656,9 +6043,9 @@ def cmd_import(args: argparse.Namespace) -> None:
     if not args.no_tmux:
         ensure_executable("tmux", hint="Install tmux")
     if not args.no_opencode:
-        if shutil.which(args.opencode_cmd) is None:
+        if shutil.which(DEFAULT_OPENCODE_CMD) is None:
             print(
-                f"warning: opencode executable not found: {args.opencode_cmd} (windows will be shells)",
+                f"warning: opencode executable not found: {DEFAULT_OPENCODE_CMD} (windows will be shells)",
                 file=sys.stderr,
             )
 
@@ -5669,7 +6056,7 @@ def cmd_import(args: argparse.Namespace) -> None:
         devs=args.devs,
         mode="import",
         imported_from=src,
-        opencode_cmd=args.opencode_cmd,
+        opencode_cmd=DEFAULT_OPENCODE_CMD,
         opencode_model=args.model,
         sandbox=args.sandbox,
         approval=args.ask_for_approval,
@@ -5685,7 +6072,23 @@ def cmd_import(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     _ = create_root_structure(root, state)
-    create_git_scaffold_import(root, state, src)
+
+    if args.seed:
+        seed_file = root / DIR_SEED / "SEED.md"
+        seed_path = Path(args.seed).expanduser().resolve()
+        if not seed_path.exists():
+            raise OTeamError(f"seed file not found: {seed_path}")
+        mkdirp(seed_file.parent)
+        atomic_write_text(seed_file, seed_path.read_text(encoding="utf-8"))
+
+    import_seed_text = create_git_scaffold_import(root, state, src)
+    if import_seed_text and not args.seed:
+        seed_file = root / DIR_SEED / "SEED.md"
+        existing = seed_file.read_text(encoding="utf-8") if seed_file.exists() else ""
+        if not existing.strip():
+            mkdirp(seed_file.parent)
+            atomic_write_text(seed_file, import_seed_text)
+
     ensure_agents_created(root, state)
     update_roster(root, state)
     save_state(root, state)
@@ -6437,25 +6840,23 @@ def cmd_broadcast(args: argparse.Namespace) -> None:
 
     sender = args.sender or "pm"
     subject = args.subject or "broadcast"
-    for a in state["agents"]:
-        write_message(
-            root,
-            state,
-            sender=sender,
-            recipient=a["name"],
-            subject=subject,
-            body=body,
-            msg_type="MESSAGE",
-            nudge=not args.no_nudge,
-            start_if_needed=args.start_if_needed,
-        )
+    recipients = [a["name"] for a in state["agents"]]
+
+    write_broadcast_message(
+        root,
+        state,
+        sender=sender,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        msg_type="MESSAGE",
+        nudge=not args.no_nudge,
+        start_if_needed=args.start_if_needed,
+    )
+
     if args.start_if_needed:
         ensure_tmux_session(root, state)
         ensure_router_window(root, state)
-        for a in state["agents"]:
-            name = a["name"]
-            if not is_opencode_running(state, name):
-                start_opencode_in_window(root, state, a, boot=False)
 
     print("broadcast sent")
 
@@ -6466,11 +6867,11 @@ def cmd_assign(args: argparse.Namespace) -> None:
         raise OTeamError("could not find oteam.json in this directory or its parents")
     state = load_state(root)
 
-    body = args.text
+    body = getattr(args, "body", "") or args.text
     if args.file:
         body = Path(args.file).read_text(encoding="utf-8")
     if not body.strip():
-        raise OTeamError("assignment body is empty (provide TEXT or --file)")
+        raise OTeamError("assignment body is empty (provide TEXT, --body, or --file)")
 
     sender = args.sender or "pm"
     ticket: Optional[Dict[str, Any]] = None
@@ -7199,11 +7600,6 @@ def build_parser() -> argparse.ArgumentParser:
         pp.add_argument("--window", help="Window name to attach/select (e.g., pm).")
 
     def add_opencode_flags(pp: argparse.ArgumentParser) -> None:
-        pp.add_argument(
-            "--opencode-cmd",
-            default=DEFAULT_OPENCODE_CMD,
-            help="OpenCode executable name/path.",
-        )
         pp.add_argument("--model", default=None, help="OpenCode model (if supported).")
         pp.add_argument(
             "--sandbox",
@@ -7261,11 +7657,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_imp = sub.add_parser(
-        "import", help="Import an existing git repo or directory into a new workspace."
+        "import",
+        help="Import an existing git repo, directory, or tarball into a new workspace.",
     )
     add_common_workspace(p_imp)
     p_imp.add_argument(
-        "--src", required=True, help="Git repo URL/path OR local directory to import."
+        "--src",
+        required=True,
+        help="Git repo URL/path, local directory, or tarball to import.",
     )
     p_imp.add_argument("--name", help="Project name override.")
     p_imp.add_argument("--devs", type=int, default=1)
@@ -7274,6 +7673,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--recon",
         action="store_true",
         help="Also send safe coordinated recon assignments (no code changes) to non-PM agents.",
+    )
+    p_imp.add_argument(
+        "--seed",
+        help="Path to SEED.md file to use instead of auto-generated seed from import source.",
     )
     add_opencode_flags(p_imp)
     add_coord_flags(p_imp)
@@ -7544,6 +7947,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_assign.add_argument("--task", help="Task ID (e.g., T001).")
     p_assign.add_argument("--from", dest="sender")
     p_assign.add_argument("--subject")
+    p_assign.add_argument(
+        "--body", help="Assignment body text (alternative to positional TEXT)."
+    )
     p_assign.add_argument("--file")
     p_assign.add_argument("--no-nudge", action="store_true")
     p_assign.add_argument(

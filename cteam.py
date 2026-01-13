@@ -63,6 +63,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import readline
 import textwrap
@@ -315,6 +317,112 @@ def slugify(s: str) -> str:
 def _looks_like_git_url(src: str) -> bool:
     s = src.strip()
     return bool(re.match(r"^(https?://|ssh://|git@|file://|.+\\.git$)", s))
+
+
+TARBALL_SUFFIXES = (".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz")
+
+
+def _looks_like_tarball(src: str) -> bool:
+    s = src.strip().lower()
+    return any(s.endswith(ext) for ext in TARBALL_SUFFIXES)
+
+
+def _safe_extract_tarball(tf: tarfile.TarFile, dest: Path) -> None:
+    dest_abs = dest.resolve()
+    for member in tf.getmembers():
+        member_path = dest_abs / member.name
+        try:
+            member_abs = member_path.resolve()
+        except Exception:
+            member_abs = member_path
+        if not str(member_abs).startswith(str(dest_abs)):
+            raise CTeamError(
+                f"tarball contains unsafe path outside extract dir: {member.name}"
+            )
+        if member.islnk() or member.issym():
+            target = Path(member.linkname or "")
+            if target.is_absolute():
+                raise CTeamError(
+                    f"tarball contains symlink with absolute target: {member.name}"
+                )
+            target_path = (member_path.parent / target).resolve()
+            if not str(target_path).startswith(str(dest_abs)):
+                raise CTeamError(
+                    f"tarball contains symlink outside extract dir: {member.name}"
+                )
+    tf.extractall(dest_abs)
+
+
+def _collapse_single_dir(base: Path) -> Path:
+    entries = [p for p in base.iterdir() if p.name != "__MACOSX"]
+    if len(entries) == 1 and entries[0].is_dir():
+        return entries[0]
+    return base
+
+
+def _read_seed_from_dir(src_root: Path) -> Optional[str]:
+    for candidate in [src_root / "SEED.md", src_root / "seed" / "SEED.md"]:
+        try:
+            if candidate.exists() and candidate.is_file():
+                text = candidate.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    return text
+        except Exception:
+            continue
+    return None
+
+
+def _maybe_extract_tarball_src(
+    src: str,
+) -> Tuple[Optional[tempfile.TemporaryDirectory], Optional[Path], Optional[str]]:
+    src_path = Path(src).expanduser()
+    tar_like = _looks_like_tarball(src)
+    tar_path: Optional[Path] = None
+    tmpdir: Optional[tempfile.TemporaryDirectory] = None
+
+    if tar_like and src_path.exists() and src_path.is_file():
+        if not tarfile.is_tarfile(src_path):
+            raise CTeamError(f"--src tarball is not readable: {src}")
+        tmpdir = tempfile.TemporaryDirectory(prefix="cteam_import_")
+        tar_path = src_path
+    elif tar_like and src.strip().lower().startswith(("http://", "https://")):
+        tmpdir = tempfile.TemporaryDirectory(prefix="cteam_import_")
+        tar_path = Path(tmpdir.name) / "src.tar"
+        try:
+            with urllib.request.urlopen(src, timeout=60.0) as resp:
+                tar_path.write_bytes(resp.read())
+        except Exception as e:
+            tmpdir.cleanup()
+            raise CTeamError(f"failed to download tarball from {src}: {e}") from e
+    elif tar_like:
+        raise CTeamError(f"--src tarball not found or unreadable: {src}")
+    else:
+        return None, None, None
+
+    if not tarfile.is_tarfile(tar_path):
+        tmpdir.cleanup()
+        raise CTeamError(f"--src tarball is not readable: {src}")
+
+    extract_root = Path(tmpdir.name) / "extract"
+    mkdirp(extract_root)
+    try:
+        with tarfile.open(tar_path, "r:*") as tf:
+            _safe_extract_tarball(tf, extract_root)
+    except Exception:
+        tmpdir.cleanup()
+        raise
+
+    src_root = _collapse_single_dir(extract_root)
+    try:
+        has_any = any(src_root.iterdir())
+    except Exception:
+        has_any = False
+    if not has_any:
+        tmpdir.cleanup()
+        raise CTeamError(f"--src tarball appears to be empty: {src}")
+
+    seed_text = _read_seed_from_dir(src_root)
+    return tmpdir, src_root, seed_text
 
 
 def mkdirp(p: Path) -> None:
@@ -2283,7 +2391,9 @@ def create_git_scaffold_new(root: Path, state: Dict[str, Any]) -> None:
             pass
 
 
-def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> None:
+def create_git_scaffold_import(
+    root: Path, state: Dict[str, Any], src: str
+) -> Optional[str]:
     bare = root / DIR_PROJECT_BARE
     checkout = root / DIR_PROJECT_CHECKOUT
 
@@ -2292,73 +2402,87 @@ def create_git_scaffold_import(root: Path, state: Dict[str, Any], src: str) -> N
             f"{DIR_PROJECT_BARE} already exists and is not empty in {root}"
         )
 
-    imported_as_git = False
-    try:
-        git_clone_bare(src, bare)
-        imported_as_git = True
-    except CTeamError:
-        imported_as_git = False
-        if _looks_like_git_url(src):
-            raise
+    tar_tmp: Optional[tempfile.TemporaryDirectory] = None
+    src_seed_text: Optional[str] = None
 
-    if imported_as_git:
-        if not checkout.exists():
-            git_clone(bare, checkout)
+    try:
+        tar_tmp, tar_src_root, src_seed_text = _maybe_extract_tarball_src(src)
+        if tar_src_root is not None:
+            src_path = tar_src_root
+        else:
+            imported_as_git = False
+            try:
+                git_clone_bare(src, bare)
+                imported_as_git = True
+            except CTeamError:
+                imported_as_git = False
+                if _looks_like_git_url(src):
+                    raise
+
+            if imported_as_git:
+                if not checkout.exists():
+                    git_clone(bare, checkout)
+                try:
+                    git_append_info_exclude(
+                        checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
+                    )
+                except Exception:
+                    pass
+                return src_seed_text
+
+            src_path = Path(src).expanduser().resolve()
+            if not src_path.exists() or not src_path.is_dir():
+                raise CTeamError(
+                    f"--src is neither a git repo, tarball, nor a readable directory: {src}"
+                )
+
+        git_init_bare(bare, branch=state["git"]["default_branch"])
+        git_clone(bare, checkout)
+
+        for item in src_path.iterdir():
+            if item.name == ".git":
+                continue
+            dest = checkout / item.name
+            if item.is_dir():
+                shutil.copytree(item, dest, dirs_exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item, dest)
+
+        git_config_local(checkout, "user.name", "cteam-import")
+        git_config_local(checkout, "user.email", "cteam+import@local")
+        run_cmd(["git", "-C", str(checkout), "add", "-A"])
+        try:
+            run_cmd(
+                ["git", "-C", str(checkout), "commit", "-m", "Import existing project"],
+                capture=True,
+            )
+        except CTeamError:
+            run_cmd(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "Import existing project",
+                ],
+                capture=True,
+            )
+
+        run_cmd(["git", "-C", str(checkout), "push", "origin", "HEAD"], capture=True)
+
         try:
             git_append_info_exclude(
                 checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
             )
         except Exception:
             pass
-        return
-
-    src_path = Path(src).expanduser().resolve()
-    if not src_path.exists() or not src_path.is_dir():
-        raise CTeamError(f"--src is neither a git repo nor a readable directory: {src}")
-
-    git_init_bare(bare, branch=state["git"]["default_branch"])
-    git_clone(bare, checkout)
-
-    for item in src_path.iterdir():
-        if item.name == ".git":
-            continue
-        dest = checkout / item.name
-        if item.is_dir():
-            shutil.copytree(item, dest, dirs_exist_ok=True)
-        else:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(item, dest)
-
-    git_config_local(checkout, "user.name", "cteam-import")
-    git_config_local(checkout, "user.email", "cteam+import@local")
-    run_cmd(["git", "-C", str(checkout), "add", "-A"])
-    try:
-        run_cmd(
-            ["git", "-C", str(checkout), "commit", "-m", "Import existing project"],
-            capture=True,
-        )
-    except CTeamError:
-        run_cmd(
-            [
-                "git",
-                "-C",
-                str(checkout),
-                "commit",
-                "--allow-empty",
-                "-m",
-                "Import existing project",
-            ],
-            capture=True,
-        )
-
-    run_cmd(["git", "-C", str(checkout), "push", "origin", "HEAD"], capture=True)
-
-    try:
-        git_append_info_exclude(
-            checkout, [f"{DIR_SHARED}/", f"{DIR_SEED}/", f"{DIR_SEED_EXTRAS}/"]
-        )
-    except Exception:
-        pass
+        return src_seed_text
+    finally:
+        if tar_tmp:
+            tar_tmp.cleanup()
 
 
 def create_agent_dirs(root: Path, state: Dict[str, Any], agent: Dict[str, Any]) -> None:
@@ -2940,13 +3064,24 @@ def nudge_agent(
             "6) Drive your own PM tickets (plan/brief/status/comm updates) to done. "
             "7) Refresh plan/BRIEF/STATUS_BOARD if scope/timelines changed and tell the team/customer."
         )
-    if interrupt:
-        msg = f"INTERRUPT — {reason}: open message.md, do the next concrete action, reply to PM if needed, then update STATUS.md. {extra}"
+        if interrupt:
+            msg = (
+                f"INTERRUPT — {reason}: open message.md, clear new mail, dispatch/assign next actions, "
+                f"unblock the team, and update STATUS_BOARD/PLAN/STATUS.md. {extra}"
+            )
+        else:
+            msg = (
+                f"{reason}: open message.md now. Clear customer/agent mail, dispatch/assign next actions, unblock dependencies, "
+                f"and update STATUS_BOARD/PLAN/STATUS.md. {extra}"
+            )
     else:
-        msg = (
-            f"{reason}: open message.md now. Do the next concrete task, send PM a short status (result + next step + ETA), "
-            f"and update STATUS.md. {extra}"
-        )
+        if interrupt:
+            msg = f"INTERRUPT — {reason}: open message.md, do the next concrete action, reply to PM if needed, then update STATUS.md. {extra}"
+        else:
+            msg = (
+                f"{reason}: open message.md now. Do the next concrete task, send PM a short status (result + next step + ETA), "
+                f"and update STATUS.md. {extra}"
+            )
     try:
         if interrupt:
             try:
@@ -5570,19 +5705,26 @@ def cmd_import(args: argparse.Namespace) -> None:
     save_state(root, state)
 
     _ = create_root_structure(root, state)
-    create_git_scaffold_import(root, state, src)
+    import_seed_text = create_git_scaffold_import(root, state, src)
     ensure_agents_created(root, state)
     update_roster(root, state)
 
+    seed_text: Optional[str] = None
     if getattr(args, "seed", None):
         seed_path = Path(args.seed)
         if seed_path.exists():
-            seed_content = seed_path.read_text(encoding="utf-8")
-            seed_file = root / DIR_SEED / "SEED.md"
-            mkdirp(seed_file.parent)
-            atomic_write_text(seed_file, seed_content)
+            seed_text = seed_path.read_text(encoding="utf-8")
         else:
             raise CTeamError(f"seed file not found: {seed_path}")
+    elif import_seed_text:
+        seed_text = import_seed_text
+
+    if seed_text is not None:
+        seed_file = root / DIR_SEED / "SEED.md"
+        existing = seed_file.read_text(encoding="utf-8") if seed_file.exists() else ""
+        if not existing.strip():
+            mkdirp(seed_file.parent)
+            atomic_write_text(seed_file, seed_text)
 
     if getattr(args, "seed_extras", None):
         extras_path = Path(args.seed_extras)
@@ -7146,11 +7288,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_imp = sub.add_parser(
-        "import", help="Import an existing git repo or directory into a new workspace."
+        "import",
+        help="Import an existing git repo, directory, or tarball into a new workspace.",
     )
     add_common_workspace(p_imp)
     p_imp.add_argument(
-        "--src", required=True, help="Git repo URL/path OR local directory to import."
+        "--src",
+        required=True,
+        help="Git repo URL/path, local directory, or tarball to import.",
     )
     p_imp.add_argument("--name", help="Project name override.")
     p_imp.add_argument("--devs", type=int, default=1)
