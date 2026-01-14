@@ -1,0 +1,49 @@
+#!/bin/bash
+# post-receive hook - Handle push events (CI integration, auto-close tickets)
+# Installed in: project.git/hooks/post-receive
+
+set -e
+
+cd "$(dirname "$0")/../.."
+
+echo "=== post-receive hook running ==="
+
+# Read pushed refs
+while read old_rev new_rev ref_name; do
+    branch=$(echo "$ref_name" | sed 's|refs/heads/||')
+
+    # Only process agent branches
+    if [[ "$branch" == agent/* ]]; then
+        agent_name=$(echo "$branch" | cut -d'/' -f2)
+        ticket_id=$(echo "$branch" | cut -d'/' -f3)
+
+        echo "Processing push from $agent_name on ticket T$ticket_id"
+
+        # Extract ticket ID number if it has T prefix
+        ticket_num=$(echo "$ticket_id" | sed 's/^T//')
+
+        # Log the push
+        mkdir -p .oteam/runtime/activity
+        echo "[$(date +%H:%M:%S)] $agent_name pushed agent/$agent_name/T$ticket_id" >> .oteam/runtime/activity/activity.log
+
+        # Check if this looks like a merge (many commits at once)
+        commit_count=$(git log --oneline "$old_rev".."$new_rev" 2>/dev/null | wc -l)
+
+        if [ "$commit_count" -gt 0 ]; then
+            echo "  $agent_name pushed $commit_count commit(s)"
+
+            # Write to CI queue for processing
+            mkdir -p .oteam/runtime/ci_queue
+            echo "$(date -Iseconds) $agent_name $ticket_num $commit_count" >> .oteam/runtime/ci_queue/pushes.txt
+
+            # Auto-close ticket on merge to main
+            if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
+                echo "  Merge to main detected - would close ticket T$ticket_num"
+                # Note: Actual ticket closing requires oteam CLI - this is for logging
+                echo "[$(date +%H:%M:%S)] CI: Merge to main - T$ticket_num ready for close" >> .oteam/runtime/activity/activity.log
+            fi
+        fi
+    fi
+done
+
+echo "=== post-receive hook complete ==="

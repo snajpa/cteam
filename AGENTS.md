@@ -1,96 +1,206 @@
-# Coding agent instructions (repo-wide)
+# oteam - Self-Organizing Multi-Agent Coordination System
 
-This repository is a **scaffold** intended for software agents (and humans) to implement the system specified in `doc/`.
+## Overview
 
-## Non-negotiable invariants
+oteam is a Python package for coordinating OpenCode agents around a shared git repo. Agents self-assign tickets, plan their work, and push changes with safety checks.
 
-1) **Server never touches workspace files directly**
-- Workspace files + box sandboxes live behind `ap-wsmgr` (`no “local workspace mode”`).
-- Source: `doc/README.md` L14-L17.
+## Package Structure
 
-2) **Hard control-plane / data-plane split**
-- control-plane: `ap-server` (users, agents, runs, LLM, streaming, event log)
-- data-plane: `ap-wsmgr` (workspace filesystem, boxes, snapshots)
-- Source: `doc/02-architecture.md` L1-L44.
+```
+oteam_pkg/
+├── cmd/                      # CLI command implementations
+│   ├── tickets/
+│   │   ├── list.py           # `oteam tickets list --ready`
+│   │   └── list_test.py
+│   ├── ticket_grab.py        # `oteam ticket-grab <id> --agent <name>`
+│   └── ticket_grab_test.py
+├── state/                    # State management
+│   ├── tickets.py            # Ready detection, grab logic
+│   └── tickets_test.py
+├── ctx/                      # Context injection
+│   ├── inject.py             # Generate ticket context files
+│   ├── inject_test.py
+│   └── templates/
+│       └── ticket_context.md # 50-line context template
+├── tmux/                     # OpenCode pane control
+│   ├── detect_mode.py        # Detect Plan/Build/Unknown mode
+│   ├── detect_mode_test.py
+│   ├── send_keys.py          # Send Tab, Enter, text to panes
+│   └── send_keys_test.py
+├── coord/                    # Coordination layer
+│   ├── broadcast.py          # File-based agent messaging (0 latency)
+│   ├── broadcast_test.py
+│   ├── activity.py           # Log agent actions
+│   ├── activity_test.py
+│   ├── stream.py             # Real-time activity feed CLI
+│   ├── file_history.py       # "What changed" summary
+│   └── file_history_test.py
+├── safety/                   # Quality gates
+│   ├── pre_push.py           # Pre-push safety checks
+│   ├── pre_push_test.py
+│   └── stuck.py              # Stuck flag for agents
+└── hooks/                    # Git hooks
+    ├── post-update
+    └── post-receive
+```
 
-3) **Event log is the source of truth for UI + replay**
-- UI reconstructs from snapshot + subscribe.
-- Replay/cold-resume depends on deterministic boundaries recorded.
-- Source: `doc/05-event-log.md` L1-L52, `doc/21-replay-and-resume.md` L1-L106.
+## Key Functions
 
-4) **mruby worker is out-of-process and has no network**
-- The worker communicates with server only via RPC.
-- Source: `doc/07-mruby-runtime.md` L1-L16, `doc/17-rpc-protocol.md` L20-L33.
+### Self-Assignment
 
-If an implementation choice conflicts with these, the implementation choice is wrong.
+`oteam_pkg.state.tickets`:
+- `is_ready_ticket(ticket)` - Check if ticket has "ready" or "auto" tag
+- `load_ready_tickets(root)` - Load all self-assignable tickets
+- `can_grab_ticket(root, ticket_id, agent_name)` - Check if agent can grab
+- `grab_ticket(root, ticket_id, agent_name, user)` - Assign ticket to agent
+- `get_ticket_branch_name(agent_name, ticket_id)` - Get branch name format
 
-## How to use the spec
+### Context Injection
 
-- `doc/` is the primary design spec. Do not “invent” behavior that contradicts it.
-- Every TODO in code must point to specific `doc/*` line ranges.
-- If you change `doc/*`, you MUST update any TODO line references that mention the changed lines.
+`oteam_pkg.ctx.inject`:
+- `generate_context(root, ticket, agent_name)` - Generate context from template
+- `inject_context(root, ticket, agent_name)` - Write context file
+- `get_context(root, ticket_id)` - Read existing context
+- `_parse_scope(description, marker)` - Extract Scope IN/OUT from description
 
-Tip: use `nl -ba doc/<file>.md | sed -n 'X,Yp'` to view the exact line ranges referenced by TODOs.
+### Mode Detection
 
-## Milestone-driven implementation order
+`oteam_pkg.tmux.detect_mode`:
+- `detect_mode(pane_output)` - Returns "plan", "build", or "unknown"
+- `is_plan_mode(pane_output)` - Check if pane is in Plan mode
+- `is_build_mode(pane_output)` - Check if pane is in Build mode
+- `parse_mode_indicator(pane_output)` - Parse model selector line
 
-Follow `doc/15-implementation-plan.md`:
+### Key Sending
 
-- Milestone 0: repo skeleton (already scaffolded) – `doc/15-implementation-plan.md` L5-L13.
-- Milestone 1: `ap-wsmgr` MVP filesystem + leases – `doc/15-implementation-plan.md` L15-L26.
-- Milestone 2: `ap-server` core DB + event log + SSE – `doc/15-implementation-plan.md` L27-L44.
-- Milestone 3: contexts + streaming messages – `doc/15-implementation-plan.md` L45-L57.
-- Milestone 4: runs + mruby worker (no LLM) – `doc/15-implementation-plan.md` L58-L70.
-- Milestone 5: LLM providers + tool loop – `doc/15-implementation-plan.md` L71-L85 and `doc/18-llm-providers.md`.
-- Milestone 6: bidirectional widgets – `doc/15-implementation-plan.md` L86-L99 and `doc/08-ui-widgets.md`.
-- Milestone 7: git agent registry + workspace creation from agent ref – `doc/15-implementation-plan.md` L100-L112 and `doc/10-agent-registry.md` L86-L103.
-- Milestone 8: boxes via bubblewrap + streaming NDJSON – `doc/15-implementation-plan.md` L113-L124 and `doc/22-workspace-manager.md` L197-L217.
-- Milestone 9: snapshots – `doc/15-implementation-plan.md` L125-L136 and `doc/22-workspace-manager.md` L114-L141.
-- Milestone 10: CLI TUI attach – `doc/15-implementation-plan.md` L137-L143 and `doc/12-cli.md` L68-L114.
+`oteam_pkg.tmux.send_keys`:
+- `switch_to_plan_mode(session, window)` - Press Tab to switch to Plan
+- `switch_to_build_mode(session, window)` - Press Tab to switch to Build
+- `send_enter(session, window)` - Send Enter key
+- `send_text(session, window, text)` - Send text to pane
+- `capture_pane(session, window)` - Get pane output
+- `is_pane_ready(session, window)` - Check if OpenCode is waiting
 
-## Testing expectations
+### Broadcast
 
-The goal is "boring reliability".
+`oteam_pkg.coord.broadcast`:
+- `broadcast(root, sender, message, recipient, priority)` - Send message
+- `notify_agent(root, sender, recipient, message, priority)` - Direct message
+- `get_latest_broadcasts(root, after)` - Get broadcasts after timestamp
+- `clear_broadcasts(root)` - Clear all broadcasts
 
-Minimum test coverage targets (MVP):
-- Path traversal + path normalization tests (server + wsmgr).
-  - Sources: `doc/14-security.md` L20-L31 and `doc/19-policy-and-tools.md` L118-L129.
-- Event sequence allocation correctness under concurrency.
-  - Source: `doc/04-data-model.md` L208-L215.
-- Integration test: wsmgr workspace create/open/fs operations.
-  - Source: `doc/22-workspace-manager.md` L153-L196.
-- Integration test: server append events + SSE subscribe from `after=SEQ`.
-  - Source: `doc/05-event-log.md` L30-L52.
+### Activity
 
-See also testing strategy list: `doc/15-implementation-plan.md` L157-L171.
+`oteam_pkg.coord.activity`:
+- `log_activity(root, agent, action, details)` - Log an action
+- `log_ticket_grabbed(root, agent, ticket_id)` - Log ticket grab
+- `log_ticket_pushed(root, agent, ticket_id)` - Log push
+- `log_ticket_merged(root, agent, ticket_id, passed)` - Log merge with CI result
+- `get_activity(root, limit)` - Get recent activity
+- `get_activity_since(root, timestamp)` - Get activity after timestamp
 
-## Repo conventions
+### File History
 
-- Prefer small crates with explicit boundaries.
-- Keep protocol/data types in shared crates (`ap-core`, `ap-events`, `ap-rpc`) to avoid drift.
-- Do not add new networked daemons beyond `ap-server` and `ap-wsmgr`.
-- Keep everything async-first (`tokio`).
-- Log with `tracing`, not `println!`.
+`oteam_pkg.coord.file_history`:
+- `get_file_history(root, files, limit)` - Get recent commits for files
+- `get_ticket_file_history(root, ticket, limit)` - Get history for ticket files
+- `get_related_changes(root, agent_name, ticket_id)` - Get changes for ticket
+- `get_verify_command(root, ticket)` - Suggest verification command
+- `suggest_test_command(root, ticket)` - Suggest test command
 
-## Tooling note (oteam)
+### Pre-push Check
 
-- oteam expects the `opencode` CLI binary name. If only `codex` is installed, create an `opencode` symlink to `codex` instead of changing `opencode_cmd`; pane health checks rely on the configured name.
+`oteam_pkg.safety.pre_push`:
+- `check_pre_push(root, agent_name)` - Run all pre-push checks
+- `check_conflicts_with_main(repo)` - Check for main branch conflicts
+- `run_pre_push_check(workdir, agent)` - CLI entry point
 
-## Security posture (MVP)
+### Stuck Flag
 
-- This platform is not aiming for perfect hostile-code isolation.
-- It must still prevent obvious escapes: path traversal, cross-user leakage, accidental network access from mruby.
-- Sources: `doc/14-security.md` L1-L116 and `doc/11-boxes.md` L15-L30.
+`oteam_pkg.safety.stuck`:
+- `mark_stuck(root, agent, reason)` - Mark agent as stuck
+- `clear_stuck(root, agent)` - Clear stuck status
+- `is_stuck(root, agent)` - Check if agent is stuck
+- `get_stuck_reason(root, agent)` - Get stuck reason
+- `get_stuck_agents(root)` - List all stuck agents
 
-## “Doc-first TODOs” rule
+## Ready Ticket Criteria
 
-Every component has a top-level TODO plan (usually in `AGENTS.md` and/or `src/lib.rs`) with:
-- the intended behavior,
-- implementation steps,
-- and precise `doc/*` backreferences.
+A ticket is "ready" for self-assignment when:
+1. Status is `open`
+2. Assignee is `None`
+3. Has tag `ready` or `auto`
 
-When you implement a TODO:
-1) Link the PR/commit to the TODO block you’re completing.
-2) Replace TODO text with actual code.
-3) Add/extend tests.
-4) Keep the backreference notes as comments (or move them into docstrings) so future changes can be traced to the spec.
+## Branch Naming
+
+Branch format: `agent/{agent_name}/{ticket_id}`
+
+Examples:
+- `agent/dev1/T3`
+- `agent/dev1/3`
+
+## Context Template
+
+Located at `oteam_pkg/ctx/templates/ticket_context.md`
+
+Variables:
+- `{{ticket_id}}` - Ticket ID
+- `{{title}}` - Ticket title
+- `{{agent_name}}` - Agent name
+- `{{context_file_path}}` - Path to context file
+- `{{test_command}}` - Suggested test command
+- `{{verify_command}}` - Verification command
+- `{{previous_ticket}}` - Previous related ticket
+- `{{previous_file}}` - Previous related file
+- `{{related_agent}}` - Related agent working on same files
+- `{{related_ticket}}` - Related ticket
+
+## Activity Log Format
+
+```
+[HH:MM:SS] {agent} {action}: {details}
+```
+
+Examples:
+```
+[14:32:15] dev1 grabbed ticket T3
+[14:35:42] dev1 pushed agent/dev1/T3
+[14:40:00] dev1 merged T3 (CI passed)
+```
+
+## Git Hooks
+
+### post-update
+
+Location: `oteam_pkg/hooks/post-update`
+
+Fetches updates for all agent repos and logs activity.
+
+### post-receive
+
+Location: `oteam_pkg/hooks/post-receive`
+
+Handles push events:
+- Logs push activity
+- Queues for CI processing
+- Logs merge to main (ready for close)
+
+## Tests
+
+All tests in `oteam_pkg/*/*_test.py`:
+
+```bash
+python3 -m pytest oteam_pkg/ -v
+```
+
+139 tests, all passing.
+
+## Import Pattern
+
+```python
+from oteam_pkg.state import tickets as state_tickets
+from oteam_pkg.ctx import inject
+from oteam_pkg.tmux import detect_mode, send_keys
+from oteam_pkg.coord import broadcast, activity, file_history
+from oteam_pkg.safety import pre_push, stuck
+```

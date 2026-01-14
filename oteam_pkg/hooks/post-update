@@ -1,0 +1,35 @@
+#!/bin/bash
+# post-update hook - Notify working agents of changes
+# Installed in: project.git/hooks/post-update
+
+set -e
+
+cd "$(dirname "$0")/../.."
+
+echo "=== post-update hook running ==="
+
+# Find all agent repos
+for agent_dir in agents/*/proj; do
+    if [ -d "$agent_dir/.git" ]; then
+        agent_name=$(basename $(dirname "$agent_dir"))
+        echo "Notifying $agent_name of changes..."
+
+        # Fetch updates silently
+        cd "$agent_dir"
+        git fetch origin 2>/dev/null || true
+
+        # Check if there are updates
+        local_ref=$(git rev-parse HEAD)
+        remote_ref=$(git rev-parse origin/HEAD 2>/dev/null || echo "")
+
+        if [ -n "$remote_ref" ] && [ "$local_ref" != "$remote_ref" ]; then
+            echo "  $agent_name has updates available from origin"
+
+            # Write to activity log
+            mkdir -p .oteam/runtime/activity
+            echo "[$(date +%H:%M:%S)] $agent_name has updates from origin" >> .oteam/runtime/activity/activity.log
+        fi
+    fi
+done
+
+echo "=== post-update hook complete ==="

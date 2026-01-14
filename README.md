@@ -1,178 +1,176 @@
-# Clanker Team (cteam)
+# OpenCode Team (oteam)
 
-Clanker Team is a single-file orchestrator that spins up tmux-based Codex
-agents around a shared git repo. It keeps work PM-led, nudges agents when mail
-arrives, and can bridge a customer chat (local or Telegram).
+oteam is a multi-agent coordination system for tmux + OpenCode. Agents self-organize around a shared git repo.
 
-## What it does
-- Starts a tmux session with windows for PM/architect/devs/tester/researcher.
-- Creates a bare repo (`project.git`), an integration checkout (`project/`), and
-  per-agent clones (`agents/<name>/proj/`).
-- Maintains shared coordination docs (GOALS, PLAN, DECISIONS, TIMELINE) and ticket store.
-- Routes mail via `shared/mail/<agent>/message.md` and nudges/auto-starts Codex
-  on assignments.
-- Optional Telegram bridge for the customer channel.
+## Core Philosophy
 
-## Requirements
-- Python 3.9+
-- `git` and `tmux` in `PATH`
-- Codex/OpenCode CLI (`opencode` in `PATH`)
-  - Recommended Codex posture for low-friction work:
-    - `--sandbox danger-full-access`
-    - `--ask-for-approval never` (or `--approval-policy never` on newer CLIs)
+**Old (PM-led):** PM assigns → agent waits → implements → PM closes (bottlenecked)
 
-**oteam note:** oteam is the OpenCode flavour of this orchestrator. It expects the `opencode` binary name. If only `codex` is installed, create an `opencode` symlink to `codex` instead of changing `--opencode-cmd`; pane health checks look for the configured command name.
+**New (Self-organized):** Agent grabs → plans → implements → CI auto-closes
 
-## Quick start (new project)
-1) Initialize a workspace (example with two devs):
-   ```bash
-   python3 cteam.py /path/to/workspace init --name "My Project" --devs 2
-   ```
-2) Attach to tmux if not auto-attached:
-   ```bash
-   python3 cteam.py /path/to/workspace attach
-   ```
-3) PM fills `shared/GOALS.md`, `shared/PLAN.md` (high-level), then sends
-   assignments (`cteam assign ...`).
+## Quick Start
 
-## Import an existing repo
 ```bash
-python3 cteam.py /path/to/workspace import \
-  --src /path/to/existing/repo \
-  --devs 2 \
-  --recon
+# Initialize workspace
+python3 oteam.py /path/to/workspace init --name "My Project" --devs 2
+
+# Attach to tmux
+python3 oteam.py /path/to/workspace attach
 ```
-`--recon` seeds safe recon assignments (no code changes) to architect/tester/
-researcher. The source repo becomes `project.git` and `project/`; each agent
-gets a clone under `agents/<name>/proj/`.
 
-## Everyday loop (PM-led)
-- Open/resume: `python3 cteam.py . open`
-- Customer channel: `python3 cteam.py . customer-chat`
-- Assign work (auto-starts Codex):  
-  `python3 cteam.py . assign --to dev1 --task T001 --subject "Feature" "details..."`
-- Message/broadcast: `python3 cteam.py . msg --to dev1 "Ping"` /
-  `python3 cteam.py . broadcast "Standup in 10"`
-- Nudge: `python3 cteam.py . nudge --to dev1 --reason "Check inbox"`; add
-  `--interrupt` to send an immediate interrupt (sends Esc before the message).
-- Add agent (PM is unique; PM gets balancing reminder):  
-  `python3 cteam.py . add-agent --role developer --name dev3`
-- Remove agent (non-PM):  
-  `python3 cteam.py . remove-agent --name dev3`
-- Router loop (usually in tmux window `router`): `python3 cteam.py . watch`
+## Self-Assignment Workflow
 
-## Codex posture
-- Defaults: `--sandbox danger-full-access`, `--ask-for-approval never`,
-  `--search` on (if supported). Override with `--sandbox`, `--ask-for-approval`
-  (or `--approval-policy`), `--model`, `--no-search`, `--full-auto`, `--yolo`.
-- To mirror Clanker Team’s intended behavior, run Codex with approval policy set
-  to `never`.
+### 1. List ready tickets
 
-## Roles and etiquette
-- PM is the coordinator. Non-PM agents wait for `Type: ASSIGNMENT` before
-  coding; recon notes without code are fine.
-- Customer channel is PM-only. Customer messages go to PM; PM replies via the
-  customer channel (local chat or Telegram bridge).
-- Branch naming: `agent/<agent>/<topic>`; push/pull often. Large/binary assets
-  belong in `shared/drive/`, not git.
-- Long/ongoing commands should be logged in each agent’s `STATUS.md`; PM tracks
-  and nudges owners.
+```bash
+oteam . tickets list --ready
+```
 
-## Workspace layout
-- `project.git` — bare origin
-- `project/` — integration checkout
-- `agents/<name>/proj/` — per-agent clones (work here)
-- `shared/` — coordination docs, mail logs, and `drive/` for non-repo artifacts
-- `seed/`, `seed-extras/` — input docs (not in git)
-- `cteam.json` — workspace state (versioned)
+Shows tickets tagged "ready" or "auto" that are open and unassigned.
+
+### 2. Grab a ticket
+
+```bash
+oteam . ticket-grab 3 --agent dev1
+```
+
+Assigns ticket T3 to dev1 and shows next steps:
+```
+Ticket T3 assigned to dev1
+Branch: agent/dev1/T3
+
+Next steps:
+  1. cd agents/dev1/proj
+  2. git checkout agent/dev1/T3
+  3. Read ticket context (if available)
+  4. Press Tab to switch to Plan mode
+```
+
+### 3. Plan mode
+
+Press Tab to switch OpenCode to Plan mode. Plan your approach, then Tab again to switch to Build mode.
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `tickets list --ready` | List self-assignable tickets |
+| `ticket-grab <id> --agent <name>` | Self-assign a ticket |
+| `pre-push --agent <name>` | Run safety checks before pushing |
+| `stuck --on "reason"` | Mark yourself as stuck (notifies PM) |
+
+## Directory Structure
+
+```
+oteam_pkg/
+├── cmd/                    # CLI commands
+│   ├── tickets/list.py     # list --ready
+│   └── ticket_grab.py      # self-assign
+├── state/tickets.py        # Ready detection, grab logic
+├── ctx/                    # Context injection
+│   ├── inject.py           # Generate ticket context
+│   └── templates/ticket_context.md
+├── tmux/                   # OpenCode integration
+│   ├── detect_mode.py      # Plan/Build detection
+│   └── send_keys.py        # Tab key sending
+├── coord/                  # Coordination
+│   ├── broadcast.py        # Agent messaging (0 latency)
+│   ├── activity.py         # Activity logging
+│   ├── stream.py           # Real-time feed
+│   └── file_history.py     # "What changed" summary
+├── safety/                 # Quality gates
+│   ├── pre_push.py         # Pre-push checks
+│   └── stuck.py            # Stuck flag
+└── hooks/                  # Git hooks
+    ├── post-update
+    └── post-receive
+```
+
+## Context Injection
+
+When grabbing a ticket, oteam generates a 50-line context file with:
+- Ticket ID and title
+- Previous related work
+- Test command suggestion
+- Scope IN/OUT
+- Verification command
+
+Context files live in `.oteam/runtime/contexts/T{ticket_id}.md`.
+
+## Coordination Layer
+
+### Broadcast (0 latency)
+
+Agents can message each other instantly via file-based broadcast:
+
+```python
+from oteam_pkg.coord import broadcast
+broadcast.broadcast(root, "dev1", "Hey dev2, need help")
+```
+
+No PM involvement, no 15-second mail latency.
+
+### Activity Stream
+
+All agent actions are logged:
+
+```python
+from oteam_pkg.coord import activity
+activity.log_ticket_grabbed(root, "dev1", "3")
+activity.log_ticket_pushed(root, "dev1", "3")
+activity.log_ticket_merged(root, "dev1", "3", passed=True)
+```
+
+### File History
+
+Get recent changes for a ticket:
+
+```python
+from oteam_pkg.coord import file_history
+history = file_history.get_file_history(root, ["src/auth.py"])
+```
+
+## Safety Features
+
+### Pre-push Check
+
+Run before pushing to catch issues:
+
+```bash
+oteam . pre-push --agent dev1
+```
+
+Checks:
+- Working tree is clean
+- Upstream is configured
+- No commits behind upstream
+- Ticket is assigned to correct agent
+
+### Stuck Flag
+
+Mark yourself as stuck when blocked:
+
+```bash
+oteam . stuck --on "waiting on API response"
+```
+
+Notifies PM automatically.
+
+### Git Hooks
+
+- `post-update`: Notifies agents of upstream changes
+- `post-receive`: Handles push events, logs activity, queues CI
 
 ## Testing
+
 ```bash
-python3 -m unittest discover
+python3 -m pytest oteam_pkg/ -v
 ```
 
-## Flag cheatsheet (commonly used)
-- Codex: `--codex-cmd`, `--model`, `--sandbox`, `--ask-for-approval`,
-  `--no-search`, `--full-auto`, `--yolo`
-- tmux/router: `--no-tmux`, `--no-codex`, `--no-attach`, `--window`,
-  `--autostart pm|pm+architect|all`, `--no-router` / `--router`
-- Help: usage errors print full `--help`; `cteam <workdir> <command> --help` shows
-  defaults.
+All 139 tests pass.
 
-## Command reference (with explanations)
-All commands use: `python3 cteam.py <workdir> <command> [flags/options]`.
-Lifecycle
-- `<workdir> init [--name NAME] [--devs N] [--force] [--no-interactive]
-  [--autostart pm|pm+architect|all]`  
-  Create a new workspace with a fresh git repo and agent clones.
-- `<workdir> import --src <repo|dir> [--name NAME] [--devs N] [--force] [--recon]
-  [--autostart ...]`  
-  Import an existing project. `--src` accepts anything `git clone` accepts
-  (GitHub/SSH/HTTP) or a local directory copy. `--recon` sends safe, read-only
-  recon tasks to non-PM agents.
-- `<workdir> open [--no-router]` / `<workdir> resume [--autostart ...]
-  [--router|--no-router]`  
-  Ensure structure exists, start tmux/router/Codex unless suppressed.
-- `attach WORKDIR [--window NAME]`  
-  Attach to the tmux session; `kill WORKDIR` kills the tmux session.
+## Requirements
 
-Coordination & chat
-- `watch WORKDIR [--interval SECONDS]`  
-  Router loop: watches mailboxes, nudges agents, auto-starts Codex on
-  assignments, and nags PM if the customer is waiting.
-- `msg WORKDIR --to NAME [--from SENDER] [--subject TEXT] [--file PATH]
-  [--no-nudge] [--start-if-needed] [--no-follow] TEXT`  
-  Send a message to one agent.
-- `broadcast WORKDIR [--from SENDER] [--subject TEXT] [--file PATH]
-  [--no-nudge] [--start-if-needed] TEXT`  
-  Send a message to all agents.
-- `assign WORKDIR --to NAME [--task ID] [--from SENDER] [--subject TEXT]
-  [--file PATH] [--no-nudge] [--no-follow] TEXT`  
-  Send an assignment (`Type: ASSIGNMENT`); auto-starts recipient Codex.
-- `nudge WORKDIR [--to NAME|all] [--reason TEXT] [--no-follow]`  
-  Manual nudge to a tmux window. Add `--interrupt` to send Escape before the
-  message (use for urgent interrupts).
-- `<workdir> chat --to NAME [--sender NAME] [--subject TEXT] [--no-nudge]
-  [--start-if-needed]`  
-  Interactive chat with an agent.  
-  `<workdir> customer-chat` — dedicated PM/customer chat window.
-
-Ops & repos
-- `<workdir> upload PATH... [--dest SUBPATH] [--from SENDER]`  
-  Copy files/dirs into `shared/drive` and notify PM.
-- `<workdir> status`  
-  Show agent STATUS/inbox timestamps and snippets.
-- `<workdir> sync [--all] [--agent names] [--fetch] [--pull]
-  [--no-show-branches]`  
-  Git fetch/pull and status for integration checkout and optional agent repos.
-- `<workdir> seed-sync [--clean]`  
-  Propagate `seed/` and `seed-extras/` into agent workdirs.
-- `<workdir> update-workdir`  
-  Refresh AGENTS.md templates and propagate the latest `cteam.py` into agents.
-- `<workdir> restart [--window NAME|all] [--hard]`  
-  Respawn Codex in agent windows (best-effort Ctrl-C with `--hard`).
-- `<workdir> add-agent [--role developer|tester|researcher|architect]
-  [--name NAME] [--title TITLE] [--persona TEXT] [--no-tmux] [--start-codex]`  
-  Add an agent (PM is unique). PM is notified to onboard and rebalance work.
-- `<workdir> remove-agent --name NAME [--purge]`  
-  Remove an agent (non-PM). Archives agent/mail under `_removed/` unless
-  `--purge` is passed.
-- `<workdir> doc-walk [--from SENDER] [--subject TEXT] [--task ID] [--auto]`  
-  Kick off a documentation sprint; `--auto` seeds doc tasks to other roles.
-- `<workdir> tickets <subcommand>`  
-  Manage tickets (list/show/create/assign/block/reopen/close). Tickets live in
-  `shared/TICKETS.json` (view with `cteam <workdir> tickets list`). `cteam assign` now
-  requires a ticket (`--ticket`) or will auto-create one with `--title/--desc`.
-  Example: `python3 cteam.py . tickets list` or `python3 cteam.py . assign --ticket T001 --to dev1 "body"`.
-
-Customer & Telegram
-- `<workdir> customer-chat`  
-  Local PM/customer chat window (tails `shared/mail/customer/message.md`).
-- `<workdir> telegram-configure [--token TOKEN] [--phone PHONE] [--no-interactive]`  
-  Store bot credentials for the authorized customer (send `/start` then share your
-  phone/contact from that number to link the chat; if it seems quiet, re-share
-  contact to re-authorize).
-- `<workdir> telegram-enable` / `<workdir> telegram-disable`  
-  Enable/disable Telegram bridge (honored by the router).
-- Telegram images from the authorized customer are saved to `shared/drive/telegram/`
-  and referenced in the PM/customer mailboxes.
+- Python 3.9+
+- `git` and `tmux` in PATH
+- `opencode` CLI in PATH
