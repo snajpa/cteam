@@ -1,0 +1,19 @@
+{
+  "version": "1.0",
+  "team_name": "My Team",
+  "root": "/root/cteam/oteam_test",
+  "agents": [
+    {
+      "name": "dev1",
+      "role": "developer",
+      "title": "Developer",
+      "dir_rel": "agents/dev1",
+      "window": "dev1",
+      "initialized": false
+    }
+  ],
+  "settings": {
+    "router": null,
+    "auto_grab": false
+  }
+}

@@ -1,0 +1,25 @@
+[project]
+name = "oteam"
+version = "1.0.0"
+description = "Self-Organizing Multi-Agent Coordination System"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "python-telegram-bot>=20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-typeguard>=4.0.0",
+]
+
+[project.scripts]
+oteam-cli = "oteam_pkg.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
